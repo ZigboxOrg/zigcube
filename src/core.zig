@@ -32,6 +32,7 @@ pub const modules = .{
     @import("job_trust_fixture.zig"),
     @import("apply.zig"),
     @import("mesh_address.zig"),
+    @import("mesh_plan.zig"),
     @import("history.zig"),
     @import("rollout_plan.zig"),
     @import("rollback.zig"),
