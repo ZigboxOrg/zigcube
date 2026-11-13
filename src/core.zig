@@ -31,6 +31,7 @@ pub const modules = .{
     @import("job_trust.zig"),
     @import("job_trust_fixture.zig"),
     @import("apply.zig"),
+    @import("mesh_address.zig"),
     @import("history.zig"),
     @import("rollout_plan.zig"),
     @import("rollback.zig"),
@@ -195,6 +196,7 @@ test {
     _ = @import("tls_wire_test.zig");
     _ = @import("replica_controller_test.zig");
     _ = @import("rollout_controller_test.zig");
+    _ = @import("mesh_address_test.zig");
     _ = @import("scheduler_test.zig");
     _ = @import("job_controller_test.zig");
     _ = @import("api_test.zig");

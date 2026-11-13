@@ -239,6 +239,13 @@ export const ZC_CODES = [
     "explanation": "Every job is submitted with a submit-by time, at most an hour ahead. This\nPOST arrived after it, so the job was not created. The deadline exists so\nthat a retry of a POST can always find the job the first one made: an ended\njob is kept for at least as long as a submit window.\n\nSubmit again with a new submit-by time. If the job was created by an\nearlier attempt, zcube job get NAME shows it; do not assume it did not run."
   },
   {
+    "code": "ZC-E0135",
+    "severity": "error",
+    "blame": "user",
+    "summary": "a service's allow list has a bad entry",
+    "explanation": "A service's `allow` lists the services that may connect to it and the port\neach may use. The server refused this one before storing anything: an entry\nnames a port of 0 or above 65535, names the service itself, repeats an\nearlier entry, names a service that could not exist, or the list is longer\nthan 64 entries. The cause line names the entry.\n\nFix the entry and apply again. A grant to a service that does not exist yet\nis allowed: only its name must be valid."
+  },
+  {
     "code": "ZC-E0201",
     "severity": "error",
     "blame": "external",
@@ -692,6 +699,55 @@ export const ZC_CODES = [
     "blame": "user",
     "summary": "a relayed connection reached its byte or idle bound",
     "explanation": "A connection through a job's relay was closed by the relay itself: it had\ncarried 1 GiB in one direction, or neither side had sent a byte for five\nminutes. The cause line says which. The job's other connections are not\naffected.\n\nOpen a new connection to go on. A job that needs a connection quiet for\nlonger than five minutes should send something now and then."
+  },
+  {
+    "code": "ZC-E0707",
+    "severity": "error",
+    "blame": "user",
+    "summary": "no grant allows this connection",
+    "explanation": "A replica connected to another service on the mesh, and the destination's\n`allow` list has no entry for the source service and that port. The\nconnection was closed before any byte reached the destination. Grants are\nchecked at both ends; either one refuses on its own.\n\nIf the connection should be allowed, add `{ .from = \"SOURCE\", .port = N }`\nto the destination's `allow` and apply it. zcube why grant SOURCE DEST:PORT\nshows what the destination allows now and who changed it last."
+  },
+  {
+    "code": "ZC-E0708",
+    "severity": "error",
+    "blame": "environment",
+    "summary": "a mesh peer's certificate was refused",
+    "explanation": "A mesh connection's peer showed a certificate this end did not accept: it is\nnot signed by this cluster's workload issuer, is not a service certificate,\nnames no service, has expired or is not valid yet. The cause line says\nwhich. The connection was closed.\n\nA certificate that has expired or is not valid yet usually means a node's\nclock is wrong: check time sync on both nodes. Any other reason means the\npeer is not a replica of this cluster, which is a bug if both ends are."
+  },
+  {
+    "code": "ZC-E0709",
+    "severity": "error",
+    "blame": "user",
+    "summary": "a granted service has no ready replica",
+    "explanation": "A replica connected to a service it is allowed to reach, and no replica of\nthat service is ready: none runs, none has passed its readiness check, or\nnone has published a mesh endpoint yet. The connection was closed.\n\nCheck the destination with zcube why service NAME. The connection may be\nopened again; it succeeds once a replica of the destination is ready."
+  },
+  {
+    "code": "ZC-E0710",
+    "severity": "error",
+    "blame": "environment",
+    "summary": "a mesh port could not be bound on this node",
+    "explanation": "The agent gives each replica a port from the node's mesh port range for the\nconnections other replicas make to it. No port of the range could be bound:\nother programs on the node hold them. The replica runs but takes no mesh\nconnections until a port is free.\n\nFind what holds the ports (ss -ltn) and stop it, or give the agent another\nrange. The agent retries on its own."
+  },
+  {
+    "code": "ZC-E0711",
+    "severity": "error",
+    "blame": "environment",
+    "summary": "the mesh could not make a socket in the container",
+    "explanation": "To carry a replica's mesh connections the agent makes a listening socket in\nthe container's own network namespace. The runtime refused it, so the\nreplica has no mesh: connections it makes to other services, and theirs\nto it, fail.\n\nThe cause line names the runtime's error. Check that the node's runtime is\nthe release the agent expects; the agent and the runtime are upgraded\ntogether."
+  },
+  {
+    "code": "ZC-W0703",
+    "severity": "warning",
+    "blame": "environment",
+    "summary": "a replica's mesh certificate could not be renewed",
+    "explanation": "The agent renews each replica's mesh certificate at half its lifetime, and\nthe server did not issue a new one: it was unreachable, or refused. The\nreplica keeps running. When its certificate expires it is taken off the\nmesh until a renewal succeeds; the agent keeps trying.\n\nCheck that the node reaches the server. A refusal names its own code in\nthe cause line."
+  },
+  {
+    "code": "ZC-W0704",
+    "severity": "warning",
+    "blame": "user",
+    "summary": "a grant names a service that does not exist",
+    "explanation": "A service's `allow` names a source service that is not stored. The grant\nwas kept, so services may be applied in any order; it takes effect when a\nservice of that name is created.\n\nIf the name is a typo, correct it and apply again: a grant to a missing\nservice would let whoever creates that name connect."
   },
   {
     "code": "ZC-E0801",

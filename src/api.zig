@@ -262,6 +262,8 @@ const ApplyBody = struct {
     /// ZC-E0126).
     health: ?records.Health = null,
     rollout: ?records.RolloutPolicy = null,
+    /// C4: who may connect through the mesh; `apply` checks it (ZC-E0135).
+    allow: []const records.Grant = &.{},
 };
 
 const CheckFinding = struct { decision: []const u8, revision: u64 };
@@ -384,6 +386,7 @@ fn apply_input(ctx: *const Context, body: []const u8, id: []const u8) Failure!ap
         .request_id = id,
         .health = parsed.health,
         .rollout = parsed.rollout,
+        .allow = parsed.allow,
     };
 }
 
