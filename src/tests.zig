@@ -92,6 +92,7 @@ comptime {
     _ = @import("relay_pump.zig");
     _ = @import("relay_fuzz.zig");
     _ = @import("mesh_plan_fuzz.zig"); // Reads ZCUBE_FUZZ_SEED: native only.
+    _ = @import("why_grant.zig"); // A core module: here too, so `-Dtest-filter` finds its tests.
     _ = @import("relay.zig");
     _ = @import("relay_tls_test.zig");
     _ = @import("relay_secure.zig");
