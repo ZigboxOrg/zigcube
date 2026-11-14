@@ -203,10 +203,20 @@ pub const job_runs_unread = declared("c1_teeth_job_runs_unread");
 pub const fence_stop_teeth = declared("c1_teeth_fence_stop");
 pub const fence_stop_teeth_ms: u64 = if (fence_stop_teeth) 8_000 else 0;
 
+/// C4 slice 3's M3 tooth: service certificate issuance (`service_cert.decide`) does not compare
+/// the ask's placement epoch with the replica's current assignment, so a node certifies a replica
+/// under an epoch the store has moved past (must break M3).
+pub const mesh_issue_stale = declared("c1_teeth_mesh_issue_stale");
+
+/// C4 slice 3's M6 tooth: a node that starts a replica of a new digest keeps the key of the
+/// replica it replaces, as a supervisor that did not make a new key would (must break M6).
+pub const mesh_reuse_key = declared("c1_teeth_mesh_reuse_key");
+
 /// The teeth whose fault needs the `strong` world (state-directory wipes, unplaceable jobs, relayed
 /// jobs).
 pub const strong_world = job_unclaimed or job_wipe or evict_world or relay_leak or relay_dropped or
-    job_cert_stale or job_cert_long or relay_conn_leak or job_cert_image or relay_stop_leak;
+    job_cert_stale or job_cert_long or relay_conn_leak or job_cert_image or relay_stop_leak or
+    mesh_issue_stale or mesh_reuse_key;
 
 /// The agent starts every run its node's trust policy refuses: `trust_refusal` judges
 /// nothing (must break J12: no run its node's policy refuses ever starts; B5 slice 3). Needs the
@@ -234,7 +244,8 @@ pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_co
     job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped or job_reuse or
     job_cert_stale or job_cert_long or relay_conn_leak or job_cert_image or relay_stop_leak or
     job_untrusted or placement_exclusive or relabel_kept or job_pass_break or
-    job_runs_unread or job_reuse_assigned or register_unchecked or soak_leak;
+    job_runs_unread or job_reuse_assigned or register_unchecked or soak_leak or
+    mesh_issue_stale or mesh_reuse_key;
 
 /// The replica controller spends the rollout budget on the plan it read, without comparing the
 /// counter or the rollout record, and ignores `max_unavailable` (C3 slice 7; must break R1).
@@ -316,4 +327,6 @@ const runners = [_][2][]const u8{
     .{ "c1_teeth_rollout_exact", "sim_c1_teeth_rollout_exact" },
     .{ "c1_teeth_rollout_race", "sim_c1_teeth_rollout_race" },
     .{ "c1_teeth_rollout_stuck", "sim_c1_teeth_rollout_stuck" },
+    .{ "c1_teeth_mesh_issue_stale", "sim_c1_teeth_mesh_issue_stale" },
+    .{ "c1_teeth_mesh_reuse_key", "sim_c1_teeth_mesh_reuse_key" },
 };
