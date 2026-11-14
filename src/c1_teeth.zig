@@ -212,11 +212,20 @@ pub const mesh_issue_stale = declared("c1_teeth_mesh_issue_stale");
 /// replica it replaces, as a supervisor that did not make a new key would (must break M6).
 pub const mesh_reuse_key = declared("c1_teeth_mesh_reuse_key");
 
+/// C4 slice 3 fixes: the node gate's tooth. Issuance (`service_cert.look_up`) takes the replica's
+/// assignment on any node, not the asking node's own key, so a node certifies a replica another
+/// node runs (must break M3).
+pub const mesh_issue_any_node = declared("c1_teeth_mesh_issue_any_node");
+
+/// C4 slice 3 fixes: a service replica's supervisor renews only when its certificate has expired,
+/// not at half-life (must break M3r).
+pub const mesh_renew_late = declared("c1_teeth_mesh_renew_late");
+
 /// The teeth whose fault needs the `strong` world (state-directory wipes, unplaceable jobs, relayed
 /// jobs).
 pub const strong_world = job_unclaimed or job_wipe or evict_world or relay_leak or relay_dropped or
     job_cert_stale or job_cert_long or relay_conn_leak or job_cert_image or relay_stop_leak or
-    mesh_issue_stale or mesh_reuse_key;
+    mesh_issue_stale or mesh_reuse_key or mesh_issue_any_node or mesh_renew_late;
 
 /// The agent starts every run its node's trust policy refuses: `trust_refusal` judges
 /// nothing (must break J12: no run its node's policy refuses ever starts; B5 slice 3). Needs the
@@ -245,7 +254,7 @@ pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_co
     job_cert_stale or job_cert_long or relay_conn_leak or job_cert_image or relay_stop_leak or
     job_untrusted or placement_exclusive or relabel_kept or job_pass_break or
     job_runs_unread or job_reuse_assigned or register_unchecked or soak_leak or
-    mesh_issue_stale or mesh_reuse_key;
+    mesh_issue_stale or mesh_reuse_key or mesh_issue_any_node or mesh_renew_late;
 
 /// The replica controller spends the rollout budget on the plan it read, without comparing the
 /// counter or the rollout record, and ignores `max_unavailable` (C3 slice 7; must break R1).
@@ -329,4 +338,6 @@ const runners = [_][2][]const u8{
     .{ "c1_teeth_rollout_stuck", "sim_c1_teeth_rollout_stuck" },
     .{ "c1_teeth_mesh_issue_stale", "sim_c1_teeth_mesh_issue_stale" },
     .{ "c1_teeth_mesh_reuse_key", "sim_c1_teeth_mesh_reuse_key" },
+    .{ "c1_teeth_mesh_issue_any_node", "sim_c1_teeth_mesh_issue_any_node" },
+    .{ "c1_teeth_mesh_renew_late", "sim_c1_teeth_mesh_renew_late" },
 };
