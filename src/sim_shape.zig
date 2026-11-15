@@ -28,9 +28,12 @@ pub const ClusterProfile = enum(u8) {
     /// No faults, and many applies of an image that never starts: rollouts to a generation that
     /// never becomes healthy (C3 slice 7; `flaky_health` waits for probes, slices 9 and 10).
     bad_release,
+    /// C4 slice 5: the mesh world's own faults: partitions between supervisors, slow agents
+    /// (delayed links) and grant churn (`sim_mesh_conns.zig`). Implies `--mesh`.
+    mesh,
 
     /// Draw weights, in the order of the enum.
-    pub const weights = [_]u32{ 3, 2, 2, 2, 2, 2 };
+    pub const weights = [_]u32{ 3, 2, 2, 2, 2, 2, 2 };
 
     comptime {
         assert(weights.len == @typeInfo(ClusterProfile).@"enum".field_names.len);

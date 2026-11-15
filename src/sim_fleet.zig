@@ -1,7 +1,8 @@
 //! `sim_fleet`: the simulation fleet's reporter (docs/briefs/c1-9.md, ops/sim-fleet/README.md).
 //!
 //!     sim_fleet ingest --repo OWNER/NAME --commit SHA --state FILE [--token-file FILE]
-//!                      [--tracker N] [--kind sim-cluster|sim-c1|sim-swarm|sim-soak|store-faults]
+//!                      [--tracker N]
+//!                      [--kind sim-cluster|sim-c1|sim-c4|sim-swarm|sim-soak|store-faults]
 //!                      [--dry-run]
 //!                      [--canary RUNNER --canary-seeds A..B [--expect-symptom TEXT[|TEXT...]]]
 //!                      [--ref BRANCH] [--round-started UNIX]
@@ -12,8 +13,9 @@
 //!                         [--url-file FILE] [--clean]
 //!
 //! Reads what one kind of producer printed in one round on stdin: for `sim-cluster`, each
-//! `sim_cluster --seeds A..B <operations> --shrink`; for `sim-c1`, the same with `--c1`; for
-//! `sim-swarm`, each `sim_swarm --seeds A..B <operations> --shrink`; concatenated, plus
+//! `sim_cluster --seeds A..B <operations> --shrink`; for `sim-c1`, the same with `--c1` (`sim-c4`:
+//! `--c4`); for `sim-swarm`, each `sim_swarm --seeds A..B <operations> --shrink`;
+//! concatenated, plus
 //! `run.sh`'s records of crashed seeds. `run.sh` calls it once per kind per round. It counts
 //! the seeds per UTC day in the state file and, on the first round of a new day, first posts the
 //! finished days' totals on the tracking issue. Then each distinct failure (fingerprint = kind,
@@ -62,13 +64,13 @@ const coverage = @import("sim_fleet_coverage.zig");
 const usage_text =
     "usage: sim_fleet ingest --repo OWNER/NAME --commit SHA --state FILE [--token-file FILE]\n" ++
     "                        [--tracker N]\n" ++
-    "                        [--kind sim-cluster|sim-c1|sim-swarm|sim-soak|store-faults]\n" ++
+    "                        [--kind sim-cluster|sim-c1|sim-c4|sim-swarm|sim-soak|store-faults]\n" ++
     "                        [--dry-run] [--canary RUNNER --canary-seeds A..B\n" ++
     "                         [--expect-symptom TEXT[|TEXT]]]\n" ++
     "reads one kind's output of a round on stdin: `sim_cluster --seeds A..B <ops> --shrink`\n" ++
-    "(--kind sim-cluster), the same with --c1 (sim-c1), or `sim_swarm --seeds A..B <ops>\n" ++
-    "--shrink` (sim-swarm), concatenated, or `zig build test-store-faults` (store-faults,\n" ++
-    "once a day); with --canary, the fault-on RUNNER's run of that\n" ++
+    "(--kind sim-cluster), the same with --c1 (sim-c1) or --c4 (sim-c4), or `sim_swarm\n" ++
+    "--seeds A..B <ops> --shrink` (sim-swarm), concatenated, or `zig build test-store-faults`\n" ++
+    "(store-faults, once a day); with --canary, the fault-on RUNNER's run of that\n" ++
     "kind over seeds A..B, filed as sim-canary\n" ++
     "       sim_fleet ingest ... [--ref BRANCH] [--round-started UNIX]\n" ++
     "       sim_fleet coverage --kind sim-cluster|sim-c1 --commit SHA --file FILE\n" ++
@@ -666,9 +668,10 @@ const RunError = issue.ParseError || state_file.ParseError || IngestError ||
 fn explain(err: RunError) []const u8 {
     return switch (err) {
         error.NoSummary => "stdin has no summary line of --kind (`sim-cluster: seeds A..B`, " ++
-            "`sim-cluster --c1: seeds A..B`, `sim-swarm: seeds A..B` or " ++
-            "`sim-cluster --soak: seeds A..B`), or a failure after the last one; feed it " ++
-            "that producer's output unchanged (run.sh and soak.sh do)",
+            "`sim-cluster --c1: seeds A..B`, `sim-cluster --c4: seeds A..B`, " ++
+            "`sim-swarm: seeds A..B` or `sim-cluster --soak: seeds A..B`), or a failure " ++
+            "after the last one; feed it that producer's output unchanged (run.sh and " ++
+            "soak.sh do)",
         error.BadLine => "stdin has a line sim_fleet cannot read, batches of different " ++
             "operation counts, or a summary whose count of failed seeds is not the number of " ++
             "`seed N:` records before it; feed it unchanged --seeds output",
