@@ -1383,7 +1383,10 @@ pub const registry = [_]Entry{
         \\setting. The agent did not start and changed nothing.
         \\
         \\The mesh port range (--mesh-ports A-B) must hold at least 512 ports, as
-        \\many as the agent can run containers, so that it cannot run out.
+        \\many as the agent can run containers, so that it cannot run out. It is
+        \\refused when the agent advertises no address for peers (--peer-advertise),
+        \\since its replicas then get no mesh, and when it holds the --peer-listen
+        \\port.
         \\
         \\Run zcube-agent --help for the flags and the file's fields.
         ,
