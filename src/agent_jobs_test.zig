@@ -1426,7 +1426,18 @@ const FailingList = struct {
         .events = events,
         .probe_begin = probe_begin,
         .probe_poll = probe_poll,
+        .mesh_update = mesh_update,
     };
+
+    fn mesh_update(
+        context: *anyopaque,
+        handle: rt.Handle,
+        rules: *const rt.MeshRules,
+        diag: *diag_mod.Diag,
+    ) rt.Error!void {
+        const inner = from(context).inner;
+        return inner.vtable.mesh_update(inner.context, handle, rules, diag);
+    }
 
     fn interface(self: *FailingList) rt.Runtime {
         return .{ .context = self, .vtable = &vtable };

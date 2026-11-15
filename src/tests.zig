@@ -80,6 +80,7 @@ test {
     _ = @import("sim_fleet_coverage.zig");
     _ = @import("tidy.zig");
     _ = @import("harness_tls.zig");
+    _ = @import("fake_mesh.zig");
 }
 
 // The files below are imported by a file-level `comptime` block, not by a test: a test that a
