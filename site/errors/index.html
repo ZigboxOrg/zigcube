@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Diagnostic codes · Zigcube</title>
+<meta name="description" content="Every diagnostic code zcube can show">
+<link rel="canonical" href="https://zigbox.github.io/zigcube/errors/index.html">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;700&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap">
+<style>
+:root{color-scheme:light}
+:root{
+  --bg:#f3f5f8; --surface:#ffffff; --fg:#151a24; --muted:#5d6676; --line:#dde2ea;
+  --accent:#2156b8; --term:#141925; --term-fg:#e3e8f2; --term-accent:#7fa8f5;
+  --display:"Familjen Grotesk", "Helvetica Neue", Arial, sans-serif;
+  --body:"IBM Plex Sans", "Helvetica Neue", Arial, sans-serif;
+  --mono:"IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#0f131b; --surface:#161b25; --fg:#e3e8f2; --muted:#98a1b3; --line:#262d3a;
+  --accent:#7fa8f5; --term:#0a0d13; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#0f131b; --surface:#161b25; --fg:#e3e8f2; --muted:#98a1b3; --line:#262d3a;
+  --accent:#7fa8f5; --term:#0a0d13; color-scheme:dark}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--fg);font-family:var(--body);font-size:16px;
+  line-height:1.6;margin:0}
+.wrap{max-width:760px;margin:0 auto;padding-left:max(16px,env(safe-area-inset-left,0px));
+  padding-right:max(16px,env(safe-area-inset-right,0px))}
+a{color:var(--accent)} a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+h1,h2{font-family:var(--display);line-height:1.15;margin:0;text-wrap:balance}
+h1{font-size:clamp(2rem,6vw,2.8rem);font-family:var(--mono);font-weight:500;
+  letter-spacing:-.01em}
+h2{font-size:1.3rem;margin:32px 0 8px}
+code,pre{font-family:var(--mono);font-size:.9em}
+.eyebrow{font-family:var(--mono);font-size:.75rem;letter-spacing:.08em;
+  text-transform:uppercase;color:var(--muted)}
+header.top{border-bottom:1px solid var(--line)}
+header.top .wrap{display:flex;align-items:center;gap:20px;padding-block:12px;flex-wrap:wrap}
+.brand{font-family:var(--display);font-weight:700;font-size:1.2rem;color:var(--fg);
+  text-decoration:none;display:flex;gap:8px;align-items:center}
+.brand .mark{width:20px;height:20px;border:2px solid var(--accent);border-radius:3px;
+  position:relative}
+.brand .mark::after{content:"";position:absolute;inset:4px;background:var(--accent);
+  border-radius:1px}
+nav{margin-left:auto;font-size:.9rem}
+main{padding-block:40px 56px}
+.summary{font-size:1.25rem;margin:10px 0 24px}
+.facts{display:flex;gap:32px;flex-wrap:wrap;margin:0 0 8px;padding:16px 0;
+  border-block:1px solid var(--line)}
+.facts div{min-width:0} .facts dt{font-family:var(--mono);font-size:.72rem;
+  letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.facts dd{margin:2px 0 0;font-family:var(--mono)}
+p{margin:0 0 14px;max-width:68ch}
+.term{background:var(--term);color:var(--term-fg);border-radius:10px;margin:0;
+  padding:12px 16px;overflow-x:auto;white-space:pre}
+table{border-collapse:collapse;width:100%}
+th,td{text-align:left;padding:8px 12px 8px 0;border-bottom:1px solid var(--line);
+  vertical-align:top}
+th{font-family:var(--mono);font-size:.72rem;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--muted);font-weight:500}
+td.code{font-family:var(--mono);white-space:nowrap}
+footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
+  font-size:.85rem}
+</style>
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="../"><span class="mark" aria-hidden="true"></span>Zigcube</a>
+  <nav aria-label="Diagnostics"><a href="./">All diagnostic codes</a></nav>
+</div></header>
+<main class="wrap">
+<p class="eyebrow">Reference</p>
+<h1>Diagnostic codes</h1>
+<p class="summary">Every failure zcube reports has one of these codes. <code>zcube explain &lt;code&gt;</code> prints the same text offline.</p>
+<table>
+<tr><th>Code</th><th>Summary</th><th>Blame</th></tr>
+<tr><td class="code"><a href="E0101.html">ZC-E0101</a></td><td>no such resource</td><td>user</td></tr>
+<tr><td class="code"><a href="E0102.html">ZC-E0102</a></td><td>can't reach zcube-server</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0103.html">ZC-E0103</a></td><td>zcube-server sent a reply the client can't read</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0104.html">ZC-E0104</a></td><td>the request can't be understood</td><td>user</td></tr>
+<tr><td class="code"><a href="E0105.html">ZC-E0105</a></td><td>the service changed while it was being applied</td><td>user</td></tr>
+<tr><td class="code"><a href="E0106.html">ZC-E0106</a></td><td>the server's configuration can't be used</td><td>user</td></tr>
+<tr><td class="code"><a href="E0107.html">ZC-E0107</a></td><td>can't listen on the server's address</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0108.html">ZC-E0108</a></td><td>the server is at one of its limits</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0109.html">ZC-E0109</a></td><td>a file named on the command line can't be read</td><td>user</td></tr>
+<tr><td class="code"><a href="E0110.html">ZC-E0110</a></td><td>the service file isn't valid</td><td>user</td></tr>
+<tr><td class="code"><a href="E0111.html">ZC-E0111</a></td><td>the command line can't be understood</td><td>user</td></tr>
+<tr><td class="code"><a href="E0112.html">ZC-E0112</a></td><td>the server address can't be used</td><td>user</td></tr>
+<tr><td class="code"><a href="E0113.html">ZC-E0113</a></td><td>apply needs an answer and there is no terminal</td><td>user</td></tr>
+<tr><td class="code"><a href="E0114.html">ZC-E0114</a></td><td>the apply was declined</td><td>user</td></tr>
+<tr><td class="code"><a href="E0115.html">ZC-E0115</a></td><td>can't write the output</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0116.html">ZC-E0116</a></td><td>can't use the state directory</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0117.html">ZC-E0117</a></td><td>there is no failure to bundle</td><td>user</td></tr>
+<tr><td class="code"><a href="E0118.html">ZC-E0118</a></td><td>no such diagnostic code</td><td>user</td></tr>
+<tr><td class="code"><a href="W0119.html">ZC-W0119</a></td><td>--no-redact keeps secrets in the bundle</td><td>user</td></tr>
+<tr><td class="code"><a href="E0120.html">ZC-E0120</a></td><td>zcube ran out of memory</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0121.html">ZC-E0121</a></td><td>the lease settings cannot fence an agent in time</td><td>user</td></tr>
+<tr><td class="code"><a href="E0122.html">ZC-E0122</a></td><td>zcube local can't find or start the server or agent</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0123.html">ZC-E0123</a></td><td>the local server or agent did not come up</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0124.html">ZC-E0124</a></td><td>another zcube local command is running</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0130.html">ZC-E0130</a></td><td>a job is not valid</td><td>user</td></tr>
+<tr><td class="code"><a href="E0131.html">ZC-E0131</a></td><td>a different job already has that name</td><td>user</td></tr>
+<tr><td class="code"><a href="E0132.html">ZC-E0132</a></td><td>there are too many jobs</td><td>user</td></tr>
+<tr><td class="code"><a href="E0133.html">ZC-E0133</a></td><td>no job by that name</td><td>user</td></tr>
+<tr><td class="code"><a href="E0134.html">ZC-E0134</a></td><td>the time to submit this job has passed</td><td>user</td></tr>
+<tr><td class="code"><a href="E0201.html">ZC-E0201</a></td><td>can't reach the store backend</td><td>external</td></tr>
+<tr><td class="code"><a href="E0202.html">ZC-E0202</a></td><td>the store backend failed an operation</td><td>external</td></tr>
+<tr><td class="code"><a href="E0203.html">ZC-E0203</a></td><td>that revision was compacted away</td><td>user</td></tr>
+<tr><td class="code"><a href="E0204.html">ZC-E0204</a></td><td>that revision does not exist yet</td><td>user</td></tr>
+<tr><td class="code"><a href="E0205.html">ZC-E0205</a></td><td>the lease has expired or was revoked</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0206.html">ZC-E0206</a></td><td>the request exceeds a store limit</td><td>user</td></tr>
+<tr><td class="code"><a href="E0207.html">ZC-E0207</a></td><td>the store has no free capacity for this</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0208.html">ZC-E0208</a></td><td>the store database is busy</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0209.html">ZC-E0209</a></td><td>the store database is damaged or not a store</td><td>external</td></tr>
+<tr><td class="code"><a href="E0210.html">ZC-E0210</a></td><td>the store database is from a newer zcube</td><td>user</td></tr>
+<tr><td class="code"><a href="E0211.html">ZC-E0211</a></td><td>the store backend refused the credentials</td><td>user</td></tr>
+<tr><td class="code"><a href="E0212.html">ZC-E0212</a></td><td>the store database does not exist</td><td>user</td></tr>
+<tr><td class="code"><a href="E0213.html">ZC-E0213</a></td><td>the store connection dropped during an operation</td><td>external</td></tr>
+<tr><td class="code"><a href="E0214.html">ZC-E0214</a></td><td>the store has no chain hash for that revision</td><td>user</td></tr>
+<tr><td class="code"><a href="E0215.html">ZC-E0215</a></td><td>the store went backwards or forked</td><td>external</td></tr>
+<tr><td class="code"><a href="E0216.html">ZC-E0216</a></td><td>the remembered revision file is unusable</td><td>external</td></tr>
+<tr><td class="code"><a href="E0301.html">ZC-E0301</a></td><td>a stored record can't be read</td><td>external</td></tr>
+<tr><td class="code"><a href="E0302.html">ZC-E0302</a></td><td>there is more to reconcile than one pass holds</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0303.html">ZC-E0303</a></td><td>a stored record is from a newer release</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0307.html">ZC-E0307</a></td><td>a job's stored records contradict each other</td><td>external</td></tr>
+<tr><td class="code"><a href="W0307.html">ZC-W0307</a></td><td>a report for an ended job was dropped</td><td>environment</td></tr>
+<tr><td class="code"><a href="W0308.html">ZC-W0308</a></td><td>a job waits: no node can take it now</td><td>user</td></tr>
+<tr><td class="code"><a href="E0401.html">ZC-E0401</a></td><td>a repair needs confirming</td><td>user</td></tr>
+<tr><td class="code"><a href="E0402.html">ZC-E0402</a></td><td>the node has no open allocation finding</td><td>user</td></tr>
+<tr><td class="code"><a href="E0403.html">ZC-E0403</a></td><td>the node's accounting changed during the repair</td><td>user</td></tr>
+<tr><td class="code"><a href="E0404.html">ZC-E0404</a></td><td>a node's accounting disagrees with its assignments</td><td>user</td></tr>
+<tr><td class="code"><a href="E0501.html">ZC-E0501</a></td><td>the runtime does not know that container</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0502.html">ZC-E0502</a></td><td>the runtime failed an operation</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0503.html">ZC-E0503</a></td><td>the agent can't reach zcube-server</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0504.html">ZC-E0504</a></td><td>zcube-server refused the agent's request</td><td>external</td></tr>
+<tr><td class="code"><a href="E0505.html">ZC-E0505</a></td><td>the agent's configuration can't be used</td><td>user</td></tr>
+<tr><td class="code"><a href="E0506.html">ZC-E0506</a></td><td>the agent's state directory can't be used</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0507.html">ZC-E0507</a></td><td>the agent can't start a container's supervisor</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0508.html">ZC-E0508</a></td><td>the container's command can't be run</td><td>user</td></tr>
+<tr><td class="code"><a href="E0509.html">ZC-E0509</a></td><td>the container's supervisor is gone</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0510.html">ZC-E0510</a></td><td>the agent's tenure on its node has ended</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0511.html">ZC-E0511</a></td><td>the image does not give the tree the service names</td><td>user</td></tr>
+<tr><td class="code"><a href="E0512.html">ZC-E0512</a></td><td>the node can't apply limits: no user systemd bus</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0513.html">ZC-E0513</a></td><td>this host can't run Zigbox containers</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0514.html">ZC-E0514</a></td><td>the service does not fit Zigbox's limits</td><td>user</td></tr>
+<tr><td class="code"><a href="E0515.html">ZC-E0515</a></td><td>a swarm fetch outlived its kill, so the image was not pulled</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0521.html">ZC-E0521</a></td><td>the agent could not tell how a run ended</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0522.html">ZC-E0522</a></td><td>a run's start record is missing or damaged</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0523.html">ZC-E0523</a></td><td>a run's input does not match its digest</td><td>environment</td></tr>
+<tr><td class="code"><a href="W0501.html">ZC-W0501</a></td><td>the agent fenced itself and registered again</td><td>environment</td></tr>
+<tr><td class="code"><a href="W0503.html">ZC-W0503</a></td><td>a job reached its deadline and was stopped</td><td>user</td></tr>
+<tr><td class="code"><a href="W0504.html">ZC-W0504</a></td><td>a pull record was not stored</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0601.html">ZC-E0601</a></td><td>a tree could not be fetched from any peer or the registry</td><td>external</td></tr>
+<tr><td class="code"><a href="W0601.html">ZC-W0601</a></td><td>a peer sent a chunk that does not match its hash</td><td>external</td></tr>
+<tr><td class="code"><a href="W0602.html">ZC-W0602</a></td><td>a peer's chunk list does not match its digest</td><td>external</td></tr>
+<tr><td class="code"><a href="W0603.html">ZC-W0603</a></td><td>the swarm fetch ended without the tree</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0701.html">ZC-E0701</a></td><td>a relay's upstream refused a connection</td><td>external</td></tr>
+<tr><td class="code"><a href="E0702.html">ZC-E0702</a></td><td>a job's relay could not be served</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0703.html">ZC-E0703</a></td><td>this agent's build cannot serve a job's relay</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0704.html">ZC-E0704</a></td><td>a relay's upstream did not answer in time</td><td>external</td></tr>
+<tr><td class="code"><a href="E0705.html">ZC-E0705</a></td><td>a relayed connection failed in the middle</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0706.html">ZC-E0706</a></td><td>the server refused a relayed run's certificate</td><td>environment</td></tr>
+<tr><td class="code"><a href="W0701.html">ZC-W0701</a></td><td>a job's relay is at its connection limit</td><td>user</td></tr>
+<tr><td class="code"><a href="W0702.html">ZC-W0702</a></td><td>a relayed connection reached its byte or idle bound</td><td>user</td></tr>
+<tr><td class="code"><a href="E0801.html">ZC-E0801</a></td><td>a peer's credential is not signed by this cluster</td><td>external</td></tr>
+<tr><td class="code"><a href="E0802.html">ZC-E0802</a></td><td>a peer's credential is expired or not yet valid</td><td>external</td></tr>
+<tr><td class="code"><a href="E0803.html">ZC-E0803</a></td><td>the peer is not the node that was asked for</td><td>external</td></tr>
+<tr><td class="code"><a href="E0804.html">ZC-E0804</a></td><td>a peer handshake failed</td><td>external</td></tr>
+<tr><td class="code"><a href="E0805.html">ZC-E0805</a></td><td>a peer record was refused</td><td>external</td></tr>
+<tr><td class="code"><a href="E0806.html">ZC-E0806</a></td><td>a peer key, certificate or trust file can't be used</td><td>user</td></tr>
+<tr><td class="code"><a href="E0807.html">ZC-E0807</a></td><td>a name on the removed list was refused a certificate</td><td>user</td></tr>
+<tr><td class="code"><a href="E0808.html">ZC-E0808</a></td><td>a peer's handshake was refused: its address is over a limit</td><td>external</td></tr>
+<tr><td class="code"><a href="E0809.html">ZC-E0809</a></td><td>a certificate is malformed or outside the bounds</td><td>external</td></tr>
+<tr><td class="code"><a href="E0810.html">ZC-E0810</a></td><td>a certificate is not signed by the pinned anchor</td><td>external</td></tr>
+<tr><td class="code"><a href="E0811.html">ZC-E0811</a></td><td>a certificate is expired or not yet valid</td><td>external</td></tr>
+<tr><td class="code"><a href="E0812.html">ZC-E0812</a></td><td>a certificate names another server than the one asked for</td><td>external</td></tr>
+<tr><td class="code"><a href="E0813.html">ZC-E0813</a></td><td>a TLS handshake was refused</td><td>external</td></tr>
+<tr><td class="code"><a href="E0814.html">ZC-E0814</a></td><td>the TLS client certificate was not asked for, or was refused</td><td>external</td></tr>
+<tr><td class="code"><a href="E0815.html">ZC-E0815</a></td><td>a TLS record failed its checks</td><td>external</td></tr>
+<tr><td class="code"><a href="E0816.html">ZC-E0816</a></td><td>a TLS connection ended or stalled without close_notify</td><td>external</td></tr>
+<tr><td class="code"><a href="E0817.html">ZC-E0817</a></td><td>an identity could not be issued</td><td>user</td></tr>
+<tr><td class="code"><a href="E0818.html">ZC-E0818</a></td><td>a TLS peer needs something zcube does not offer</td><td>external</td></tr>
+<tr><td class="code"><a href="E0819.html">ZC-E0819</a></td><td>a certificate is of another kind than this use needs</td><td>external</td></tr>
+<tr><td class="code"><a href="E0820.html">ZC-E0820</a></td><td>the key behind a client's or this server's certificate did not sign</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0821.html">ZC-E0821</a></td><td>the operating system's secure random source failed</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0822.html">ZC-E0822</a></td><td>the caller's certificate does not allow this request</td><td>user</td></tr>
+<tr><td class="code"><a href="B0001.html">ZC-B0001</a></td><td>zcube hit an internal error</td><td>internal</td></tr>
+<tr><td class="code"><a href="B0002.html">ZC-B0002</a></td><td>zcube failed in a way it should not</td><td>internal</td></tr>
+<tr><td class="code"><a href="B0003.html">ZC-B0003</a></td><td>allocation accounting disagrees with assignments</td><td>internal</td></tr>
+<tr><td class="code"><a href="B0004.html">ZC-B0004</a></td><td>zcube could not map how a job ended</td><td>internal</td></tr>
+<tr><td class="code"><a href="B0005.html">ZC-B0005</a></td><td>a job's run record is larger than a run may be</td><td>internal</td></tr>
+</table>
+</main>
+<footer><div class="wrap">
+Generated from the diagnostic registry by <code>zig build errors-site</code>.
+The same text is printed offline by <code>zcube explain</code>.
+</div></footer>
+</body>
+</html>

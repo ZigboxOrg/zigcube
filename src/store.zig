@@ -1,0 +1,709 @@
+//! `Store`: control-plane storage, a versioned key-value store with etcd-like semantics. The
+//! API server and the controllers use only this; there is no backend-specific SQL above it.
+//! Backends: Postgres, SQLite, and `store_memory.zig` (the reference the tests pin semantics to).
+//! How a backend realises these rules is in docs/store-design.md; the keys are in docs/keys.md.
+//!
+//! ## Revisions
+//!
+//! One global, monotonic `Revision` per store. A store starts at revision 0 (empty). Every
+//! committed write transaction that changes at least one key takes the next revision, and all
+//! the events it produces carry it. A transaction that changes nothing (a delete of an absent
+//! key, a failed compare with no failure ops) takes no revision. Revisions never repeat and are
+//! never skipped: a reader that has seen revision N has seen every change up to N.
+//!
+//! ## The chain hash
+//!
+//! Every revision has a hash, `h(n) = SHA-256(h(n-1) || revision || the revision's events)`, with
+//! `h(0)` 32 zero bytes. `ChainHasher` below is the one place that encodes and hashes, so every
+//! backend gives the same bytes for the same history; the encoding is in docs/store-design.md.
+//! `Status.hash` is the hash of the current revision and `Store.hash_at` that of any revision
+//! from the chain's start. Compaction never drops a hash. A store upgraded from a schema that had
+//! no chain starts it at its revision then (`chain_seed`), so `hash_at` below that fails with
+//! `NoHash`.
+//!
+//! ## Failure
+//!
+//! Every operation that can fail takes a `*Diag` and returns a plain `Error`. The error says
+//! THAT it failed; the `Diag` says WHY, with the code in the table below, so a store failure
+//! reaches `zcube why` intact. A caller that handles the error itself (a controller that
+//! relists after `Compacted`) calls `diag.reset()`; one that cannot hands the `Diag` up.
+//!
+//!     error.Compacted       ZC-E0203   a revision older than the compaction point
+//!     error.FutureRevision  ZC-E0204   a revision above the store's current one
+//!     error.LeaseNotFound   ZC-E0205   unknown, expired or revoked lease
+//!     error.TooLarge        ZC-E0206   key, value, transaction or ttl over its bound
+//!     error.NoCapacity      ZC-E0207   watch slots, lease slots or arena exhausted
+//!     error.NoHash          ZC-E0214   no chain hash for that revision (before the chain's start)
+//!     error.BackendFailed   ZC-E0201 (unreachable) or ZC-E0202 (the backend refused or failed);
+//!                           a SQLite file adds ZC-E0208 (busy), ZC-E0209 (damaged or not a
+//!                           store) and ZC-E0210 (schema from a newer zcube)
+//!
+//! ## Memory
+//!
+//! Everything a call returns (keys, values, event lists) is allocated from the `arena` the
+//! caller passes in, and is valid until the caller resets or frees that arena. The store keeps
+//! no reference to the caller's arguments after a call returns: it copies what it keeps. A
+//! request or a reconcile pass owns one arena (`constants.request_arena_bytes_max`); running out
+//! of it is `error.NoCapacity`, never a crash.
+//!
+//! ## Concurrency
+//!
+//! A `Store` may be used from several threads at once. Each operation is atomic and
+//! linearizable with respect to the revision order. A `Watch` is used by one thread at a time.
+
+const std = @import("std");
+const assert = std.debug.assert;
+const constants = @import("constants.zig");
+const Diag = @import("diag.zig").Diag;
+
+pub const Revision = u64;
+
+/// 0 means "no lease".
+pub const LeaseId = u64;
+pub const lease_none: LeaseId = 0;
+
+pub const Error = error{
+    Compacted,
+    FutureRevision,
+    LeaseNotFound,
+    TooLarge,
+    NoCapacity,
+    NoHash,
+    BackendFailed,
+};
+
+// ---- The chain hash ------------------------------------------------------------------------
+
+pub const hash_bytes = std.crypto.hash.sha2.Sha256.digest_length;
+pub const Hash = [hash_bytes]u8;
+
+/// `h(0)`: the hash before any revision.
+pub const hash_zero: Hash = @splat(0);
+
+/// Where the chain of a store upgraded at `revision` starts: `h(revision)` is not computed from
+/// the log (the log may be compacted) but derived from the revision alone, and recorded.
+pub fn chain_seed(revision: Revision) Hash {
+    assert(revision > 0);
+    var sha = std.crypto.hash.sha2.Sha256.init(.{});
+    sha.update("zcube chain seed 1");
+    update_u64(&sha, revision);
+    return sha.finalResult();
+}
+
+/// Builds `h(n)` from `h(n-1)`, the revision and its events, in order. `begin`, then `add` once
+/// per event of the revision in position order, then `finish`. The encoding of an event is
+/// docs/store-design.md "The chain hash": nothing here depends on a backend.
+pub const ChainHasher = struct {
+    sha: std.crypto.hash.sha2.Sha256,
+
+    pub fn begin(previous: Hash, revision: Revision) ChainHasher {
+        assert(revision > 0);
+        var hasher: ChainHasher = .{ .sha = std.crypto.hash.sha2.Sha256.init(.{}) };
+        hasher.sha.update(&previous);
+        update_u64(&hasher.sha, revision);
+        return hasher;
+    }
+
+    /// Like `add`, for an event whose key or value a backend read back from its own storage:
+    /// one that fails validation means the store is damaged, which is no assertion's business.
+    pub fn add_stored(hasher: *ChainHasher, event: Event) error{Malformed}!void {
+        if (key_problem(event.kv.key) != null) return error.Malformed;
+        if (event.kv.value.len > constants.store_value_bytes_max) return error.Malformed;
+        if (event.kind == .delete and event.kv.value.len != 0) return error.Malformed;
+        hasher.add(event);
+    }
+
+    /// For events from callers, which `Store` has already validated: a bad one is a bug.
+    pub fn add(hasher: *ChainHasher, event: Event) void {
+        assert(key_problem(event.kv.key) == null);
+        assert(event.kv.value.len <= constants.store_value_bytes_max);
+        if (event.kind == .delete) assert(event.kv.value.len == 0);
+        hasher.sha.update(&.{@as(u8, switch (event.kind) {
+            .put => 1,
+            .delete => 2,
+        })});
+        update_u32(&hasher.sha, @intCast(event.kv.key.len));
+        hasher.sha.update(event.kv.key);
+        update_u32(&hasher.sha, @intCast(event.kv.value.len));
+        hasher.sha.update(event.kv.value);
+        update_u64(&hasher.sha, event.kv.create_revision);
+        update_u64(&hasher.sha, event.kv.lease);
+    }
+
+    pub fn finish(hasher: *ChainHasher) Hash {
+        return hasher.sha.finalResult();
+    }
+};
+
+/// `h(revision)` of `events` (every event of the revision, in order) after `previous`.
+pub fn chain_hash(previous: Hash, revision: Revision, events: []const Event) Hash {
+    var hasher = ChainHasher.begin(previous, revision);
+    for (events) |event| {
+        assert(event.kv.mod_revision == revision);
+        hasher.add(event);
+    }
+    return hasher.finish();
+}
+
+fn update_u64(sha: *std.crypto.hash.sha2.Sha256, value: u64) void {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, value, .big);
+    sha.update(&bytes);
+}
+
+fn update_u32(sha: *std.crypto.hash.sha2.Sha256, value: u32) void {
+    var bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &bytes, value, .big);
+    sha.update(&bytes);
+}
+
+pub const KeyValue = struct {
+    key: []const u8,
+    value: []const u8,
+    /// The revision at which this key was last created (a put of an absent key).
+    create_revision: Revision,
+    /// The revision of the write that produced this value. Never 0 for a key that exists.
+    mod_revision: Revision,
+    lease: LeaseId = lease_none,
+};
+
+pub const Status = struct {
+    /// The current revision: that of the latest committed write, 0 for an empty store.
+    revision: Revision,
+    /// History older than this is gone: reads and watches below it fail with `Compacted`.
+    compacted_revision: Revision,
+    /// The chain hash of `revision` (`hash_zero` for an empty store).
+    hash: Hash,
+};
+
+// ---- Reads ---------------------------------------------------------------------------------
+
+pub const GetResult = struct {
+    /// Null if the key does not exist at `revision`; that is not an error.
+    kv: ?KeyValue,
+    /// The revision the read was made at: `at_revision` if given, else the current one.
+    revision: Revision,
+};
+
+pub const ListOptions = struct {
+    /// Keys that start with these bytes. The empty prefix lists everything.
+    prefix: []const u8,
+    /// Read the state as of this revision. Null: the current state. Pass the `revision` of the
+    /// first page to read the following pages consistently.
+    at_revision: ?Revision = null,
+    /// At most this many entries, from 1 to `constants.store_list_limit_max`. A page also ends
+    /// early once its values total `constants.store_page_bytes_max` (it has at least one entry).
+    limit: u32,
+    /// Resume after this key, as returned in `ListResult.continue_after`. Null: from the start.
+    /// With `reverse`, "after" means below: the page holds keys less than this one.
+    continue_after: ?[]const u8 = null,
+    /// Newest first: descending by key, so the tail of a key range (the latest decisions, whose
+    /// ids sort by time) costs one page and not the whole range. Paging works the same way, in
+    /// the other direction: `continue_after` is the last (smallest) key returned.
+    reverse: bool = false,
+};
+
+pub const ListResult = struct {
+    /// Ascending by key, bytewise; descending if the request had `reverse`.
+    kvs: []const KeyValue,
+    /// The revision the page was read at (the current one, if `at_revision` was null).
+    revision: Revision,
+    /// Set if more entries follow: pass it as `continue_after`, with `at_revision = revision`.
+    continue_after: ?[]const u8,
+};
+
+// ---- Transactions --------------------------------------------------------------------------
+
+/// "The key's `mod_revision` equals `mod_revision`." A `mod_revision` of 0 means the key must
+/// not exist. This one comparison is compare-and-swap, create-only, and delete-if-unchanged.
+pub const Compare = struct {
+    key: []const u8,
+    mod_revision: Revision,
+};
+
+pub const Put = struct {
+    key: []const u8,
+    value: []const u8,
+    /// Attaches the key to a lease; the key is deleted when the lease ends. `lease_none`
+    /// detaches it: a put replaces the lease association along with the value.
+    lease: LeaseId = lease_none,
+};
+
+pub const Op = union(enum) {
+    put: Put,
+    /// Deleting an absent key does nothing and produces no event.
+    delete: []const u8,
+};
+
+pub const TxnRequest = struct {
+    /// All must hold, evaluated atomically at the commit point. Empty: always succeeds.
+    compares: []const Compare = &.{},
+    on_success: []const Op = &.{},
+    on_failure: []const Op = &.{},
+};
+
+pub const TxnResult = struct {
+    /// True if every compare held and `on_success` was applied; false if `on_failure` was.
+    succeeded: bool,
+    /// The revision after the transaction: the new one if it wrote, else the current one.
+    revision: Revision,
+    /// The chain hash of `revision`, computed in the transaction that wrote it. Null when the
+    /// transaction wrote nothing (`revision` is then the current one) or the store cannot say
+    /// (the node agent's remote store). `VerifiedStore` advances what it remembers from it.
+    hash: ?Hash = null,
+};
+
+// ---- Watch ---------------------------------------------------------------------------------
+
+pub const EventKind = enum { put, delete };
+
+pub const Event = struct {
+    kind: EventKind,
+    /// For a delete, `value` is empty and `mod_revision` is the revision of the delete.
+    kv: KeyValue,
+};
+
+pub const WatchOptions = struct {
+    prefix: []const u8,
+    /// The first revision to deliver: events with `mod_revision >= from_revision`. A caller that
+    /// has seen everything up to revision N passes N + 1.
+    from_revision: Revision,
+};
+
+pub const WatchBatch = struct {
+    /// Ordered by revision, then by position in the transaction. A revision's events are never
+    /// split across batches. May be empty (see `Watch.next`).
+    events: []const Event,
+    /// Every matching event up to and including this revision has been delivered, in this
+    /// batch or an earlier one. Resume from `revision + 1`. It advances even when `events` is
+    /// empty, so an idle watch can reconnect without a relist.
+    revision: Revision,
+};
+
+/// An open watch: an ordered, gap-free stream of the events under a prefix.
+///
+/// Guarantees: no event is skipped, none is repeated, none is reordered, and all events of one
+/// revision arrive in one batch. If the store has compacted past the watch's position (it fell
+/// behind), `next` fails with `Compacted` and the caller lists again and opens a new watch.
+pub const Watch = struct {
+    context: *anyopaque,
+    vtable: *const WatchVTable,
+    /// The `revision` of the last batch returned (or `from_revision - 1` at the start).
+    delivered: Revision,
+
+    pub const WatchVTable = struct {
+        next: *const fn (
+            context: *anyopaque,
+            arena: std.mem.Allocator,
+            timeout_ms: u32,
+            diag: *Diag,
+        ) Error!WatchBatch,
+        close: *const fn (context: *anyopaque) void,
+    };
+
+    /// Waits up to `timeout_ms` for events, returning at once if some are ready, and an empty
+    /// batch if none arrive in time (the long-poll shape). A deterministic backend may return
+    /// an empty batch at once rather than wait.
+    pub fn next(
+        watch: *Watch,
+        arena: std.mem.Allocator,
+        timeout_ms: u32,
+        diag: *Diag,
+    ) Error!WatchBatch {
+        assert(diag.code == null);
+        const batch = watch.vtable.next(watch.context, arena, timeout_ms, diag) catch |err| {
+            assert(diag.code != null);
+            return err;
+        };
+        assert(batch.revision >= watch.delivered);
+        var previous: Revision = watch.delivered;
+        for (batch.events) |event| {
+            assert(event.kv.mod_revision > watch.delivered); // No repeats.
+            assert(event.kv.mod_revision >= previous); // No reordering.
+            assert(event.kv.mod_revision <= batch.revision); // No event past the bookmark.
+            previous = event.kv.mod_revision;
+        }
+        watch.delivered = batch.revision;
+        return batch;
+    }
+
+    /// Releases the watch slot. The `Watch` must not be used afterwards.
+    pub fn close(watch: *Watch) void {
+        watch.vtable.close(watch.context);
+        watch.* = undefined;
+    }
+};
+
+// ---- Leases --------------------------------------------------------------------------------
+
+pub const Lease = struct {
+    id: LeaseId,
+    ttl_ms: u32,
+};
+
+/// A lease as `lease_list` reports it: what the Nodes screen shows (TTL, remaining time) and what
+/// a reader needs to say which keys a lease would take with it.
+pub const LeaseInfo = struct {
+    id: LeaseId,
+    ttl_ms: u32,
+    /// Milliseconds until the lease runs out, by the backend's clock, at most `ttl_ms`. 0 for a
+    /// lease whose time is up but which `expire_leases` has not yet revoked: it can no longer be
+    /// renewed, and its keys are still there.
+    remaining_ms: u32,
+    /// The keys attached to the lease, ascending, at most `constants.store_lease_keys_max`.
+    keys: []const []const u8,
+};
+
+// ---- The interface -------------------------------------------------------------------------
+
+pub const Store = struct {
+    context: *anyopaque,
+    vtable: *const VTable,
+
+    /// What a backend implements. The wrappers below check arguments and results once, for
+    /// every backend, so a backend can assume well-formed input and the callers can assume the
+    /// documented postconditions.
+    pub const VTable = struct {
+        status: *const fn (context: *anyopaque, diag: *Diag) Error!Status,
+        get: *const fn (
+            context: *anyopaque,
+            arena: std.mem.Allocator,
+            key: []const u8,
+            at_revision: ?Revision,
+            diag: *Diag,
+        ) Error!GetResult,
+        list: *const fn (
+            context: *anyopaque,
+            arena: std.mem.Allocator,
+            options: ListOptions,
+            diag: *Diag,
+        ) Error!ListResult,
+        txn: *const fn (context: *anyopaque, request: TxnRequest, diag: *Diag) Error!TxnResult,
+        watch: *const fn (context: *anyopaque, options: WatchOptions, diag: *Diag) Error!Watch,
+        lease_grant: *const fn (context: *anyopaque, ttl_ms: u32, diag: *Diag) Error!Lease,
+        lease_keepalive: *const fn (context: *anyopaque, id: LeaseId, diag: *Diag) Error!Lease,
+        lease_revoke: *const fn (context: *anyopaque, id: LeaseId, diag: *Diag) Error!Revision,
+        lease_list: *const fn (
+            context: *anyopaque,
+            arena: std.mem.Allocator,
+            diag: *Diag,
+        ) Error![]const LeaseInfo,
+        expire_leases: *const fn (context: *anyopaque, diag: *Diag) Error!u32,
+        compact: *const fn (context: *anyopaque, revision: Revision, diag: *Diag) Error!void,
+        hash_at: *const fn (context: *anyopaque, revision: Revision, diag: *Diag) Error!Hash,
+    };
+
+    /// The current and compacted revisions, and the chain hash of the current one.
+    pub fn status(store: Store, diag: *Diag) Error!Status {
+        assert(diag.code == null);
+        const result = try finish(diag, store.vtable.status(store.context, diag));
+        assert(result.compacted_revision <= result.revision);
+        return result;
+    }
+
+    /// The chain hash of `revision`, from 0 (`hash_zero`) to the current revision; compaction
+    /// never removes one. A store upgraded from a schema without the chain has none below the
+    /// revision it was upgraded at: `NoHash`. Above the current revision: `FutureRevision`.
+    pub fn hash_at(store: Store, revision: Revision, diag: *Diag) Error!Hash {
+        assert(diag.code == null);
+        const result = try finish(diag, store.vtable.hash_at(store.context, revision, diag));
+        if (revision == 0) assert(std.mem.eql(u8, &result, &hash_zero));
+        return result;
+    }
+
+    /// One key, now or `at_revision`. A missing key is `kv == null`, not an error.
+    pub fn get(
+        store: Store,
+        arena: std.mem.Allocator,
+        key: []const u8,
+        at_revision: ?Revision,
+        diag: *Diag,
+    ) Error!GetResult {
+        assert(diag.code == null);
+        assert(key_problem(key) == null);
+        const result = try finish(diag, store.vtable.get(
+            store.context,
+            arena,
+            key,
+            at_revision,
+            diag,
+        ));
+        if (at_revision) |revision| assert(result.revision == revision);
+        if (result.kv) |kv| {
+            assert(std.mem.eql(u8, kv.key, key));
+            assert(kv.mod_revision > 0);
+            assert(kv.mod_revision <= result.revision);
+            assert(kv.create_revision <= kv.mod_revision);
+        }
+        return result;
+    }
+
+    /// Entries under a prefix, one page at a time.
+    pub fn list(
+        store: Store,
+        arena: std.mem.Allocator,
+        options: ListOptions,
+        diag: *Diag,
+    ) Error!ListResult {
+        assert(diag.code == null);
+        assert(options.limit > 0);
+        assert(options.limit <= constants.store_list_limit_max);
+        assert(prefix_problem(options.prefix) == null);
+        if (options.continue_after != null) assert(options.at_revision != null);
+        const result = try finish(diag, store.vtable.list(store.context, arena, options, diag));
+        assert(result.kvs.len <= options.limit);
+        if (result.continue_after != null) assert(result.kvs.len > 0);
+        if (options.at_revision) |revision| assert(result.revision == revision);
+        var previous: ?[]const u8 = options.continue_after;
+        for (result.kvs) |kv| {
+            assert(std.mem.startsWith(u8, kv.key, options.prefix));
+            assert(kv.mod_revision <= result.revision);
+            if (previous) |before| {
+                const order = std.mem.order(u8, before, kv.key);
+                assert(order == if (options.reverse) std.math.Order.gt else std.math.Order.lt);
+            }
+            previous = kv.key;
+        }
+        return result;
+    }
+
+    /// Compare-and-swap. All compares hold: apply `on_success`; else apply `on_failure`. The
+    /// chosen branch is applied atomically, under one revision. An oversized request is
+    /// `TooLarge` before anything is read or written. Duplicate keys within one branch are a
+    /// programmer error.
+    pub fn txn(store: Store, request: TxnRequest, diag: *Diag) Error!TxnResult {
+        assert(diag.code == null);
+        for (request.compares) |compare| assert(key_problem(compare.key) == null);
+        try check_txn_size(request, diag);
+        assert(!has_duplicate_keys(request.on_success));
+        assert(!has_duplicate_keys(request.on_failure));
+        const result = try finish(diag, store.vtable.txn(store.context, request, diag));
+        // No assertion on `result.revision`: a transaction that changes nothing returns the
+        // current revision, which is 0 for an empty store, whatever operations it held.
+        if (!result.succeeded) assert(request.compares.len > 0); // Only a compare can fail.
+        return result;
+    }
+
+    /// Opens a watch. `from_revision` below the compaction point (or at it) is `Compacted`;
+    /// more than one past the current revision is `FutureRevision`.
+    pub fn watch(store: Store, options: WatchOptions, diag: *Diag) Error!Watch {
+        assert(diag.code == null);
+        assert(prefix_problem(options.prefix) == null);
+        assert(options.from_revision > 0);
+        const opened = try finish(diag, store.vtable.watch(store.context, options, diag));
+        assert(opened.delivered == options.from_revision - 1);
+        return opened;
+    }
+
+    /// A lease that lasts `ttl_ms` from now unless kept alive. The time is the backend's: the
+    /// store's own clock decides expiry, never the caller's.
+    pub fn lease_grant(store: Store, ttl_ms: u32, diag: *Diag) Error!Lease {
+        assert(diag.code == null);
+        try check_ttl(ttl_ms, diag);
+        const lease = try finish(diag, store.vtable.lease_grant(store.context, ttl_ms, diag));
+        assert(lease.id != lease_none);
+        // The backends grant what was asked; a remote store (the agent's) carries the server's
+        // choice of ttl, which the caller learns from the grant.
+        assert(lease.ttl_ms >= constants.lease_ttl_ms_min);
+        assert(lease.ttl_ms <= constants.lease_ttl_ms_max);
+        return lease;
+    }
+
+    /// Restarts the lease's clock for its full ttl. `LeaseNotFound` if it has ended, and a lease
+    /// whose time has run out has ended even before `expire_leases` deletes its keys: it can
+    /// never be renewed, so an owner that is told so can stop its work knowing the keys go.
+    pub fn lease_keepalive(store: Store, id: LeaseId, diag: *Diag) Error!Lease {
+        assert(diag.code == null);
+        assert(id != lease_none);
+        const lease = try finish(diag, store.vtable.lease_keepalive(store.context, id, diag));
+        assert(lease.id == id);
+        return lease;
+    }
+
+    /// Ends the lease now and deletes its keys, all under one revision, which is returned (the
+    /// current revision if the lease held no keys).
+    pub fn lease_revoke(store: Store, id: LeaseId, diag: *Diag) Error!Revision {
+        assert(diag.code == null);
+        assert(id != lease_none);
+        return finish(diag, store.vtable.lease_revoke(store.context, id, diag));
+    }
+
+    /// Every lease the store holds, ascending by id: a read-only view, which changes nothing and
+    /// takes no revision. A lease past its time but not yet revoked is listed with
+    /// `remaining_ms == 0`.
+    pub fn lease_list(store: Store, arena: std.mem.Allocator, diag: *Diag) Error![]const LeaseInfo {
+        assert(diag.code == null);
+        const leases = try finish(diag, store.vtable.lease_list(store.context, arena, diag));
+        assert(leases.len <= constants.store_leases_max);
+        var previous: LeaseId = lease_none;
+        for (leases) |lease| {
+            assert(lease.id > previous);
+            assert(lease.remaining_ms <= lease.ttl_ms);
+            assert(lease.keys.len <= constants.store_lease_keys_max);
+            previous = lease.id;
+        }
+        return leases;
+    }
+
+    /// Revokes every lease whose time has run out, each as `lease_revoke` would. Returns how
+    /// many. Backends start no threads of their own: the server calls this on a timer, which
+    /// keeps expiry deterministic in tests and puts the schedule in one place.
+    pub fn expire_leases(store: Store, diag: *Diag) Error!u32 {
+        assert(diag.code == null);
+        return finish(diag, store.vtable.expire_leases(store.context, diag));
+    }
+
+    /// Discards history below `revision`: afterwards reads below it and watches from it or
+    /// below fail with `Compacted`. Reads at `revision` and later are unaffected. Compacting to
+    /// or below the current compaction point does nothing; above the current revision is
+    /// `FutureRevision`.
+    pub fn compact(store: Store, revision: Revision, diag: *Diag) Error!void {
+        assert(diag.code == null);
+        assert(revision > 0);
+        try finish(diag, store.vtable.compact(store.context, revision, diag));
+    }
+};
+
+/// A failed call always leaves a diagnostic behind; a successful one never does.
+fn finish(diag: *Diag, result: anytype) @TypeOf(result) {
+    if (result) |_| {
+        assert(diag.code == null);
+    } else |_| {
+        assert(diag.code != null);
+    }
+    return result;
+}
+
+// ---- Validation shared by all backends ------------------------------------------------------
+
+pub const KeyProblem = enum { empty, too_long, not_absolute, bad_byte };
+
+/// Null if `key` is a valid key: "/" then printable ASCII, at most `store_key_bytes_max`.
+/// Keys are built by code from validated names, so an invalid one is a programmer error.
+pub fn key_problem(key: []const u8) ?KeyProblem {
+    if (key.len == 0) return .empty;
+    if (key.len > constants.store_key_bytes_max) return .too_long;
+    if (key[0] != '/') return .not_absolute;
+    for (key) |byte| {
+        if (byte < 0x21 or byte >= 0x7f) return .bad_byte;
+    }
+    return null;
+}
+
+/// A prefix is a key prefix: empty, or "/" then printable ASCII.
+pub fn prefix_problem(prefix: []const u8) ?KeyProblem {
+    if (prefix.len == 0) return null;
+    return key_problem(prefix);
+}
+
+fn has_duplicate_keys(ops: []const Op) bool {
+    assert(ops.len <= constants.store_txn_ops_max);
+    for (ops, 0..) |first, index| {
+        for (ops[index + 1 ..]) |second| {
+            if (std.mem.eql(u8, op_key(first), op_key(second))) return true;
+        }
+    }
+    return false;
+}
+
+pub fn op_key(op: Op) []const u8 {
+    return switch (op) {
+        .put => |put| put.key,
+        .delete => |key| key,
+    };
+}
+
+fn check_txn_size(request: TxnRequest, diag: *Diag) Error!void {
+    const compares = request.compares.len;
+    if (compares > constants.store_txn_compares_max) {
+        diag.raise(.E0206);
+        diag.cause("a transaction has {d} compares; the limit is {d}", .{
+            compares, constants.store_txn_compares_max,
+        });
+        diag.fix(.{ .sentence = "split the change into smaller transactions" });
+        return error.TooLarge;
+    }
+    for ([_][]const Op{ request.on_success, request.on_failure }) |ops| {
+        if (ops.len > constants.store_txn_ops_max) {
+            diag.raise(.E0206);
+            diag.cause("a transaction branch has {d} operations; the limit is {d}", .{
+                ops.len, constants.store_txn_ops_max,
+            });
+            diag.fix(.{ .sentence = "split the change into smaller transactions" });
+            return error.TooLarge;
+        }
+        for (ops) |op| {
+            assert(key_problem(op_key(op)) == null);
+            switch (op) {
+                .delete => {},
+                .put => |put| try check_value(put.value, diag),
+            }
+        }
+    }
+}
+
+fn check_value(value: []const u8, diag: *Diag) Error!void {
+    if (value.len <= constants.store_value_bytes_max) return;
+    diag.raise(.E0206);
+    diag.cause("a value is {d} bytes; the limit is {d}", .{
+        value.len, constants.store_value_bytes_max,
+    });
+    diag.fix(.{ .sentence = "store large data outside the control plane and keep a reference" });
+    return error.TooLarge;
+}
+
+fn check_ttl(ttl_ms: u32, diag: *Diag) Error!void {
+    if (ttl_ms >= constants.lease_ttl_ms_min and ttl_ms <= constants.lease_ttl_ms_max) return;
+    diag.raise(.E0206);
+    diag.cause("a lease ttl of {d} ms is outside {d} to {d} ms", .{
+        ttl_ms, constants.lease_ttl_ms_min, constants.lease_ttl_ms_max,
+    });
+    diag.fix(.{ .sentence = "choose a ttl inside the range" });
+    return error.TooLarge;
+}
+
+const repeat = @import("test_util.zig").repeat;
+
+test "keys are absolute printable paths within the bound" {
+    // Goal: the boundary where a key becomes invalid. Method: each rule once, and the longest
+    // key that is still accepted.
+    try std.testing.expect(key_problem("/services/hello") == null);
+    try std.testing.expectEqual(KeyProblem.empty, key_problem("").?);
+    try std.testing.expectEqual(KeyProblem.not_absolute, key_problem("services").?);
+    try std.testing.expectEqual(KeyProblem.bad_byte, key_problem("/a b").?);
+    try std.testing.expectEqual(KeyProblem.bad_byte, key_problem("/a\x00").?);
+    const longest = "/" ++ repeat('k', constants.store_key_bytes_max - 1);
+    try std.testing.expect(key_problem(longest) == null);
+    try std.testing.expectEqual(KeyProblem.too_long, key_problem(longest ++ "k").?);
+    try std.testing.expect(prefix_problem("") == null);
+}
+
+test "chain hash: the encoding is fixed, and each part of it matters" {
+    // Goal: the hash depends on the previous hash, the revision and every field of every event,
+    // in order; and `ChainHasher` and `chain_hash` agree. Method: change one thing at a time.
+    const put: Event = .{ .kind = .put, .kv = .{
+        .key = "/k",
+        .value = "v",
+        .create_revision = 1,
+        .mod_revision = 2,
+        .lease = 0,
+    } };
+    var other = put;
+    other.kv.lease = 7;
+    var deleted = put;
+    deleted.kind = .delete;
+    deleted.kv.value = "";
+    const base = chain_hash(hash_zero, 2, &.{put});
+    try std.testing.expectEqual(base, chain_hash(hash_zero, 2, &.{put}));
+    try std.testing.expect(!std.mem.eql(u8, &base, &chain_hash(chain_seed(1), 2, &.{put})));
+    other.kv.mod_revision = 3;
+    try std.testing.expect(!std.mem.eql(u8, &base, &chain_hash(hash_zero, 3, &.{other})));
+    other.kv.mod_revision = 2;
+    try std.testing.expect(!std.mem.eql(u8, &base, &chain_hash(hash_zero, 2, &.{other})));
+    try std.testing.expect(!std.mem.eql(u8, &base, &chain_hash(hash_zero, 2, &.{deleted})));
+    try std.testing.expect(!std.mem.eql(u8, &base, &chain_hash(hash_zero, 2, &.{ put, put })));
+    var hasher = ChainHasher.begin(hash_zero, 2);
+    hasher.add(put);
+    try std.testing.expectEqual(base, hasher.finish());
+    try std.testing.expect(!std.mem.eql(u8, &chain_seed(1), &chain_seed(2)));
+}

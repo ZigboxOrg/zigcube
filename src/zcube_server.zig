@@ -1,0 +1,223 @@
+//! `zcube-server`: the API, the controllers and the console in one process. This file is the
+//! process around `server.zig`: flags and the configuration file, the one panic handler,
+//! signals, and the exit codes of DIAGNOSTICS.md. Every start-up failure (a bad setting, a store
+//! that cannot be reached, a port in use) is a coded `ZC-` diagnostic on stderr and an exit code
+//! decided by its blame; a panic is a `bug` diagnostic and exit 70. Never a stack trace.
+
+const std = @import("std");
+const assert = std.debug.assert;
+const build_options = @import("build_options");
+const config_mod = @import("server_config.zig");
+const c1_teeth = @import("c1_teeth.zig");
+const constants = @import("constants.zig");
+const diag_mod = @import("diag.zig");
+const server_mod = @import("server.zig");
+const issue_mod = @import("server_issue.zig");
+const p12_mod = @import("server_issue_p12.zig");
+const x509 = @import("x509.zig");
+
+const Diag = diag_mod.Diag;
+
+/// A panic is a `bug` diagnostic. The internal message is shown only with `--verbose`
+/// (DIAGNOSTICS.md); a panic writes no bundle, because writing one from a panic handler could
+/// panic again.
+pub const panic = std.debug.FullPanic(panic_handler);
+
+/// Set by `main` before anything can panic; the handler has no other way to know.
+var verbose_panics: bool = false;
+
+fn panic_handler(message: []const u8, first_trace_address: ?usize) noreturn {
+    _ = first_trace_address;
+    var diag: Diag = undefined;
+    diag.reset();
+    diag.raise(.B0001);
+    diag.cause("{s}", .{message});
+    var diagnostic: diag_mod.Diagnostic = undefined;
+    diag_mod.to_diagnostic(&diagnostic, &diag);
+    var buffer: [constants.diag_output_bytes_max]u8 = undefined;
+    const mode: @import("zigbox").render.Mode = if (verbose_panics) .verbose else .text;
+    const text = diag_mod.render(&diagnostic, mode, false, &buffer);
+    var io_buffer: [64]u8 = undefined;
+    var writer = std.Io.File.stderr().writerStreaming(std.Options.debug_io, &io_buffer);
+    writer.interface.writeAll(text) catch {}; // A panic has nowhere else to report it.
+    writer.interface.flush() catch {};
+    std.process.exit(constants.exit_internal);
+}
+
+/// Set by the signal handler, read by `main`.
+var stop_requested: std.atomic.Value(bool) = .init(false);
+
+fn on_signal(_: std.posix.SIG) callconv(.c) void {
+    stop_requested.store(true, .release);
+}
+
+// The sim-c1 negative tests (c1_teeth.zig) must be unreachable from the shipped program.
+comptime {
+    std.debug.assert(!c1_teeth.any);
+}
+
+pub fn main(init: std.process.Init) u8 {
+    const arena = init.arena.allocator();
+    const args = init.minimal.args.toSlice(arena) catch return constants.exit_environment;
+    verbose_panics = args_ask_verbose(args);
+    var diag: Diag = undefined;
+    diag.reset();
+    const command = config_mod.load(arena, init.io, args[1..], &diag) catch |err| {
+        if (err == error.OutOfMemory) return constants.exit_environment;
+        return fail(init.io, &diag, args_ask_verbose(args));
+    };
+    switch (command) {
+        .version => return say(init.io, "zcube-server " ++ build_options.version ++ "\n"),
+        .help => return say(init.io, config_mod.usage),
+        .run => |config| return run(init, config),
+        .ca_issue => |request| return issue(init, &request),
+    }
+}
+
+/// `zcube-server ca issue-client` or `ca issue-node`: writes the files and says where, or prints
+/// the diagnostic.
+fn issue(init: std.process.Init, request: *const config_mod.Issue) u8 {
+    var diag: Diag = undefined;
+    diag.reset();
+    const result = if (request.p12 != null)
+        p12_mod.issue(init.gpa, init.io, request, &diag)
+    else
+        issue_mod.issue(init.gpa, init.io, request, &diag);
+    const issued = result catch |err| {
+        return switch (err) {
+            error.OutOfMemory => constants.exit_environment,
+            error.Canceled => constants.exit_ok,
+            error.Failed => fail(init.io, &diag, request.config.verbose),
+        };
+    };
+    assert(request.name.len > 0);
+    assert(issued.not_after_ms > 0);
+    var what_buffer: [constants.node_name_bytes_max + 32]u8 = undefined;
+    const what = switch (request.subject) {
+        .client => |scope| std.fmt.bufPrint(&what_buffer, "client {s}, scope {s}", .{
+            request.name, scope.text(),
+        }) catch unreachable, // A name is no longer than a node name.
+        .node => std.fmt.bufPrint(&what_buffer, "node {s}", .{request.name}) catch
+            unreachable, // As above.
+    };
+    var until_buffer: [20]u8 = undefined;
+    var buffer: [512]u8 = undefined;
+    if (request.p12) |path| {
+        const until = x509.format_time(&until_buffer, issued.not_after_ms);
+        const p12_line = std.fmt.bufPrint(&buffer, "zcube-server: wrote {s} ({s}, browser CA, " ++
+            "until {s})\n", .{ path, what, until }) catch
+            return say(init.io, "zcube-server: wrote the PKCS#12 file\n");
+        return say(init.io, p12_line);
+    }
+    const line = std.fmt.bufPrint(&buffer, "zcube-server: wrote {s}.key and {s}.crt in {s} " ++
+        "({s}, until {s})\n", .{
+        request.name,
+        request.name,
+        request.out_dir,
+        what,
+        x509.format_time(&until_buffer, issued.not_after_ms),
+    }) catch return say(init.io, "zcube-server: wrote the key and certificate\n");
+    return say(init.io, line);
+}
+
+/// Test-only (#237): the registration barrier (server_register_barrier.zig), compiled only in a
+/// server built with `-Dregister-barrier=true`; any other build ignores the variable.
+const RegisterBarrier = if (build_options.register_barrier)
+    @import("server_register_barrier.zig").Barrier
+else
+    void;
+var register_barrier_state: RegisterBarrier = undefined;
+
+/// The barrier's hook when it is built in and `ZCUBE_TEST_REGISTER_BARRIER` names a directory.
+fn register_barrier(init: std.process.Init, io: std.Io) ?server_mod.Hook {
+    if (build_options.register_barrier) {
+        const dir = init.environ_map.get("ZCUBE_TEST_REGISTER_BARRIER") orelse return null;
+        if (dir.len == 0) return null;
+        register_barrier_state = .{ .io = io, .dir = dir };
+        return register_barrier_state.hook();
+    }
+    return null;
+}
+
+fn run(init: std.process.Init, config: config_mod.Config) u8 {
+    verbose_panics = config.verbose;
+    const limit = constants.http_connections_max + constants.http_refusals_max +
+        constants.server_threads_extra;
+    var threaded = std.Io.Threaded.init(init.gpa, .{ .concurrent_limit = .limited(limit) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var diag: Diag = undefined;
+    diag.reset();
+    const server = server_mod.Server.start(init.gpa, io, config, .{
+        .version = build_options.version,
+        .hook = register_barrier(init, io),
+    }, &diag) catch |err| switch (err) {
+        error.OutOfMemory => return constants.exit_environment,
+        error.Canceled => return constants.exit_ok, // Stopped on request: nothing to report.
+        error.StartFailed => return fail(io, &diag, config.verbose),
+    };
+    announce(io, server, config);
+    install_signals();
+    while (!stop_requested.load(.acquire)) {
+        io.sleep(.fromMilliseconds(100), .awake) catch break;
+    }
+    server.stop();
+    return constants.exit_ok;
+}
+
+fn announce(io: std.Io, server: *server_mod.Server, config: config_mod.Config) void {
+    var buffer: [256]u8 = undefined;
+    if (config.listen != null) {
+        const line = std.fmt.bufPrint(&buffer, "zcube-server {s} listening on {f} (TLS, name " ++
+            "{s}; store: {s})\n", .{
+            build_options.version, server.tls_address(), config.tls_name, config.store.backend(),
+        }) catch return;
+        _ = say(io, line);
+    }
+    if (config.insecure_listen != null) {
+        const line = std.fmt.bufPrint(&buffer, "zcube-server {s} listening on {f} (insecure, " ++
+            "loopback; store: {s})\n", .{
+            build_options.version, server.address(), config.store.backend(),
+        }) catch return;
+        _ = say(io, line);
+    }
+    if (config.store == .memory) {
+        _ = say(io, "zcube-server: the memory store keeps nothing: stopping the server loses it\n");
+    }
+}
+
+fn install_signals() void {
+    const action: std.posix.Sigaction = .{
+        .handler = .{ .handler = on_signal },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.INT, &action, null);
+    std.posix.sigaction(.TERM, &action, null);
+}
+
+/// Prints the diagnostic and returns the exit code its blame decides.
+fn fail(io: std.Io, diag: *const Diag, verbose: bool) u8 {
+    assert(diag.code != null);
+    var diagnostic: diag_mod.Diagnostic = undefined;
+    diag_mod.to_diagnostic(&diagnostic, diag);
+    var buffer: [constants.diag_output_bytes_max]u8 = undefined;
+    const mode: @import("zigbox").render.Mode = if (verbose) .verbose else .text;
+    const text = diag_mod.render(&diagnostic, mode, false, &buffer);
+    std.Io.File.stderr().writeStreamingAll(io, text) catch {}; // Nowhere else to report it.
+    return diag.exit_code();
+}
+
+fn say(io: std.Io, text: []const u8) u8 {
+    std.Io.File.stdout().writeStreamingAll(io, text) catch return constants.exit_environment;
+    return constants.exit_ok;
+}
+
+/// `--verbose` before the arguments are parsed: so a bad flag can still be shown in full.
+fn args_ask_verbose(args: []const []const u8) bool {
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--verbose")) return true;
+        if (std.mem.eql(u8, arg, "-v")) return true;
+    }
+    return false;
+}

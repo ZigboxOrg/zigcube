@@ -1,0 +1,385 @@
+//! `check <zig> <user>`: the last step of `zig build check`, which has already built, tested,
+//! tidied, checked the error pages, compiled and run the WASM core and the console module, and
+//! run the store conformance suite on memory and SQLite when this runs (they are its
+//! dependencies, so any failure stops the build before here). It adds the gates a dependency
+//! cannot express:
+//!
+//!   - The conformance suite on Postgres, when `ZCUBE_TEST_POSTGRES` is set. Unset is not a
+//!     failure; the PASS line names the backends that ran.
+//!   - `sim-c0` with a fresh seed, native against WASM, as CI's second sim step does. A failure
+//!     prints the seed in the `sim-c0: seed N` line above it.
+//!   - `sim-cluster` with a fresh seed (and the fault profile that seed draws, `-Dprofile=auto`)
+//!     and a small number of operations, native against WASM, and
+//!     one more run at a drawn shape (`-Dauto-shape`, its own fresh seed on the
+//!     `sim-cluster auto-shape: seed N` line), and
+//!     `sim-teeth`: the same simulator with the agent's test-only fault on, which must fail
+//!     (docs/core.md, "The cluster simulation"). A failure prints the seed in the
+//!     `sim-cluster: seed N` line above it.
+//!   - `sim-c1` (docs/authority.md §4 and §5) with a fresh seed, native against WASM, the same
+//!     in B6's tenant world (`-Dtenants`, P1) on a seed of its own (`sim-c1 tenants: seed N`),
+//!     and `sim-c1-teeth`, the negative tests, each of which must fire. A failure prints the
+//!     seed in the `sim-c1: seed N` line above it.
+//!   - The one gate a root build container cannot see: CI runs `zig build test` as an ordinary
+//!     user. When this runs as root and <user> is not "-", the committed tree is checked out into
+//!     a scratch worktree owned by <user> and tested as that user. Its build caches are kept
+//!     between checks in `.zig-cache/zcube-check-cache` (owned by <user>), so only the first check
+//!     of a worktree, or the first after `rm -rf .zig-cache`, builds from nothing.
+//!
+//! Then it prints the line a report quotes:
+//!
+//!     check: PASS 1a2b3c4d5e6f (build test tidy errors-site wasm-check wasm-test console-wasm
+//!     mtls-teeth
+//!     store:memory,sqlite sim-c0 sim-cluster sim-teeth sim-c1 sim-swarm sim-swarm-teeth,
+//!     test as tester)
+//!
+//! It also says when the build cache has grown past `cache_note_bytes`, with the command that
+//! empties it, because a full disk costs more than a rebuild.
+//!
+//! "+dirty" after the commit means the working tree had uncommitted changes, which the build-step
+//! gates saw and the user test did not. Not in `check`: `agent-smoke` and `demo-c0`, which CI runs
+//! (they are slow and start servers). Build-host tool, run by build.zig from the repository root.
+
+const std = @import("std");
+const Io = std.Io;
+
+const scratch = ".zig-cache/zcube-check-tree";
+const kept_cache = ".zig-cache/zcube-check-cache";
+const cache_note_bytes: u64 = 6 << 30;
+/// The kept test cache is emptied before a run once it is past this, so it cannot grow without
+/// bound (every changed binary adds a copy and Zig removes none).
+const kept_cache_max_bytes: u64 = 8 << 30;
+const sim_operations = "200";
+const cluster_operations = "40";
+const swarm_operations = "100";
+const gates = "build test tidy errors-site wasm-check wasm-test console-wasm mtls-teeth";
+
+/// Runs `argv` (in `cwd` if given) with its errors on stderr; fails unless it exits 0.
+fn run(io: Io, argv: []const []const u8, cwd: ?[]const u8) !void {
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .cwd = if (cwd) |path| .{ .path = path } else .inherit,
+        .stdout = .ignore,
+        .stderr = .inherit,
+    });
+    switch (try child.wait(io)) {
+        .exited => |code| if (code == 0) return,
+        else => {},
+    }
+    return error.CommandFailed;
+}
+
+/// Runs `argv` and returns its standard output, trimmed; fails unless it exits 0.
+fn output(gpa: std.mem.Allocator, io: Io, argv: []const []const u8) ![]const u8 {
+    const result = try std.process.run(gpa, io, .{ .argv = argv });
+    switch (result.term) {
+        .exited => |code| if (code != 0) return error.CommandFailed,
+        else => return error.CommandFailed,
+    }
+    return std.mem.trim(u8, result.stdout, " \n");
+}
+
+/// Whether `argv` exits 0 (for `id` and `pgrep`, whose exit status is their answer).
+fn succeeds(io: Io, argv: []const []const u8) bool {
+    run(io, argv, null) catch return false;
+    return true;
+}
+
+pub fn main(init: std.process.Init) !u8 {
+    var buffer: [512]u8 = undefined;
+    var file_writer: Io.File.Writer = .init(.stderr(), init.io, &buffer);
+    const err = &file_writer.interface;
+    defer err.flush() catch {};
+    var arguments = init.minimal.args.iterate();
+    _ = arguments.next();
+    const zig = arguments.next() orelse return usage(err);
+    const user = arguments.next() orelse return usage(err);
+    const io = init.io;
+    const gpa = init.arena.allocator();
+    const commit = try output(gpa, io, &.{ "git", "rev-parse", "--short=12", "HEAD" });
+    const porcelain = [_][]const u8{ "git", "status", "--porcelain", "--untracked-files=no" };
+    const dirty: []const u8 = if ((try output(gpa, io, &porcelain)).len > 0) "+dirty" else "";
+    const label = try std.fmt.allocPrint(gpa, "{s}{s}", .{ commit, dirty });
+    const as_user = !std.mem.eql(u8, user, "-") and std.os.linux.geteuid() == 0;
+    // Before the slow gates: a missing user is the operator's to fix, and says how.
+    if (as_user and !succeeds(io, &.{ "id", "-u", user })) {
+        try err.print("check: FAIL {s} (user {s} does not exist: useradd -m {s}, or " ++
+            "-Dcheck-user=-)\n", .{ label, user, user });
+        return 1;
+    }
+    const postgres = init.environ_map.get("ZCUBE_TEST_POSTGRES") != null;
+    if (postgres and !succeeds(io, &.{ zig, "build", "test-store", "-Dbackend=postgres" })) {
+        try err.print("check: FAIL {s} (zig build test-store -Dbackend=postgres)\n", .{label});
+        return 1;
+    }
+    var seed_bytes: [8]u8 = undefined;
+    io.random(&seed_bytes);
+    const seed = std.mem.readInt(u64, &seed_bytes, .little);
+    try err.print("sim-c0: seed {d}\n", .{seed});
+    try err.flush();
+    const seed_option = try std.fmt.allocPrint(gpa, "-Dseed={d}", .{seed});
+    const sim = [_][]const u8{
+        zig,         "build",                    "sim-c0",
+        seed_option, "-Dops=" ++ sim_operations, "-Doptimize=ReleaseSafe",
+    };
+    run(io, &sim, null) catch {
+        try err.print("check: FAIL {s} (zig build sim-c0: its seed is the sim-c0 line above)\n", .{
+            label,
+        });
+        return 1;
+    };
+    sim_cluster_gates(gpa, io, zig, label, err) catch return 1;
+    sim_c1_gates(gpa, io, zig, label, err) catch return 1;
+    sim_swarm_gates(gpa, io, zig, label, err) catch return 1;
+    if (as_user) {
+        test_as(gpa, io, zig, user, err) catch {
+            try err.print("check: FAIL {s} (zig build test as {s})\n", .{ label, user });
+            return 1;
+        };
+    }
+    const tail: []const u8 = if (as_user)
+        try std.fmt.allocPrint(gpa, ", test as {s}", .{user})
+    else
+        "";
+    note_cache(gpa, io, err);
+    const stores = if (postgres) "store:memory,sqlite,postgres" else "store:memory,sqlite";
+    const sims = "sim-c0 sim-cluster sim-teeth sim-c1 sim-swarm sim-swarm-teeth";
+    try err.print("check: PASS {s} ({s} {s} {s}{s})\n", .{ label, gates, stores, sims, tail });
+    return 0;
+}
+
+/// `sim-cluster` on a fresh seed (native against WASM), then `sim-teeth`. Prints the seed first.
+/// Both build in Debug: the WASM core is already built that way by `wasm-check`, and a
+/// ReleaseSafe build of the runner alone costs a minute of `check`.
+fn sim_cluster_gates(
+    gpa: std.mem.Allocator,
+    io: Io,
+    zig: []const u8,
+    label: []const u8,
+    err: *Io.Writer,
+) !void {
+    var seed_bytes: [8]u8 = undefined;
+    io.random(&seed_bytes);
+    const seed = std.mem.readInt(u64, &seed_bytes, .little);
+    try err.print("sim-cluster: seed {d}\n", .{seed});
+    try err.flush();
+    const seed_option = try std.fmt.allocPrint(gpa, "-Dseed={d}", .{seed});
+    const cluster = [_][]const u8{
+        zig, "build", "sim-cluster", seed_option, "-Dops=" ++ cluster_operations, "-Dprofile=auto",
+    };
+    run(io, &cluster, null) catch {
+        try err.print("check: FAIL {s} (zig build sim-cluster -Dprofile=auto: seed above)\n", .{
+            label,
+        });
+        return error.CommandFailed;
+    };
+    // One drawn run (size, nodes, ttl, replicas from a second fresh seed), so a change that
+    // breaks the shape draw or a run at a drawn shape fails here and not on the fleet.
+    io.random(&seed_bytes);
+    const shape_seed = std.mem.readInt(u64, &seed_bytes, .little);
+    try err.print("sim-cluster auto-shape: seed {d}\n", .{shape_seed});
+    try err.flush();
+    const shape_option = try std.fmt.allocPrint(gpa, "-Dseed={d}", .{shape_seed});
+    const shaped = [_][]const u8{
+        zig, "build", "sim-cluster", shape_option, "-Dauto-shape", "-Dprofile=auto",
+    };
+    run(io, &shaped, null) catch {
+        try err.print("check: FAIL {s} (zig build sim-cluster -Dauto-shape: seed above)\n", .{
+            label,
+        });
+        return error.CommandFailed;
+    };
+    run(io, &.{ zig, "build", "sim-teeth" }, null) catch {
+        try err.print("check: FAIL {s} (zig build sim-teeth: the simulator did not catch " ++
+            "the agent's test-only fault)\n", .{label});
+        return error.CommandFailed;
+    };
+}
+
+/// `sim-c1` on a fresh seed (native against WASM), the tenant world on another, then its
+/// negative tests.
+fn sim_c1_gates(
+    gpa: std.mem.Allocator,
+    io: Io,
+    zig: []const u8,
+    label: []const u8,
+    err: *Io.Writer,
+) !void {
+    var seed_bytes: [8]u8 = undefined;
+    io.random(&seed_bytes);
+    const seed = std.mem.readInt(u64, &seed_bytes, .little);
+    try err.print("sim-c1: seed {d}\n", .{seed});
+    try err.flush();
+    const seed_option = try std.fmt.allocPrint(gpa, "-Dseed={d}", .{seed});
+    run(io, &.{ zig, "build", "sim-c1", seed_option }, null) catch {
+        try err.print("check: FAIL {s} (zig build sim-c1: its seed is the line above)\n", .{
+            label,
+        });
+        return error.CommandFailed;
+    };
+    // The tenant world (B6, `-Dtenants`): node labels, operator relabels and P1, on a seed of
+    // its own.
+    io.random(&seed_bytes);
+    const tenants_seed = std.mem.readInt(u64, &seed_bytes, .little);
+    try err.print("sim-c1 tenants: seed {d}\n", .{tenants_seed});
+    try err.flush();
+    const tenants_option = try std.fmt.allocPrint(gpa, "-Dseed={d}", .{tenants_seed});
+    run(io, &.{ zig, "build", "sim-c1", tenants_option, "-Dtenants" }, null) catch {
+        try err.print("check: FAIL {s} (zig build sim-c1 -Dtenants: its seed is the line " ++
+            "above)\n", .{label});
+        return error.CommandFailed;
+    };
+    run(io, &.{ zig, "build", "sim-c1-teeth" }, null) catch {
+        try err.print("check: FAIL {s} (zig build sim-c1-teeth: a negative test did not " ++
+            "fire its check)\n", .{label});
+        return error.CommandFailed;
+    };
+}
+
+/// `sim-swarm` on a fresh seed (native against WASM), then `sim-swarm-teeth`. Prints the seed
+/// first.
+fn sim_swarm_gates(
+    gpa: std.mem.Allocator,
+    io: Io,
+    zig: []const u8,
+    label: []const u8,
+    err: *Io.Writer,
+) !void {
+    var seed_bytes: [8]u8 = undefined;
+    io.random(&seed_bytes);
+    const seed = std.mem.readInt(u64, &seed_bytes, .little);
+    try err.print("sim-swarm: seed {d}\n", .{seed});
+    try err.flush();
+    const seed_option = try std.fmt.allocPrint(gpa, "-Dseed={d}", .{seed});
+    const ops = "-Dops=" ++ swarm_operations;
+    const swarm = [_][]const u8{
+        zig, "build", "sim-swarm", seed_option, ops, "-Dswarm-profile=auto",
+    };
+    run(io, &swarm, null) catch {
+        try err.print("check: FAIL {s} (zig build sim-swarm -Dswarm-profile=auto: seed above)\n", .{
+            label,
+        });
+        return error.CommandFailed;
+    };
+    run(io, &.{ zig, "build", "sim-swarm-teeth" }, null) catch {
+        try err.print("check: FAIL {s} (zig build sim-swarm-teeth: the simulator did not catch " ++
+            "the fetch plan's test-only fault)\n", .{label});
+        return error.CommandFailed;
+    };
+}
+
+/// The size in bytes of `path` (0 if it is not there).
+fn tree_bytes(gpa: std.mem.Allocator, io: Io, path: []const u8) u64 {
+    const text = output(gpa, io, &.{ "du", "-sb", path }) catch return 0;
+    const end = std.mem.indexOfAny(u8, text, " \t") orelse return 0;
+    return std.fmt.parseInt(u64, text[0..end], 10) catch 0;
+}
+
+/// Says so when `.zig-cache/o` is past `cache_note_bytes`. Every rebuild of a changed binary
+/// adds a copy and nothing removes the old ones; emptying it costs one full rebuild.
+fn note_cache(gpa: std.mem.Allocator, io: Io, err: *Io.Writer) void {
+    const bytes = tree_bytes(gpa, io, ".zig-cache/o");
+    if (bytes < cache_note_bytes) return;
+    err.print("check: note: .zig-cache/o holds {d} MiB; outside a build, rm -rf .zig-cache\n", .{
+        bytes >> 20,
+    }) catch {};
+}
+
+/// `zig build test` as `user` in a scratch worktree of HEAD that `user` owns. Then checks that
+/// the run was real: it built `zcube-agent` (the FakeRuntime tests skip without it) and left no
+/// supervisor of `user` running.
+fn test_as(
+    gpa: std.mem.Allocator,
+    io: Io,
+    zig: []const u8,
+    user: []const u8,
+    err: *Io.Writer,
+) !void {
+    try run(io, &.{ "git", "worktree", "prune" }, null);
+    if (Io.Dir.cwd().access(io, scratch, .{})) |_| {
+        try run(io, &.{ "git", "worktree", "remove", "--force", scratch }, null);
+    } else |_| {}
+    try run(io, &.{ "git", "worktree", "add", "--quiet", "--detach", scratch, "HEAD" }, null);
+    defer run(io, &.{ "git", "worktree", "remove", "--force", scratch }, null) catch {};
+    const absolute = try Io.Dir.cwd().realPathFileAlloc(io, scratch, gpa);
+    const kept = try keep_cache(gpa, io, user);
+    const global = try std.fmt.allocPrint(gpa, "{s}/global", .{kept});
+    const local = try std.fmt.allocPrint(gpa, "{s}/local", .{kept});
+    try seed_packages(gpa, io, zig, global, absolute, user);
+    try run(io, &.{ "chown", "-R", user, scratch }, null);
+    const cache = try std.fmt.allocPrint(gpa, "ZIG_GLOBAL_CACHE_DIR={s}", .{global});
+    const home = try std.fmt.allocPrint(gpa, "HOME={s}", .{absolute});
+    const argv = [_][]const u8{
+        "runuser", "-u", user, "--", "env", cache, home, zig, "build", "test", "--cache-dir", local,
+    };
+    try run(io, &argv, scratch);
+    const agent = try std.fmt.allocPrint(gpa, "{s}/zig-out/bin/zcube-agent", .{absolute});
+    Io.Dir.cwd().access(io, agent, .{}) catch {
+        try err.print("check: the test run as {s} did not build zcube-agent\n", .{user});
+        return error.AgentMissing;
+    };
+    if (succeeds(io, &.{ "pgrep", "-u", user, "-f", "[z]cube-agent supervise" })) {
+        try err.print("check: the test run as {s} left zcube-agent supervisors running\n", .{
+            user,
+        });
+        return error.LeftRunning;
+    }
+}
+
+/// The directory that keeps the tester run's local and global caches between checks. It lives
+/// under this worktree's `.zig-cache` (so `rm -rf .zig-cache` resets it and two worktrees never
+/// share one), is created empty and handed to `user` here, and from then on is written only by
+/// `user`'s build. Past `kept_cache_max_bytes` it is deleted first. Returns its absolute path.
+fn keep_cache(gpa: std.mem.Allocator, io: Io, user: []const u8) ![]const u8 {
+    if (tree_bytes(gpa, io, kept_cache) > kept_cache_max_bytes) {
+        try run(io, &.{ "rm", "-rf", kept_cache }, null);
+    }
+    try run(io, &.{ "mkdir", "-p", kept_cache ++ "/local", kept_cache ++ "/global" }, null);
+    const dirs = [_][]const u8{
+        "chown",                 user,
+        kept_cache,              kept_cache ++ "/local",
+        kept_cache ++ "/global",
+    };
+    try run(io, &dirs, null);
+    return Io.Dir.cwd().realPathFileAlloc(io, kept_cache, gpa);
+}
+
+/// The scratch tree starts without packages, so the pinned `zigbox` package would be fetched
+/// again. Copy what the build just used: the unpacked `zig-pkg` of this tree and the packages
+/// of the invoking user's global cache, which are added to the kept cache only where missing
+/// and handed to `user` (root is the only writer, and only of these entries).
+fn seed_packages(
+    gpa: std.mem.Allocator,
+    io: Io,
+    zig: []const u8,
+    global: []const u8,
+    tree: []const u8,
+    user: []const u8,
+) !void {
+    if (Io.Dir.cwd().access(io, "zig-pkg", .{})) |_| {
+        try run(io, &.{ "cp", "-a", "zig-pkg", tree }, null);
+    } else |_| {}
+    const env = try output(gpa, io, &.{ zig, "env" });
+    const key = ".global_cache_dir = \"";
+    const start = (std.mem.indexOf(u8, env, key) orelse return) + key.len;
+    const length = std.mem.indexOfScalar(u8, env[start..], '"') orelse return;
+    const packages = try std.fmt.allocPrint(gpa, "{s}/p", .{env[start..][0..length]});
+    Io.Dir.cwd().access(io, packages, .{}) catch return;
+    try run(io, &.{ "cp", "-a", "--update=none", packages, global }, null);
+    const kept_packages = try std.fmt.allocPrint(gpa, "{s}/p", .{global});
+    try run(io, &.{ "chown", "-R", user, kept_packages }, null);
+}
+
+fn usage(err: *Io.Writer) !u8 {
+    try err.print("usage: check <zig> <user|->\n", .{});
+    return 2;
+}
+
+// `run` is the gate's only judge of a nested build: a non-zero exit must fail it. (A passing test
+// step that wrote to stderr makes the build runner print `failed command: ... --listen=-` under
+// a success; that line alone is not a failure, so the gate does not read it as one.)
+test "run fails on a non-zero exit and passes on zero" {
+    const io = std.testing.io;
+    try std.testing.expectError(error.CommandFailed, run(io, &.{ "sh", "-c", "exit 3" }, null));
+    try std.testing.expectError(error.CommandFailed, run(io, &.{ "sh", "-c", "kill -9 $$" }, null));
+    try run(io, &.{ "sh", "-c", "exit 0" }, null);
+}

@@ -1,0 +1,194 @@
+# The simulation fleet
+
+One host that runs the simulators (`sim_cluster`, `sim_cluster --c1` and `sim_swarm`) on fresh seeds around the clock, at the tip of `main`, and files what it finds. C1 ships only while it runs (`docs/briefs/c1.md`, "Gate for shipping C1"); this is how to put it up. The brief is `docs/briefs/c1-9.md`.
+
+## What runs
+
+`run.sh` (under systemd, as the unprivileged user `simfleet`, one loop per state directory: it takes `flock` on `state/lock`) loops over rounds:
+
+1. `git ls-remote --heads origin` (5 minute deadline) for the tips of `SIM_FLEET_BRANCH` (`main`) and of each branch in `SIM_FLEET_SOAK_REFS` (below). For each branch whose tip is a commit it has not built, `git fetch` that branch, check the commit out in the branch's own git worktree (`state/refs/<hash of the name>/src`; the service checkout, `/var/lib/sim-fleet/zigcube`, which `run.sh` runs from, is never checked out or moved) and build there, with `zig build -Doptimize=ReleaseSafe --prefix state/bin/<sha>`, only the producers that commit lists in `zig build -l`: `sim-cluster-exe`, `sim-swarm-exe` and `sim-canary-exe` (1 hour deadline; a commit already built for another branch is shared; a commit with neither of the first two does not build). A kind whose producer the commit lacks is skipped on it, logged once. A soaked commit's own `sim_fleet` is never built or run: every ingest, heartbeat and token check, and the state file, use **the fleet's own `sim_fleet`**, built once at start from the service checkout into `state/fleet` (a failed build stops the service, exit 2). So a commit from before a change to `sim_fleet` (a new state version, `--ref`, `heartbeat`) soaks as well as `main`, and the reporter changes only on a redeploy (`setup.sh`, "Deploy"). Only a build that succeeded becomes the branch's build in use (`state/built` for `main`, `state/refs/<hash of the name>/built` for a soak branch); a tip that does not build is recorded in the branch's `broken`, logged once, and the branch's last good build keeps running. Both survive a restart, so a restart neither rebuilds a good commit nor retries a bad one. A lookup that fails keeps every branch's build. The binaries of a commit no branch uses are deleted.
+   - **Which branch a round runs.** Every worker of a round runs one branch's build; the branches with a build take turns, one round each, `main` first and then the soak branches in the order given (round robin; the place survives a restart in `state/ref-next`). With one soak branch, `main` and it get every other round; with none, every round is `main`'s, as before. A branch whose tip never built is skipped until it builds.
+   - **A branch that disappears** from the remote (deleted after a release) is dropped: one log line, `branch NAME is gone from the remote; dropped until it comes back`, its build forgotten and its binaries deleted. If it comes back (`branch NAME is back`), it is built again. Remove it from `SIM_FLEET_SOAK_REFS` at the next redeploy.
+2. **Drawn runs.** `SIM_FLEET_OPS` is `auto` and `SIM_FLEET_PROFILE` is `auto` by default: each seed draws its own size, nodes, lease ttl (8,000 to 10,000 ms, the range the server admits: `docs/decisions/2026-11-06-renewal-before-fence.md`), replica counts and fault profile (`docs/core.md`, "Profiles and shapes"), and the summary line reads `drawn operations`. A host installed earlier keeps `SIM_FLEET_OPS=100` in `/etc/sim-fleet/fleet.env`: set it to `auto` there when redeploying.
+3. Three kinds of workers, each a parallel run over fresh random ranges (1 hour deadline each): `sim-cluster` (`sim_cluster --seeds A..B auto --profile=auto --shrink`, `SIM_FLEET_BATCH_CLUSTER` seeds, default `SIM_FLEET_BATCH`, 100), `sim-c1` (the same with `--c1 --signed`: authority.md's invariants at every revision, in B5's signed-jobs world, J12, `docs/core.md`; `SIM_FLEET_BATCH_C1`, default 100; its summary line reads `sim-cluster --c1: seeds ...`, so output of a run without `--c1` is refused as sim-c1) and `sim-swarm` (`sim_swarm --seeds A..B auto --profile=auto --shrink`: the C2 fetch plan and locality estimate; `SIM_FLEET_BATCH_SWARM`, default 50000). `SIM_FLEET_WORKERS_CLUSTER`, `SIM_FLEET_WORKERS_C1` and `SIM_FLEET_WORKERS_SWARM` set how many workers each kind gets; the defaults are 1, 1 and 1, one core each of the 4 vCPU host, so each kind gets a core. (`SIM_FLEET_WORKERS` of the first release is ignored, with a log line; set a kind to 0 to stop it.) A seed of `sim_swarm` is about 700 times cheaper than one of `sim_cluster` (1.5 ms against 1.1 s, measured 2026-11-04, ReleaseSafe, 100 operations), so a swarm batch is 50000 seeds and ends about when a cluster batch does; the swarm default ignores `SIM_FLEET_BATCH` on purpose, since an installed `fleet.env` already sets that to 100 and `setup.sh` never overwrites it. The tracker's seeds per kind therefore differ by that factor: that is not an imbalance. To rebalance, change the counts or the `SIM_FLEET_BATCH_*` sizes.
+4. **The teeth canary.** Every `SIM_FLEET_CANARY_ONE_IN` rounds (default 50; 0 never, 1 every round) the round has one more worker: the next fault-on runner of a fixed cycle (`canary_pick` in `run.sh`). The cycle is the manifest `zig build sim-canary-exe` installs at `share/sim-fleet/canaries.txt`, generated by `build.zig` from `c1_teeth_roots` (`<runner> <kind> <seeds> <symptom>`): `sim_teeth`, the `sim_c1_teeth_*` (one per `c1_teeth_roots` entry) (each with the symptom its fault must break) and `sim_swarm_teeth`. The canary runs like a worker of its kind, on a fresh random seed range, with drawn operations and `--profile=auto` (whatever `SIM_FLEET_OPS` and `SIM_FLEET_PROFILE` say), and without `--shrink` (owner decision, 2026-11-05: a caught fault needs no shrinking and a miss has nothing to shrink; the other kinds keep it), so it proves that the fleet's own settings still detect. Its real output goes to `sim_fleet ingest --canary RUNNER --canary-seeds A..B [--expect-symptom TEXT[|TEXT...]]`, which reads it with its kind's parser, filed under the kind `sim-canary`, and prints `sim-fleet: canary RUNNER: caught|MISSED|WRONG SYMPTOM|CRASHED`:
+   - **caught:** a seed failed (with the symptom, for a sim-c1 runner). Nothing is filed; the tracker counts the canary's seeds under `sim-canary`.
+   - **missed:** seeds ran and none failed. Filed as `sim-canary: the fleet has stopped detecting: <runner> failed no seed (step: canary)`, with the seed range and the replay `zig build sim-canary-exe && zig-out/bin/<runner> --seeds A..B auto --profile=auto [--c1]`.
+   - **wrong symptom:** seeds failed, but none with the runner's symptom: the fault broke something else. Filed apart from a miss (step `canary-symptom`), with the first failing seed's replay and the check it failed instead.
+   - **crashed:** the runner was killed by a signal (its range is replayed seed by seed, each crash recorded as a worker's would be), timed out (`SIM_FLEET_BATCH_TIMEOUT`; the message names no seed, so one hang is one issue) or refused its arguments (exit 2): a canary that cannot run proves nothing, so each is a crash record under `sim-canary`.
+   - **not run:** the host killed the runner for memory (exit 137), or no seed could start: a host event, counted in the day and never filed (`sim-fleet: canary RUNNER: NOT RUN`). It runs again next round, at most `SIM_FLEET_CANARY_TRIES_MAX` (5) times in a row, then the cycle moves on, the log says so, and one crash is recorded under `sim-canary` (`crash: not run in N tries (step: canary)`: a lasting blind spot is one issue, and the day's totals count it as a crash). The runner is tried again when the cycle comes round to it. `SIM_FLEET_CANARY_TRIES_MAX` must be a number of 1 or more, or the fleet refuses to start.
+
+   Canary rounds are not counted as soak seeds (the canary runs fault-on runners, not the commit's simulators).
+
+   A canary that was not caught keeps its output and stderr in `$STATE/crashes` (`*-canary-<runner>-*`). A canary whose report was not filed because GitHub asked to wait or stopped the round, or the reporter timed out (`sim_fleet` exits 124, or 2: any environment error of the reporter, GitHub's hold or stop included, and also an unwritable or unreadable state file or token, or no memory), does not move the cycle on and runs again next round, at most `SIM_FLEET_CANARY_TRIES_MAX` times in a row; its seeds are counted in the day once, when it is filed. When the reporter refuses the output (exit 1), another try would get the same answer: the output stays in `$STATE/crashes` and the cycle moves on. Exit 3 (counted, but GitHub kept part of the round from being written: the tracker refused a post, or an issue is locked) moves the cycle on as 0 does; the round is not clean, so no heartbeat is sent. Each runner's range is sized from its catch rate, measured over 240 seeds or more (drawn operations, `--profile=auto`, 2026-11-05), so that a miss by chance is below 1e-9 per run even at a catch rate well under the one measured:
+
+   | Runner | Caught (measured) | Assumed floor | Seeds | P(miss by chance) |
+   |---|---|---|---|---|
+   | `sim_teeth` | 40 of 40 (reviewer: 11 of 11) | 0.9 | 10 | 1.0e-10 |
+   | `sim_c1_teeth_allocation`, `_readiness`, `_stale` | 40 of 40 each | 0.7 | 20 | 3.5e-11 |
+   | `sim_c1_teeth_skew` | 207 of 240 | 0.6 | 30 | 1.2e-12 |
+   | `sim_c1_teeth_locality` | 206 of 240 (reviewer: 10 of 11) | 0.6 | 30 | 1.2e-12 |
+   | `sim_c1_teeth_wedge` (with its symptom) | 163 of 240 (reviewer: 4 of 11) | 0.5 | 40 | 9.1e-13 |
+   | `sim_c1_teeth_job_claim`, `_double`, `_rewrite` | 39, 40, 40 of 40 (100 operations, `--c1`, 2026-11-06) | 0.7 | 40 | 1.2e-21 |
+   | `sim_c1_teeth_job_restart` | 33 of 40 (same) | 0.5 | 40 | 9.1e-13 |
+   | `sim_c1_teeth_job_cancel` | 15 of 40 (same) | 0.25 | 80 | 1.0e-10 |
+   | `sim_c1_teeth_job_deadline`, `_deadline_late` | 25 and 24 of 40 (same) | 0.4 | 50 | 8.1e-12 |
+   | `sim_c1_teeth_job_deadline_offline` | 11 of 40 (100 operations, `--c1`, 2026-11-07) | 0.25 | 80 | 1.0e-10 |
+   | `sim_c1_teeth_job_gap` | 20 of 40 (5 of 10 in 1..10) | 0.5 | 50 | 8.9e-16 |
+   | `sim_c1_teeth_job_refused_loop` (with its symptom, J10) | 67 of 80 (drawn operations, `--profile=auto`, 2026-11-08) | 0.6 | 80 | 1.5e-32 |
+   | `sim_c1_teeth_job_unclaimed` (with its symptom, J8) | 79 and 92 of 200 (100 operations, `--strong`, plain and `--c1`, seeds 1..200); 108 and 106 of 200 (drawn operations, `--profile=auto`, same; 2026-11-08) | 0.3 | 60 | 5.1e-10 |
+   | `sim_c1_teeth_job_wipe` (with its symptom, J2 or J7: `--expect-symptom` takes `|`-separated alternatives and a bare "J" matches nothing) | 26 and 26 of 200 (100 operations, `--strong`, plain and `--c1`); 25 of 200 plain (drawn operations, `--profile=auto`); 4 of 60 `--c1` (same; a rate of about 0.07, wide error) | 0.065 | 300 | 1.9e-9 |
+   | `sim_c1_teeth_register_unchecked` (with its symptom, I1b) | 23 of 40 (100 operations, `--c1`, seeds 1..40, 2026-11-18; 15 others fail on liveness, not I1b) | 0.5 | 40 | 9.1e-13 |
+   | `sim_c1_teeth_relay_leak` (with its symptom, R1) | 37 and 32 of 40 (100 operations, `--strong` implied, plain and `--c1`); 35 of 40 `--c1` (drawn operations, `--profile=auto`; 2026-11-10) | 0.8 | 20 | 1.2e-14 |
+   | `sim_c1_teeth_relay_dropped` (with its symptom, R3) | not yet measured | not yet set | 20 | not yet computed |
+   | `sim_c1_teeth_job_cert_stale` (with its symptom, R4: a stale epoch) | 104 of 240 (drawn operations, `--profile=auto`, `--c1`, `--strong` implied; 2026-11-14) | 0.3 | 60 | 5.1e-10 |
+   | `sim_c1_teeth_job_cert_image` (with its symptom, R4: another image) | 92 of 240 (same) | 0.25 | 80 | 1.0e-10 |
+   | `sim_c1_teeth_job_cert_long` (with its symptom, R5) | 235 of 240 (same) | 0.8 | 20 | 1.0e-14 |
+   | `sim_c1_teeth_relay_conn_leak` (with its symptom, R6) | 223 of 240 (same; one seed fails R7 first) | 0.7 | 20 | 3.5e-11 |
+   | `sim_c1_teeth_relay_stop_leak` (with its symptom, R7) | 95 of 240 (same) | 0.25 | 80 | 1.0e-10 |
+   | `sim_c1_teeth_job_untrusted` (with its symptom, J12) | 23 of 30 `--c1` (drawn operations, `--profile=auto`; 2026-11-13) | 0.6 | 30 | 1.2e-12 |
+   | `sim_c1_teeth_placement_exclusive` (with its symptom, P1) | 15 of 20 (100 operations, `--c1`, `--tenants` implied; 2026-11-14) | 0.5 | 35 | 2.9e-11 |
+   | `sim_c1_teeth_relabel_kept` (with its symptom, P1) | 25 of 40 (100 operations, `--c1`, `--tenants` implied; 6 of 10 in 1..10; 2026-11-14) | 0.4 | 50 | 8.1e-12 |
+   | `sim_c1_teeth_job_ledger_small` (with its symptom, J8: the start ledger is full (16 runs)) | 8 of 10 (seeds 1..10, 400 operations, `--c1`, 2026-11-13); drawn operations (52 to 329) start too few runs to fill 16, so its canary is the fixed range `1+15@400` (#236, docs/decisions/2026-11-13-ledger-canary-fixed-ops.md) | 0.8 | 15 | 3e-11 |
+   | `sim_c1_teeth_job_evicted` (with its symptom, J8: a run that no node started) | sparse: about 1 seed in 100, and the only known hit is seed 284 at 300 (186 until #225's fix, 2026-11-13; 241 until #237's registration order, 2026-11-18) operations, `--c1`, default profile (2026-11-11). Its canary is the fixed range `284+1@300` (manifest `FIRST+COUNT@OPS`; `run.sh` passes `--c1` only), about 55 s, so it re-proves that one seed, not a hit rate | n/a | 1 | n/a (a seed-specific check: it says whether the clause still fires at 284, not that the clause is caught in general) |
+   | `sim_c1_teeth_job_pass_break` (with its symptom, J6) | sparse: the agent's job pass ends at the first server failure (#247, #248); the known hits are seeds 225 and 180 of the `job_evicted` world at 300 operations, `--c1` (2026-11-14). Its canary is two lines of the manifest, the fixed ranges `225+1@300` and `180+1@300` (`also_seeds`), so it re-proves those two seeds, not a hit rate; the unit tests of #247 in `src/agent_jobs_test.zig` are the real guard | n/a | 1 + 1 | n/a (a seed-specific check) |
+   | `sim_swarm_teeth` | 192 of 400 (reviewer: 51 of 101) | 0.4 | 200 | 4e-45 |
+
+   At one canary every 50 rounds, one round a minute, the fleet runs about 10,500 canaries a year (525,600 / 50), so a false miss in a year stays below about 1.1e-6 (the worst row, 1.0e-10 per run, times 10,500); rounds longer than a minute make it smaller. A filed miss is therefore a real loss of detection until shown otherwise. Change a seed count in `build.zig` (`c1_teeth_roots`, `canary_seeds_teeth`, `canary_seeds_swarm_teeth`) and in this table together. `zig build test` runs `ops/sim-fleet/test-canary.sh` (fake runners that print what the real ones print, the generated manifest and the real `sim_fleet --dry-run`) and `test-crash-record.sh`. A new canary runner needs no step on the host: the fleet follows `main` and builds `sim-canary-exe` with it (a change to `sim_fleet` itself needs a redeploy, "Deploy").
+   Replay lines of `sim-cluster` issues filed before B1 slice 5 need `--jobs=false`: jobs are on by default and give every seed another world (`--jobs=false` leaves the existing draws unchanged).
+5. One `sim_fleet ingest --kind K --commit SHA --ref BRANCH --round-started T` per kind of the round (10 minute deadline each; the kinds one after another), so the state file has one writer and each failure is looked at once per round. A failure is filed with the commit it ran on; its fingerprint stays kind + check + step, so one bug on `main` and on a release branch is one issue, commented once per commit.
+6. **The heartbeat and the token check** (`sim_fleet heartbeat`, 10 minute deadline): a `GET /repos/Zigbox/zigcube` with the token, which reads the token's expiry (below); then, after a **clean round** (below) when the heartbeat file holds a URL, one `GET` of that URL. See "Heartbeat" and "Token expiry".
+
+`sh ops/sim-fleet/test-crash-record.sh zig-out/bin/sim_fleet` checks that a crash record `run.sh` writes for each kind (drawn and fixed operations) is read back by `sim_fleet ingest --dry-run`; run it after changing `crash_record`.
+
+A producer that **crashes** (killed by a signal: a panic is exit 134) loses its range's output, so `run.sh` keeps its output and stderr in `state/crashes/` (the last 20) and replays the range one seed at a time with `--trace-steps` (`sim_swarm` has none: its crash is in the step `run`, with the replay `zig-out/bin/sim_swarm N auto --profile=auto`). `--trace-steps` also writes each seed's concrete replay line (`--profile`, `--lease-ttl-ms`, `--replicas-pct`, `--heal-at`) to stderr as the seed starts, so the crash record carries a full replay and a batch that times out (124) or is killed (137) logs the seed it was on. The batches run with it too. Crash files are named by kind. A seed that crashes again becomes a `seed N: CRASHED: <panic message>` record with the step it was in (the last `step:` line `--trace-steps` wrote, `setup` if none); the other seeds count as usual. A run that timed out (124) or that the kernel killed for memory (137) is the host's: logged, not counted. A seed that could not start (`FAILED: out of memory`, `step: setup`) is counted and never filed.
+
+`sim_fleet ingest`:
+
+- **Fingerprint** of a failure = run kind (`sim-cluster`, `sim-c1` or `sim-swarm`: the same check failing in two kinds is two issues) + the failing check (or, for a crash, the panic message with its digits replaced by `N`, marked as a crash) + the step it failed at (`faults`, `healed`, `convergence`, `end`; for `sim-swarm` `fetch`, `locality`; a crash is the step it was in, `run` for a swarm crash). Not the seed, commit or operation count: one bug is one issue across commits.
+- A fingerprint with no issue becomes an issue on `Zigbox/zigcube`, labelled `sim-fleet`: commit, seed, shrunk operations, the one-line replay command (`git checkout <commit> && zig build ... && zig-out/bin/sim_cluster <seed> <ops> ...`; `sim-swarm-exe` and `sim_swarm <seed> <ops>` for a swarm failure, whose title and body say `run: sim-swarm`), and a hidden `<!-- sim-fleet fingerprint: ... -->` marker. Other seeds of the same round that failed alike are listed in it.
+- A fingerprint that has an issue (open or closed) gets a **comment** only when it fails on a commit it has not been reported on, and at most 4 times per UTC day. Every seed is still counted in the daily totals. A comment on a closed issue is a regression; reopen it by hand.
+- **Parser checks.** The summary line must be the kind's own, and its `F of T failed` must match the `seed N:` records before it and its range; otherwise the whole round is refused (exit 1, logged, nothing counted), so a truncated or mixed-up output never counts a kind as covered.
+- **Commits soaked.** Each producer ingest (not the canary's) also records, per UTC day, commit, kind and branch, the seeds and failures, the first round's start, the last round's end and the seconds under soak (`soak` lines, at most 64 per day). The seconds are the union of the commit's rounds: each round adds the part of its span (start to end) not already covered by an earlier round of that commit, so the gaps between its rounds, when the fleet ran another branch or did not run, are not counted, and one round's kinds count once. The day's tracker post has a section "Commits soaked (hours: the time its rounds ran):", one line per commit: its branches, its hours under soak that day, its hours since it has been under soak without a break (counted back day by day while each earlier day has a round of it; a day without one ends the run) and since when, and the seeds and failures per kind:
+
+  ```
+  - `3e5d87d...` (claude/release-0.6): 11.9 h this day, 35.6 h since 2026-11-12 00:01 UTC; sim-cluster 1200 seeds (0 failed), sim-c1 1100 seeds (0 failed), sim-swarm 600000 seeds (0 failed)
+  ```
+
+  That line is what a release quotes for "24 hours, no issue open against it".
+- **Seeds per day.** The state file counts seeds, failures, crashes, seeds that could not start, and rounds per UTC day, and the seeds of each failure. The state file also counts seeds and failures per kind (`kind` lines, state version 3; a version 1 or 2 file loads, its seeds counted as `sim-cluster`). **State version 4** (2026-11-15) adds `soak`, `token-expires` and `token-noted` lines; a version 1, 2 or 3 file loads and is written back as version 4. To roll back to an older `sim_fleet`, see "Rolling back". The first round after midnight posts the previous day's totals on the **tracking issue** (`SIM_FLEET_TRACKER`) *before* anything else, with the seeds and failures of each kind ("- sim-swarm: 1200 seeds, 0 failed") and the seeds of each failing issue ("- #31: 12 seeds"). No comment for a day means the fleet did not run that day. Look at it daily; that is the alarm.
+- **When GitHub says no.** An issue that is gone (404 or 410: deleted or transferred) is forgotten and the failure is filed again. A locked issue (403) is skipped until the next commit. A rate limit (429, or 403 with `Retry-After` or no requests left) stops every write for the round and holds them until the wait GitHub asked for (at most a day) is over; the rounds in between are counted, and their failures are reported when they come back. A tracking issue that refuses the totals is retried each round. A request never follows a redirect, so the token never goes to another host.
+- Filed fingerprints are in `/var/lib/sim-fleet/state/state.txt`. If that file is missing, the markers rebuild it (it lists the issues labelled `sim-fleet`, the latest 500). A state file that exists but cannot be read is an error (exit 2); it is never taken for empty.
+- Exit codes of `sim_fleet`: 0 done, 1 bad input (a batch cut short is refused, not guessed at), 2 environment (state file, token, GitHub). The state is saved whatever GitHub answered; a round whose filing stopped is kept in `state/last-failed-round-<kind>.txt`, and a failure that is real comes back in a later round.
+
+`sim_fleet --kind sim-cluster|sim-c1|sim-swarm` names the producer of the output; it picks the summary line to expect, the build step in the replay line and the kind in the fingerprint. **Hook for `test-store-faults`** (once a day, not built): add a second parser in `src/sim_fleet_issue.zig` (a failure is `check` + `step` + a replay line), allow its kind in `parse_args` in `src/sim_fleet.zig`, and add a once-a-day branch to `run.sh` that runs `zig build test-store-faults` and pipes its output to `sim_fleet ingest --kind store-faults`. Its fingerprints hash the kind, so they never meet the simulator's.
+
+## What the owner provides
+
+1. **A host**: Ubuntu 24.04, x86_64, 4 vCPU, 8 GB RAM, 40 GB disk or more (the defaults are sized for a Hetzner CPX32: 4 vCPU, 8 GB, 160 GB), outbound HTTPS to github.com, api.github.com and ziglang.org, and nothing inbound. Three cores run the producers (one worker per kind), one is left for the reporter, git and builds. To run more seeds, add hosts.
+2. **A token**, a fine-grained personal access token (Settings, Developer settings, Fine-grained tokens):
+   - Resource owner: `Zigbox`. Repository access: **only** `Zigbox/zigcube`.
+   - Repository permissions: **Issues: Read and write**. Nothing else (Metadata: read is added by GitHub itself).
+   - Expiry: the longest the organisation allows; put the date in the calendar. The fleet warns too (see "Token expiry"). An expired or revoked token makes `sim_fleet` exit 2 with `token refused (expired or revoked): replace /etc/sim-fleet/token` in the journal and files nothing; no heartbeat is sent, and seeds per day stops appearing on the tracker.
+   - The label `sim-fleet` must exist in the repository (it does). Without it issues are still filed but are unlabelled, and the recovery of a lost state file cannot find them.
+3. **Optionally, a heartbeat URL**: a dead man's switch (for example a healthchecks.io check, or any service that alarms when a URL is not fetched for a while), set to expect one `GET` every few minutes to an hour (a round takes about 2 to 10 minutes) with a grace of a few hours. It must be `https` and must answer without a redirect.
+4. **A tracking issue**: "Simulation fleet: seeds per day", pinned. For Zigbox/zigcube it is #29: `SIM_FLEET_TRACKER=29`.
+
+The token only ever sits in `/etc/sim-fleet/token` (root, mode 600). systemd hands the service a private copy (`LoadCredential`), `sim_fleet` reads it from there, and nothing prints it: a refused request logs its method, path and status, never a header. The copy is readable by every process running as `simfleet`, which includes `sim_cluster` and `zig build` of whatever is on `main`: a commit on `main` can read the token. That is why it may only write issues of this one repository.
+
+## Heartbeat
+
+The tracker comment shows an outage a day late; the heartbeat shows it within the grace period of the service that receives it. After each **clean round**, `sim_fleet heartbeat` sends one `GET` to the URL in `/etc/sim-fleet/heartbeat-url` (root, mode 600; systemd hands the service a private copy with `LoadCredential`, like the token) and logs `sim-fleet: heartbeat sent` or `sim-fleet: heartbeat failed: status N` (or `no answer (...)`). A round is clean when at least one producer seed was counted (some kind's ingest exited 0 or 3) and every ingest, the canary's too, exited 0. So nothing is sent after:
+
+- a round in which no seed was counted: every producer timed out, was killed for memory or exited 2, or the commit has no producer;
+- an ingest that failed (a 401, an unwritable state file, a timeout: exit 1, 2 or 124);
+- an ingest that counted the round but that GitHub kept from being written in full (exit 3): a hold ("GitHub asked to wait"), the tracker refusing a post, or a locked (forbidden) issue. The round's seeds are counted, and it is not kept in `last-failed-round-*`.
+
+A fleet that runs but cannot simulate or cannot file goes quiet.
+
+- The URL is a secret (whoever has it can fake the fleet's health): it is read only by `sim_fleet`, from the file; it is never printed, logged or put on a command line, and the log lines carry no part of it.
+- It must be `https` (`http` only to 127.0.0.1, for the tests). A redirect is never followed: a 3xx is logged as `heartbeat failed: status 3xx`. No token or other header is sent with it.
+- An empty or missing file means no heartbeat; `run.sh` logs `no heartbeat URL (...): no heartbeat is sent` once at start. The unit starts without the file (`SetCredential=heartbeat-url:` is the empty fallback systemd uses when `LoadCredential` finds none), and `setup.sh` creates it empty when it is missing.
+- Each round's heartbeat call also sends one `GET /repos/Zigbox/zigcube` with the token (the token check), so the fleet makes one more GitHub request per round than its ingests: about 1,440 a day at a round a minute, far below the token's 5,000 an hour.
+- Set it with `setup.sh --heartbeat-file PATH` (copied, never printed; the source is left alone), or by hand: `install -m 600 /dev/null /etc/sim-fleet/heartbeat-url`, write the URL into it, `systemctl restart sim-fleet`.
+
+## Token expiry
+
+Each round's token check (`GET /repos/Zigbox/zigcube`) reads GitHub's `github-authentication-token-expiration` header and keeps the expiry in the state file (`token-expires`; a token with no expiry sends no header and nothing is kept). A header that is missing or has a form `sim_fleet` does not read is logged once per UTC day (`token-noted`), never fails the round, and leaves no warning. When it is under 14 days away, the journal logs `token expires <date>: replace it (ops/sim-fleet/README.md)` every round and the daily tracker post ends with the same line. To replace the token: make a new one as in "What the owner provides", then `sh /root/zigcube/ops/sim-fleet/setup.sh --token-file NEWFILE` (it restarts the service), and delete `NEWFILE`. A refused token logs `token refused (expired or revoked): replace /etc/sim-fleet/token`.
+
+## Soaking a release branch
+
+A release is cut from a commit the fleet has run for 24 hours (AGENTS.md, "Releases"). To soak a release branch before it is merged, as root:
+
+1. Push the branch (for example `claude/release-0.6`) to `Zigbox/zigcube`. The fleet reads it through `git ls-remote` and `git fetch`; it needs no other access.
+2. Add it to `/etc/sim-fleet/fleet.env`: `SIM_FLEET_SOAK_REFS=claude/release-0.6` (space-separated for more, at most 4; names of `[A-Za-z0-9._/-]`, no `..`), then `systemctl restart sim-fleet`. The journal shows `building <sha> (claude/release-0.6)`, then rounds alternate between `main` and the branch. Keep `SIM_FLEET_BRANCH=main`: the branch is built in its own worktree and runs with the fleet's own `sim_fleet`, so a branch cut before a change to `sim_fleet` soaks too. (Pinning `SIM_FLEET_BRANCH` to the release branch instead stops `main`'s coverage.)
+3. A push to the branch is a new commit: it is built, and its 24 hours start again. Each day's tracker post lists the branch's commit under "Commits soaked" with its hours and seeds per kind; a failure on it is filed (or commented) with its commit like any other, and an issue open against that commit blocks the release.
+4. After the release, remove it from `SIM_FLEET_SOAK_REFS` and restart. If the branch is deleted first, the fleet drops it with one log line and goes on with `main`.
+
+Each branch soaked takes rounds from `main`: with one soak branch `main` gets half the rounds, so its seeds per day halve while the soak runs.
+
+## Deploy
+
+**Redeploying an existing host** (a release that changed `ops/`, `run.sh`, the state format or the sim_fleet binary): as root,
+
+```
+git -C /root/zigcube pull           # the checkout setup.sh is run from, FIRST: setup.sh installs from it
+sh /root/zigcube/ops/sim-fleet/setup.sh
+systemctl restart sim-fleet
+journalctl -u sim-fleet -f
+```
+
+`setup.sh` sets the service checkout to `main` of the remote (`--ref BRANCH` for another, for example a pull request's branch before it is merged) and builds the fleet's own `sim_fleet` from it; `run.sh` never moves that checkout, so this is the only way the fleet's own tools change. The journal then shows `building the fleet's own sim_fleet at <sha> (the service checkout)` at start.
+
+For the release of 2026-11-15 (soak branches, heartbeat, token expiry, state version 4), also, before `setup.sh`: put the heartbeat URL in a file (`install -m 600 /dev/null /root/heartbeat-url`, then write the URL into it with an editor, not on a command line) and run `sh /root/zigcube/ops/sim-fleet/setup.sh --heartbeat-file /root/heartbeat-url` instead (then `rm /root/heartbeat-url`). Without the flag the setup creates an empty `/etc/sim-fleet/heartbeat-url` and the fleet runs without a heartbeat. The new unit has a second `LoadCredential` (with a `SetCredential` fallback, so it starts without the file), installed by this `setup.sh` before the restart. After the restart the journal shows `heartbeat sent` (or `no heartbeat URL`) after the first round, and, once a day has ended, the tracker post has its "Commits soaked" section. `SIM_FLEET_SOAK_REFS` is empty unless set in `fleet.env` (an existing `fleet.env` is not overwritten: add the line when you need it).
+
+Then check the **first tracker post** (the next UTC midnight, or the first round's journal lines): `sim-fleet: sim-c1: N seeds` and `sim-fleet: sim-swarm: N seeds` with N above zero, and the tracker's "Seeds by run" listing non-zero seeds for `sim-c1` and `sim-swarm`. A kind at zero is not covered; do not trust silence. To roll back, see "Rolling back".
+
+## Rolling back
+
+To go back to an older fleet (its `run.sh` and `sim_fleet`), as root:
+
+1. `systemctl stop sim-fleet`.
+2. If the older `sim_fleet` reads an older state version than the one on disk, convert or drop the state file, as `simfleet`:
+   - from version 4 to a `sim_fleet` that reads version 3: `sed -i '/^soak /d;/^token-expires /d;/^token-noted /d;s/^version 4$/version 3/' /var/lib/sim-fleet/state/state.txt` (the soak hours and the token's noted expiry are lost);
+   - to a `sim_fleet` that reads only versions 1 and 2: delete `/var/lib/sim-fleet/state/state.txt`; the issue markers rebuild it, and today's counts per kind are lost.
+3. `sh /root/zigcube/ops/sim-fleet/setup.sh --ref <branch of the older fleet>` (or check the older commit out in `/root/zigcube` and in the service checkout by hand: `setup.sh` installs the unit from `/root/zigcube`).
+4. `systemctl restart sim-fleet`.
+
+An older `run.sh` builds in the service checkout itself; the worktrees under `state/refs/*/src` and `state/fleet` are then unused and can be deleted (`git -C /var/lib/sim-fleet/zigcube worktree prune` after).
+
+On a fresh host, as root (the exact steps for a fresh host are also in the C1-9 report):
+
+```
+cd /root
+git clone https://github.com/Zigbox/zigcube
+sh zigcube/ops/sim-fleet/setup.sh --token-file /root/github/token
+grep SIM_FLEET_TRACKER /etc/sim-fleet/fleet.env      # SIM_FLEET_TRACKER=29
+journalctl -u sim-fleet -f
+```
+
+`setup.sh` is safe to run again. It installs the pinned Zig (checksum verified; the version is in `build.zig.zon`, CI and `.claude/hooks/session-start.sh` too, and `setup.sh` refuses a checkout that wants another), creates the `simfleet` user, clones the repo to `/var/lib/sim-fleet/zigcube`, stops the service if it runs, builds once (so a broken host shows now), installs the unit and enables it. `--token-file PATH` takes the token from a file, never from an argument value or the environment: it is copied (not printed) to `/etc/sim-fleet/token` with mode 600, and the source file is left alone. Without it, create `/etc/sim-fleet/token` by hand (`install -m 600 /dev/null ...`). The service is (re)started only if the token file is not empty. It also caps the journal at 2 GB. `fleet.env` is copied only if it is not there yet: an existing one keeps its settings.
+
+Defaults (`fleet.env`) are sized for 4 vCPU, 8 GB: `SIM_FLEET_WORKERS_CLUSTER`, `_C1` and `_SWARM` (1 each) parallel producer runs (one core each), round outputs overwritten in place (a few MB of state, plus the binaries of the commit in use), and the worktrees, and the build caches (`state/zig-cache`, each worktree's `zig-pkg`, the service checkout's old `.zig-cache`, `~/.cache/zig`) emptied before a build once together they pass `SIM_FLEET_CACHE_MB=8192` (the service checkout's `zig-pkg` stays: the fleet's own `sim_fleet` builds from it). The unit caps the service at 7 GB of memory (`MemoryMax`), so the kernel kills a `sim_cluster`, not sshd; `run.sh` logs that and goes on.
+
+The journal shows `building <sha>` when `main` moves and `sim-fleet: <kind>: N seeds, F failed (...): ...` after each kind's ingest of each round. After changing anything in `ops/`, run `setup.sh` again: it moves the service checkout, which `run.sh` and the fleet's own `sim_fleet` come from, and a restart picks them up.
+
+## Check that it works (before trusting silence)
+
+- **Dry run**, nothing filed, no token needed. As root, with the service running or not:
+
+  ```
+  su -s /bin/sh simfleet -c 'cd && SIM_FLEET_DRY_RUN=1 SIM_FLEET_ROUNDS=1 SIM_FLEET_TRACKER=29 \
+      sh /var/lib/sim-fleet/zigcube/ops/sim-fleet/run.sh'
+  ```
+
+  A dry run uses its own checkout and state under `/var/lib/sim-fleet/dry/` (it clones and builds there first, a few minutes), never the service's, and prints each would-be issue and comment and the summary line. `SIM_FLEET_ROUNDS=1` stops it after one round.
+- **The teeth check**, one would-be issue and then a would-be comment, in any checkout: `zig build sim-teeth-exe sim-fleet-exe`, then `zig-out/bin/sim_teeth --seeds 1..3 100 --shrink > out.txt`, then `zig-out/bin/sim_fleet ingest --dry-run --commit aaa --state /tmp/st < out.txt` and again with `--commit bbb` (the second prints the comment; the same commit again prints neither: one comment per commit). `sim_teeth` is the simulator with the agent's test-only fault on.
+- After the first real day: the tracker has a comment for it.
+
+## Limits
+
+- The token files issues and comments; it cannot close, label or delete. Closing and reopening are the owner's.
+- The fleet tests the tip of `main` and of the branches in `SIM_FLEET_SOAK_REFS` (at most 4); it does not look at pull requests.
+- One host is a single point of failure by design. The heartbeat (if set) and the tracker comment are how an outage shows.
+- `sim_fleet` has no deadline of its own on a GitHub request (the pinned std HTTP client has none); `run.sh`'s `timeout` is the deadline.

@@ -1,0 +1,932 @@
+# Zigcube CI. Every action is pinned to a full commit SHA (the tag is in the comment); Zig is
+# installed from a verified tarball (.github/actions/setup-zig). The other shell lines are the
+# changes job (.github/ci-changes.sh decides what runs), the Postgres 16 check and
+# pg_dropcluster steps (apt installs go through .github/actions/install-apt), and the docker
+# lines of the Postgres demos job that
+# names its service container. The wasm and simulations jobs use the Node that the runner image
+# carries.
+#
+# What runs (docs/decisions/2026-11-04-ci-affected-demos.md):
+#   - A change that touches only documentation (ci-changes.sh says what counts) skips every other
+#     job: they report as skipped, which required checks count as passing.
+#   - Any other change runs format, build, test, wasm and the simulations, and of the rest only
+#     what its paths can affect on a pull request: the Postgres store suites, demo-c0, demo-c1,
+#     demo-b1 (as two jobs, one per database), demo-b7 (SQLite), the Zigbox smoke and the release build
+#     (release.yml's build and checks, publishing nothing). A path no rule names runs everything.
+#   - A push to main, a pull request from a claude/release-* branch and a pull request labelled
+#     full-ci run everything, so a break the filter missed shows on main.
+#   - The jobs whose time is compiling restore the Zig build cache (.github/actions/zig-cache);
+#     the jobs dominated by a real database, a VM or real processes do not.
+name: ci
+
+# CI runs on pull requests and on main only: a pushed branch without a PR runs nothing, so
+# Actions time is spent once per change. Open a PR when a change needs CI. A newer push to the
+# same PR cancels the run it supersedes; runs on main are never cancelled.
+on:
+  push:
+    branches: [main]
+  # `labeled` so that adding full-ci to a pull request starts the full run (any label starts a
+  # run, and the newer run cancels the older one).
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # Decides which of the jobs below run (.github/ci-changes.sh, whose rules .github/ci-changes-test.sh
+  # tests first). Seconds. Renames are listed as a delete and an add (--no-renames), so the old
+  # path is judged too. If the changed paths cannot be listed, the script gets none and runs
+  # everything. If this job itself fails, the jobs below still run (each output defaults to
+  # true), so a broken classifier cannot skip the checks; `!cancelled()` rather than `always()`,
+  # so a run superseded by a newer push is still cancelled.
+  changes:
+    name: changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.pick.outputs.code || 'true' }}
+      store: ${{ steps.pick.outputs.store || 'true' }}
+      demo_c0: ${{ steps.pick.outputs.demo_c0 || 'true' }}
+      demo_c1: ${{ steps.pick.outputs.demo_c1 || 'true' }}
+      demo_b1: ${{ steps.pick.outputs.demo_b1 || 'true' }}
+      zigbox_smoke: ${{ steps.pick.outputs.zigbox_smoke || 'true' }}
+      demo_c2: ${{ steps.pick.outputs.demo_c2 || 'true' }}
+      mtls_interop: ${{ steps.pick.outputs.mtls_interop || 'true' }}
+      demo_b3: ${{ steps.pick.outputs.demo_b3 || 'true' }}
+      demo_b7: ${{ steps.pick.outputs.demo_b7 || 'true' }}
+      demo_b5: ${{ steps.pick.outputs.demo_b5 || 'true' }}
+      demo_b6: ${{ steps.pick.outputs.demo_b6 || 'true' }}
+      demo_b4: ${{ steps.pick.outputs.demo_b4 || 'true' }}
+      jepsen: ${{ steps.pick.outputs.jepsen || 'true' }}
+      release: ${{ steps.pick.outputs.release || 'true' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Test the classifier
+        run: .github/ci-changes-test.sh
+      - name: Pick the jobs
+        id: pick
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          files=""
+          if [ "${EVENT}" = pull_request ]; then
+            files="$(git diff --no-renames --name-only "${BASE}...${HEAD}")" || files=""
+          elif [ "${BEFORE}" != 0000000000000000000000000000000000000000 ]; then
+            files="$(git diff --no-renames --name-only "${BEFORE}" "${AFTER}")" || files=""
+          fi
+          echo "Changed files:"
+          if [ -n "${files}" ]; then
+            while IFS= read -r f; do echo "  ${f}"; done <<< "${files}"
+          fi
+          if [ -n "${files}" ]; then
+            .github/ci-changes.sh <<< "${files}"
+          else
+            .github/ci-changes.sh < /dev/null
+          fi
+          echo "Verdict:"
+          cat "${GITHUB_OUTPUT}"
+
+  check:
+    name: format, build, test
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      # The SHA is the one Zigbox's CI pins for actions/checkout v7.0.1.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-zig
+      - uses: ./.github/actions/zig-cache
+        with:
+          name: check
+      - name: Formatting
+        # zig-pkg/ holds the fetched Zigbox package (ignored by git), not our source.
+        run: zig fmt --check --exclude zig-pkg .
+      - name: Tidy (style rules)
+        run: zig build tidy
+      # Before the build: zcube-server links both client libraries.
+      - name: SQLite and libpq development files
+        uses: ./.github/actions/install-apt
+        with:
+          packages: libsqlite3-dev libpq-dev
+      - name: Build the three executables
+        run: zig build
+      # The Jepsen battery's client is test-only and outside the default build (docs/jepsen.md).
+      - name: Build the Jepsen client
+        run: zig build jepsen-client
+      # zcube-server with the test-only registration barrier (#237), compiled, never shipped.
+      - name: Build the registration barrier
+        run: zig build register-barrier-build
+      - name: Unit and snapshot tests
+        run: zig build test --summary all
+      # The golden files of every ZC- code are checked by the tests above (and embedded at compile
+      # time); the pages that the `docs` link of a diagnostic points at are checked here.
+      - name: Error pages are up to date
+        run: zig build errors-site-check
+      # The suite picks a random seed per run; a failure prints it, and -Dseed=N replays it.
+      - name: Store conformance (memory)
+        run: zig build test-store -Dbackend=memory --summary all
+      - name: Store conformance (sqlite)
+        run: zig build test-store -Dbackend=sqlite --summary all
+      # Not demo-c0: the server and one agent as real processes, with real containers (kill -9, an
+      # agent restart, a server restart, an unknown digest). It cleans up what it starts.
+      - name: Agent smoke (real processes)
+        run: zig build agent-smoke --summary all
+      # Two agents, each with one of the relay's fail-closed checks removed: the fake runtime's
+      # tests must catch both (docs/agent.md, "The relay over TLS").
+      - name: Relay teeth (fail closed)
+        run: zig build relay-teeth --summary all
+
+      # Not demo-c0: `zcube local up` and `down` on the installed executables, in a scratch
+      # directory, with real containers. It cleans up what it starts.
+      - name: Local smoke (zcube local up and down)
+        run: zig build local-smoke --summary all
+
+      # The Jepsen recipe's scripts run as root only, so `zig build test` skips this test as the
+      # runner's user; here it runs under sudo (a runner, never a developer's host) on the
+      # executables built above (the client by "Build the Jepsen client"), in a scratch directory
+      # with a fake systemctl.
+      - name: Jepsen recipe (zigcube.sh and fault.sh as root)
+        run: |
+          sudo bash ops/jepsen/test-recipe.sh zig-out/bin/zcube zig-out/bin/zcube-server \
+            zig-out/bin/zcube-agent zig-out/bin/zcube-jepsen-client
+
+  # The same conformance suite against a real Postgres 16, the server a deployment would run.
+  # The image is pinned by digest (postgres:16.15, resolved from Docker Hub on 2026-10-26), so a
+  # moving tag cannot change what CI tests. The suite makes its own schema per test in the
+  # database below and drops it, and it draws a new seed each run, so a few runs in a row are
+  # a few draws of the racing-writer tests.
+  store-postgres:
+    name: store conformance (postgres)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.store == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    services:
+      postgres:
+        image: postgres:16.15@sha256:9e2cf6287f25c3151f4c9421ccce2b17f3e60061c111a29165e0d2cdd9ff0a97
+        env:
+          POSTGRES_USER: zcube
+          POSTGRES_PASSWORD: zcube
+          POSTGRES_DB: zcube
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U zcube -d zcube"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      ZCUBE_TEST_POSTGRES: host=127.0.0.1 port=5432 user=zcube password=zcube dbname=zcube
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-zig
+      - name: SQLite and libpq development files
+        uses: ./.github/actions/install-apt
+        with:
+          packages: libsqlite3-dev libpq-dev
+      - name: Store conformance (postgres), three draws
+        run: |
+          for run in 1 2 3; do
+            zig build test-store -Dbackend=postgres --summary all
+          done
+
+  # Slice 10c: client threads against Postgres through the fault proxy, every call recorded and
+  # checked, and the conformance suite run through the proxy (latency, bandwidth, stalls). The
+  # image is the one of store-postgres. The settings are in libpq keyword form because the runner
+  # adds `host=` and `port=` of the proxy to them. Each run draws a new seed (printed first).
+  # Slice 10d: the Postgres step also runs the two failover runs (src/store_failover.zig), each on
+  # a primary and a streaming standby that pg_dev makes on the runner from its preinstalled
+  # Postgres 16 (the service container cannot be half of a pair behind a proxy); about 20 s more.
+  store-faults:
+    name: store faults (postgres, sqlite)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.store == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16.15@sha256:9e2cf6287f25c3151f4c9421ccce2b17f3e60061c111a29165e0d2cdd9ff0a97
+        env:
+          POSTGRES_USER: zcube
+          POSTGRES_PASSWORD: zcube
+          POSTGRES_DB: zcube
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U zcube -d zcube"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      ZCUBE_TEST_POSTGRES: host=127.0.0.1 port=5432 user=zcube password=zcube dbname=zcube
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-zig
+      - name: SQLite and libpq development files
+        uses: ./.github/actions/install-apt
+        with:
+          packages: libsqlite3-dev libpq-dev
+      - name: Postgres 16 programs for the failover pair
+        id: pg16
+        run: |
+          if [ -x /usr/lib/postgresql/16/bin/pg_ctl ]; then echo need=false >> "${GITHUB_OUTPUT}"; else echo need=true >> "${GITHUB_OUTPUT}"; fi
+      - name: Install postgresql-16
+        if: ${{ steps.pg16.outputs.need == 'true' }}
+        uses: ./.github/actions/install-apt
+        with:
+          packages: postgresql-16
+      - name: Drop the package's own cluster, export the programs
+        run: |
+          # The package starts a cluster of its own on 5432, the service container's port.
+          if [ "${{ steps.pg16.outputs.need }}" = "true" ]; then sudo pg_dropcluster --stop 16 main || true; fi
+          echo "ZCUBE_PG_BIN=/usr/lib/postgresql/16/bin" >> "${GITHUB_ENV}"
+      - name: Store faults (postgres, then the failover runs)
+        run: zig build test-store-faults -Dbackend=postgres -Dpostgres="${ZCUBE_TEST_POSTGRES}" --summary all
+      - name: Store faults (sqlite, history checker only)
+        run: zig build test-store-faults -Dbackend=sqlite --summary all
+
+  # The three real-process demos, run for real, one job per backend (docs/demos/c0.md, c1.md,
+  # b1.md): zcube-server, FakeRuntime agents and the zcube command as processes; each prints a
+  # transcript (kept as an artifact), fails on the first assertion that does not hold, and kills
+  # everything it started. One job per backend builds once (the demos share the build cache of
+  # the job) and runs the demos in sequence, each its own step, so a failure names its demo; a
+  # failed demo does not stop the next from running, and the job still fails. Each demo still
+  # runs only when ci-changes.sh picks it (demo_c0, demo_c1, demo_b1, demo_b6, and demo_b7 on SQLite only);
+  # the job runs when any is picked. Before this they were six jobs, each downloading Zig and
+  # building the same binaries.
+  demos-sqlite:
+    name: demos (sqlite)
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.outputs.demo_c0 == 'true' || needs.changes.outputs.demo_c1 == 'true' || needs.changes.outputs.demo_b1 == 'true' || needs.changes.outputs.demo_b7 == 'true' || needs.changes.outputs.demo_b6 == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-zig
+      - name: SQLite and libpq development files
+        uses: ./.github/actions/install-apt
+        with:
+          packages: libsqlite3-dev libpq-dev
+      - name: Build the three executables once
+        run: zig build
+      - name: demo-c0 on SQLite
+        if: ${{ !cancelled() && needs.changes.outputs.demo_c0 == 'true' }}
+        run: zig build demo-c0 -Dbackend=sqlite -Dtranscript=demo-c0-sqlite.txt --summary all
+      - name: demo-c1 on SQLite
+        if: ${{ !cancelled() && needs.changes.outputs.demo_c1 == 'true' }}
+        run: zig build demo-c1 -Dbackend=sqlite -Dtranscript=demo-c1-sqlite.txt --summary all
+      - name: demo-b1 on SQLite
+        if: ${{ !cancelled() && needs.changes.outputs.demo_b1 == 'true' }}
+        run: zig build demo-b1 -Dbackend=sqlite -Dtranscript=demo-b1-sqlite.txt --summary all
+      - name: demo-b7 (the API over mTLS)
+        if: ${{ !cancelled() && needs.changes.outputs.demo_b7 == 'true' }}
+        run: zig build demo-b7 -Dtranscript=demo-b7-sqlite.txt --summary all
+      - name: demo-b6 on SQLite
+        if: ${{ !cancelled() && needs.changes.outputs.demo_b6 == 'true' }}
+        run: zig build demo-b6 -Dbackend=sqlite -Dtranscript=demo-b6-sqlite.txt --summary all
+      - name: Keep the transcripts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: demos-sqlite-transcripts
+          path: demo-*-sqlite.txt
+          if-no-files-found: warn
+
+  # The same image, by digest, as store-postgres. demo-c0 stops the database mid-run: the service
+  # container is stopped with `docker stop` and started again with `docker start`, which keeps its
+  # data and its published port. The container is named once, before the demos run. demo-c1,
+  # demo-b1 and demo-b6 do not stop it; each demo owns the database's `zcube` schema and drops it around its
+  # run, so running them in turn on one database is what each already assumes.
+  demos-postgres:
+    name: demos (postgres)
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.outputs.demo_c0 == 'true' || needs.changes.outputs.demo_c1 == 'true' || needs.changes.outputs.demo_b1 == 'true' || needs.changes.outputs.demo_b6 == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16.15@sha256:9e2cf6287f25c3151f4c9421ccce2b17f3e60061c111a29165e0d2cdd9ff0a97
+        env:
+          POSTGRES_USER: zcube
+          POSTGRES_PASSWORD: zcube
+          POSTGRES_DB: zcube
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U zcube -d zcube"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      ZCUBE_TEST_POSTGRES: host=127.0.0.1 port=5432 user=zcube password=zcube dbname=zcube
+      ZCUBE_DEMO_PG_STOP: docker stop "$PG_CONTAINER"
+      ZCUBE_DEMO_PG_START: docker start "$PG_CONTAINER"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-zig
+      - name: SQLite and libpq development files
+        uses: ./.github/actions/install-apt
+        with:
+          packages: libsqlite3-dev libpq-dev
+      - name: Name the Postgres container
+        run: |
+          container="$(docker ps --quiet --filter publish=5432)"
+          test -n "${container}"
+          echo "PG_CONTAINER=${container}" >> "${GITHUB_ENV}"
+      - name: Build the three executables once
+        run: zig build
+      - name: demo-c0 on Postgres
+        if: ${{ !cancelled() && needs.changes.outputs.demo_c0 == 'true' }}
+        run: zig build demo-c0 -Dbackend=postgres -Dtranscript=demo-c0-postgres.txt --summary all
+      - name: demo-c1 on Postgres
+        if: ${{ !cancelled() && needs.changes.outputs.demo_c1 == 'true' }}
+        run: zig build demo-c1 -Dbackend=postgres -Dtranscript=demo-c1-postgres.txt --summary all
+      - name: demo-b1 on Postgres
+        if: ${{ !cancelled() && needs.changes.outputs.demo_b1 == 'true' }}
+        run: zig build demo-b1 -Dbackend=postgres -Dtranscript=demo-b1-postgres.txt --summary all
+      - name: demo-b6 on Postgres
+        if: ${{ !cancelled() && needs.changes.outputs.demo_b6 == 'true' }}
+        run: zig build demo-b6 -Dbackend=postgres -Dtranscript=demo-b6-postgres.txt --summary all
+      - name: Keep the transcripts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: demos-postgres-transcripts
+          path: demo-*-postgres.txt
+          if-no-files-found: warn
+
+  # The control-plane core must compile for wasm32-freestanding (docs/wasm.md): no libc, no OS,
+  # no threads, no std.Io. Node is the one WebAssembly runtime on the runner (its version is
+  # printed below); tools/wasm_check.mjs says why a JavaScript runner is acceptable. The core is
+  # also built and run in ReleaseSafe, the mode Zigcube ships, where assertions stay on.
+  # The simulations are the next job, so the two run side by side (they were one job of 13 minutes,
+  # the longest of the run).
+  wasm:
+    name: core on wasm32
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-zig
+      - uses: ./.github/actions/zig-cache
+        with:
+          name: wasm
+      - name: Node version
+        run: node --version
+      - name: Core library (wasm32-freestanding), run in Node
+        run: zig build wasm-check --summary all
+      - name: Core library, ReleaseSafe
+        run: zig build wasm-check -Doptimize=ReleaseSafe --summary all
+      - name: Core unit tests (wasm32-wasi), run in Node
+        run: zig build wasm-test --summary all
+      # The console's browser module (ReleaseSafe, whatever -Doptimize says): it must build, import
+      # exactly env.zc_panic, answer GET /v1/status and run the scenario, under each V8 compiler.
+      - name: Console module (browser), checked in Node
+        run: zig build console-wasm --summary all
+
+  # Simulations, not demo-c0 (docs/core.md). This job, `sim-c1-teeth` and `sim-worlds` (each a
+  # matrix of shards) are one set, split to run side by side. The same seed runs natively and in
+  # WASM and the reports must agree byte for byte. Seed 1 always, and one seed per CI run,
+  # printed here.
+  sim:
+    name: simulations (sim-c0, sim-c1)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-zig
+      - uses: ./.github/actions/zig-cache
+        with:
+          name: sim
+      - name: C0 simulation, native and WASM, seed 1
+        run: zig build sim-c0 --summary all
+      - name: C0 simulation, native and WASM, seed of this run
+        run: |
+          echo "seed ${{ github.run_id }}"
+          zig build sim-c0 -Dseed=${{ github.run_id }} -Dops=200 -Doptimize=ReleaseSafe --summary all
+      # sim-c1 (docs/core.md, "sim-c1"): docs/authority.md §4's invariants after every revision, §5's
+      # evidence test over every decision, native against WASM.
+      - name: sim-c1, native and WASM, seed 1
+        run: zig build sim-c1 --summary all
+      - name: sim-c1, native and WASM, seed of this run
+        run: |
+          echo "seed ${{ github.run_id }}"
+          zig build sim-c1 -Dseed=${{ github.run_id }} -Dops=200 -Doptimize=ReleaseSafe --summary all
+      # B6's tenant world (P1: node labels, relabels, eviction), native against WASM.
+      - name: sim-c1 tenant world, native and WASM, seed of this run
+        run: |
+          echo "seed ${{ github.run_id }}"
+          zig build sim-c1 -Dtenants -Dseed=${{ github.run_id }} -Dops=150 -Doptimize=ReleaseSafe --summary all
+      # Replays of sim-c1 runs that once failed (build.zig, `c1_regressions`).
+      - name: sim-c1 regressions
+        run: zig build sim-c1-regressions --summary all
+      # The fleet seeds of B2 slice 1 (#151 and #142 fail without the sim node clock's spend time).
+      - name: sim-c1 regression seeds
+        run: zig build sim-c1-regress --summary all
+      # The negative test of the healed-fencing check (docs/decisions/2026-11-06-renewal-before-fence.md):
+      # the old ttl / 3 renewal rule must fail it.
+      - name: Fencing negative test
+        run: zig build sim-fencing-teeth --summary all
+
+  # The sim-c1 negative tests, apart from the other simulations so that no job nears its timeout
+  # (docs/decisions/2026-11-09-sim-job-split.md). Each tooth is a ReleaseSafe executable of its
+  # own, about a minute to compile, so the job is compile-bound: four shards, each the teeth whose
+  # index in build.zig's `c1_teeth_roots` is the shard modulo 4, together every tooth
+  # (docs/decisions/2026-11-17-ci-speed-shards.md). One cache entry per shard.
+  sim-c1-teeth:
+    name: simulations (sim-c1 negative tests, shard ${{ matrix.shard }} of ${{ strategy.job-total }})
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
+    runs-on: ubuntu-24.04
+    # Cold, a shard took 6 to 10 minutes (the decision file); twice the slowest is the margin.
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # The one place the shard count is written: the step below passes the number of entries
+        # (`strategy.job-total`) as -Dteeth-shards, so a shard cannot drop out unnoticed.
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-zig
+      - uses: ./.github/actions/zig-cache
+        with:
+          name: sim-c1-teeth-${{ matrix.shard }}
+          limit-mb: 1000
+      - name: sim-c1 negative tests, shard ${{ matrix.shard }} of ${{ strategy.job-total }}
+        run: |
+          zig build sim-c1-teeth -Dteeth-shard=${{ matrix.shard }} \
+            -Dteeth-shards=${{ strategy.job-total }} --summary all
+
+  # The worlds of the sim-c1 teeth with the fix on, in two shards of about the same CPU time.
+  # Each step splits its seeds over processes (build.zig, `add_seed_ranges`) and a shard's steps
+  # run in one `zig build`, so the runner's four cores share them
+  # (docs/decisions/2026-11-17-ci-speed-shards.md). One cache entry per shard.
+  sim-worlds:
+    name: simulations (sim-c1 worlds, ${{ matrix.part }})
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
+    runs-on: ubuntu-24.04
+    # Cold, a part took 8 to 10 minutes (the decision file).
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # One node, bursts of short jobs (#198): J8 must hold on a correct agent. The
+          # deadline-offline tooth's world (long cuts, short deadlines). The runs-unread world
+          # (runs read cut while a stop is asked, keepalives answered): the job fence holds J6.
+          # #237's world (stale registrations delivered late): every one is refused.
+          - part: burst
+            steps: sim-c1-burst sim-c1-offline sim-c1-runs-unread sim-c1-late
+          # The job_evicted tooth's world (burst, strong, more than 512 runs). The job_reuse
+          # tooth's world (retention jumps, names reused over stopped containers). B5's trust
+          # world (signed jobs, node policies), 20 seeds at drawn shapes: J12 holds.
+          - part: evict
+            steps: sim-c1-worlds sim-c1-reuse sim-c1-signed
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-zig
+      - uses: ./.github/actions/zig-cache
+        with:
+          name: sim-worlds-${{ matrix.part }}
+          limit-mb: 1000
+      - name: sim-c1 worlds (${{ matrix.steps }})
+        run: zig build ${{ matrix.steps }} --summary all
+
+  # One check for the sharded simulation jobs. A matrix job whose `if` is false (a docs-only
+  # change) reports a single skipped check under its unexpanded name, so a required check cannot
+  # name a shard: branch protection requires this job instead. It succeeds when every sharded job
+  # succeeded or was skipped, and fails when any failed or was cancelled
+  # (docs/decisions/2026-11-17-ci-speed-shards.md).
+  sim-shards:
+    name: simulations (sharded jobs)
+    needs: [sim-c1-teeth, sim-worlds]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Every sharded job succeeded or was skipped
+        run: |
+          echo "sim-c1-teeth: ${{ needs.sim-c1-teeth.result }}"
+          echo "sim-worlds: ${{ needs.sim-worlds.result }}"
+          case "${{ needs.sim-c1-teeth.result }} ${{ needs.sim-worlds.result }}" in
+            *failure*|*cancelled*) exit 1 ;;
+          esac
+
+  # The Zigbox runtime on a real host (C2 slice 1, docs/demos/c2.md): zcube-server, zcube-agent
+  # --runtime zigbox and real containers from a pulled Alpine image, in the Ubuntu 24.04 guest of
+  # Zigbox's `zigbox_vm` module under QEMU/KVM. The runner setup is Zigbox's (its demo jobs): QEMU,
+  # the udev rule that lets the runner user open /dev/kvm, the guest image cached by its pin.
+  # docker.io is reached through mirror.gcr.io, as in Zigbox's CI. A pass is a check, not
+  # `demo-c2`. It runs on a pull request only when ci-changes.sh says its paths changed, and on main.
+  zigbox-smoke:
+    name: zigbox-smoke (Ubuntu 24.04 VM, KVM, real containers)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.zigbox_smoke == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      ZBX_REGISTRY_MIRRORS: mirror.gcr.io
+      ZCUBE_REAL_HOST: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-zig
+      - name: SQLite and libpq development files, QEMU
+        uses: ./.github/actions/install-apt
+        with:
+          packages: libsqlite3-dev libpq-dev qemu-system-x86 qemu-utils
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      # The guest image is a download of about 600 MB; its pin is in the Zigbox package, so the
+      # key is the pinned package (build.zig.zon).
+      - name: Cache the VM base image
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache/vm/*.img
+          key: zigbox-smoke-image-${{ hashFiles('build.zig.zon') }}
+      # ReleaseSafe: the harness serves files of at most 8 MiB, which a Debug build exceeds.
+      - name: Zigbox smoke
+        shell: bash
+        run: zig build zigbox-smoke -Doptimize=ReleaseSafe --summary all 2>&1 | tee zigbox-smoke.txt
+      - name: Keep the output
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: zigbox-smoke-output
+          path: zigbox-smoke.txt
+          if-no-files-found: warn
+
+  demo-c2:
+    name: demo-c2 (four Ubuntu 24.04 VMs, KVM, GHCR images)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.demo_c2 == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      ZBX_REGISTRY_MIRRORS: mirror.gcr.io
+      ZCUBE_REAL_HOST: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-zig
+      - name: SQLite and libpq development files, QEMU
+        uses: ./.github/actions/install-apt
+        with:
+          packages: libsqlite3-dev libpq-dev qemu-system-x86 qemu-utils
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      # The guest image is a download of about 600 MB; its pin is in the Zigbox package, so the
+      # key is the pinned package (build.zig.zon).
+      - name: Cache the VM base image
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache/vm/*.img
+          key: zigbox-smoke-image-${{ hashFiles('build.zig.zon') }}
+      # ReleaseSafe: the harness serves files of at most 8 MiB, which a Debug build exceeds.
+      - name: demo-c2
+        shell: bash
+        run: |
+          zig build demo-c2 -Doptimize=ReleaseSafe -Dtranscript=demo-c2-transcript.txt \
+            --summary all 2>&1 | tee demo-c2.txt
+      - name: Keep the output
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: demo-c2-output
+          path: |
+            demo-c2.txt
+            demo-c2-transcript.txt
+          if-no-files-found: warn
+
+  demo-b3:
+    name: demo-b3 (one Ubuntu 24.04 VM, KVM, a GHCR image)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.demo_b3 == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      ZBX_REGISTRY_MIRRORS: mirror.gcr.io
+      ZCUBE_REAL_HOST: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-zig
+      - name: SQLite and libpq development files, QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libsqlite3-dev libpq-dev qemu-system-x86 qemu-utils
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      # The guest image is a download of about 600 MB; its pin is in the Zigbox package, so the
+      # key is the pinned package (build.zig.zon).
+      - name: Cache the VM base image
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache/vm/*.img
+          key: zigbox-smoke-image-${{ hashFiles('build.zig.zon') }}
+      # ReleaseSafe: the harness serves files of at most 8 MiB, which a Debug build exceeds.
+      - name: demo-b3
+        shell: bash
+        run: |
+          zig build demo-b3 -Doptimize=ReleaseSafe -Dtranscript=demo-b3-transcript.txt \
+            --summary all 2>&1 | tee demo-b3.txt
+      - name: Keep the output
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: demo-b3-output
+          path: |
+            demo-b3.txt
+            demo-b3-transcript.txt
+          if-no-files-found: warn
+
+  # demo-b3's rig and driver with B4's script (docs/demos/b4.md).
+  demo-b4:
+    name: demo-b4 (one Ubuntu 24.04 VM, KVM, a GHCR image)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.demo_b4 == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      ZBX_REGISTRY_MIRRORS: mirror.gcr.io
+      ZCUBE_REAL_HOST: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-zig
+      - name: SQLite and libpq development files, QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libsqlite3-dev libpq-dev qemu-system-x86 qemu-utils
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      # The guest image is a download of about 600 MB; its pin is in the Zigbox package, so the
+      # key is the pinned package (build.zig.zon).
+      - name: Cache the VM base image
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache/vm/*.img
+          key: zigbox-smoke-image-${{ hashFiles('build.zig.zon') }}
+      # ReleaseSafe: the harness serves files of at most 8 MiB, which a Debug build exceeds.
+      - name: demo-b4
+        shell: bash
+        run: |
+          zig build demo-b4 -Doptimize=ReleaseSafe -Dtranscript=demo-b4-transcript.txt \
+            --summary all 2>&1 | tee demo-b4.txt
+      - name: Keep the output
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: demo-b4-output
+          path: |
+            demo-b4.txt
+            demo-b4-transcript.txt
+          if-no-files-found: warn
+
+  # B5's demo (docs/demos/b5.md): jobs signed with zbx in the guest, refused at the server and
+  # at the agent. The same rig as demo-b3.
+  demo-b5:
+    name: demo-b5 (one Ubuntu 24.04 VM, KVM, GHCR images, signed jobs)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.demo_b5 == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      ZBX_REGISTRY_MIRRORS: mirror.gcr.io
+      ZCUBE_REAL_HOST: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-zig
+      - name: SQLite and libpq development files, QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libsqlite3-dev libpq-dev qemu-system-x86 qemu-utils
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      # The guest image is a download of about 600 MB; its pin is in the Zigbox package, so the
+      # key is the pinned package (build.zig.zon).
+      - name: Cache the VM base image
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache/vm/*.img
+          key: zigbox-smoke-image-${{ hashFiles('build.zig.zon') }}
+      # ReleaseSafe: the harness serves files of at most 8 MiB, which a Debug build exceeds.
+      - name: demo-b5
+        shell: bash
+        run: |
+          zig build demo-b5 -Doptimize=ReleaseSafe -Dtranscript=demo-b5-transcript.txt \
+            --summary all 2>&1 | tee demo-b5.txt
+      - name: Keep the output
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: demo-b5-output
+          path: |
+            demo-b5.txt
+            demo-b5-transcript.txt
+          if-no-files-found: warn
+
+  # Stock servers (openssl s_server, a JDK 21 SSLServerSocket) against the mTLS client. Test-only
+  # tools: docs/decisions/2026-11-05-interop-tools-are-test-only.md. Then C5 slice 1's browser
+  # check (public-tls-check: real Chromium against the server's public path, docs/mtls.md).
+  mtls-interop:
+    name: mtls-interop (openssl, JDK 21) and public-tls-check (Chromium)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.mtls_interop == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-zig
+      # Its server rows build zcube-server, which links both client libraries.
+      - name: SQLite and libpq development files
+        uses: ./.github/actions/install-apt
+        with:
+          packages: libsqlite3-dev libpq-dev
+      - name: mtls-interop
+        shell: bash
+        run: |
+          # The runner image ships JDK 21 and sets JAVA_HOME_21_X64; the harness fails on another.
+          : "${JAVA_HOME_21_X64:?the runner image has no JDK 21}"
+          export ZCUBE_JAVA_HOME="$JAVA_HOME_21_X64"
+          openssl version
+          "$ZCUBE_JAVA_HOME/bin/java" -version
+          zig build mtls-interop --summary all 2>&1 | tee mtls-interop.txt
+      # Playwright and its Chromium (the cloud container has both preinstalled; a runner does
+      # not), and NSS's certutil for the check's scratch certificate store.
+      - name: Playwright, Chromium and certutil
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/pw" && cd "$RUNNER_TEMP/pw"
+          npm install --no-save --no-audit --no-fund playwright@1.63.0
+          sudo npx playwright install-deps chromium
+          npx playwright install chromium
+          sudo apt-get install -y libnss3-tools
+          echo "NODE_PATH=$RUNNER_TEMP/pw/node_modules" >> "$GITHUB_ENV"
+      - name: public-tls-check
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: zig build public-tls-check --summary all 2>&1 | tee public-tls-check.txt
+      - name: Keep the output
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mtls-interop-output
+          path: |
+            mtls-interop.txt
+            public-tls-check.txt
+          if-no-files-found: warn
+
+  # The Jepsen battery's tarball and its Postgres recipe (docs/jepsen.md,
+  # docs/decisions/2026-11-17-jepsen-j2-dist-and-recipe.md). `zig build dist` builds the tarball
+  # the battery deploys; it is checked against its .sha256 and unpacked, its recipe compared with
+  # ops/jepsen/, and ops/jepsen/test-postgres.sh runs postgres.sh (a primary and a synchronous
+  # standby on two ports, a crash, a promotion, a rejoin) and fault.sh's Postgres pause as root,
+  # then test-recipe.sh against that pair with the tarball's executables. A few minutes, most of
+  # it the ReleaseSafe build.
+  jepsen:
+    name: jepsen recipe (dist, postgres.sh)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.jepsen == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-zig
+      - uses: ./.github/actions/zig-cache
+        with:
+          name: jepsen
+      - name: SQLite and libpq development files
+        uses: ./.github/actions/install-apt
+        with:
+          packages: libsqlite3-dev libpq-dev
+      - name: Postgres 16 programs
+        id: pg16
+        run: |
+          if [ -x /usr/lib/postgresql/16/bin/pg_ctl ]; then echo need=false >> "${GITHUB_OUTPUT}"; else echo need=true >> "${GITHUB_OUTPUT}"; fi
+      - name: Install postgresql-16
+        if: ${{ steps.pg16.outputs.need == 'true' }}
+        uses: ./.github/actions/install-apt
+        with:
+          packages: postgresql-16
+      - name: Drop the package's own cluster
+        if: ${{ steps.pg16.outputs.need == 'true' }}
+        run: sudo pg_dropcluster --stop 16 main || true
+      - name: Build the tarball
+        run: zig build dist --summary all
+      - name: Check and unpack the tarball
+        shell: bash
+        run: |
+          (cd zig-out/dist && sha256sum -c ./*.sha256)
+          mkdir -p "${RUNNER_TEMP}/dist"
+          tar -xzf zig-out/dist/*.tar.gz -C "${RUNNER_TEMP}/dist"
+          top=$(echo "${RUNNER_TEMP}"/dist/zigcube-*)
+          for f in "${top}"/share/jepsen/*; do cmp "${f}" "ops/jepsen/$(basename "${f}")"; done
+          echo "TOP=${top}" >> "${GITHUB_ENV}"
+      - name: postgres.sh and the recipe on a Postgres pair (as root)
+        run: |
+          sudo bash ops/jepsen/test-postgres.sh "${TOP}/bin/zcube" "${TOP}/bin/zcube-server" \
+            "${TOP}/bin/zcube-agent" "${TOP}/bin/zcube-jepsen-client"
+
+  # The release workflow's build and checks (release.yml's `build` job), publishing nothing: no
+  # draft, no upload, no tag, contents: read. Runs when release.yml, its scripts or actions, or
+  # src/dist.zig change, and on a full run (docs/releases/automation.md). No build cache: the
+  # release builds from nothing, and this job runs rarely enough not to spend the cache budget.
+  release:
+    name: release build (x86_64, aarch64; nothing published)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.release == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # release.yml must load its local actions and scripts from .release-tools (the workflow's
+      # own commit), never from the release commit's checkout.
+      - name: release.yml runs local tools only from .release-tools
+        run: |
+          if grep -vE '^[[:space:]]*#' .github/workflows/release.yml |
+            grep -nE "(^|[[:space:]\"'(])(\./)?\.github/(actions/|release-)"; then
+            echo "::error::release.yml names a local action or script outside .release-tools"
+            exit 1
+          fi
+      # Code the release commit controls (build.zig, the build and its tests, every sudo step
+      # after it) runs in jobs with no write token: a job that runs `zig build` names no
+      # `contents: write`, GH_TOKEN, github.token or secret, and the workflow's default stays
+      # read-only. Only `draft`, `attach` and `publish` write, and none of them builds.
+      - name: release.yml builds only in jobs without a write token
+        run: |
+          awk '
+            /^[[:space:]]*#/ { next }
+            /^jobs:/ { in_jobs = 1; next }
+            !in_jobs && /^  contents: write/ { print "workflow default: contents: write"; bad = 1 }
+            in_jobs && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { finish(); job = $1; build = 0; write = "" }
+            in_jobs && /zig build/ { build = 1 }
+            in_jobs && /contents:[[:space:]]*write|GH_TOKEN|github\.token|secrets\./ {
+              write = write " " $0
+            }
+            function finish() {
+              if (build && write != "") { print job " runs zig build and has:" write; bad = 1 }
+            }
+            END { finish(); exit bad }
+          ' .github/workflows/release.yml || {
+            echo "::error::a release.yml job that runs zig build holds a write token"
+            exit 1
+          }
+      - name: The release scripts pass shellcheck
+        run: shellcheck .github/release-*.sh
+      - uses: ./.github/actions/setup-zig
+        with:
+          cache: 'false'
+      - name: The aarch64 libraries and qemu-user
+        run: |
+          sudo .github/release-libs.sh "${RUNNER_TEMP}/aarch64-libs"
+          echo "LIBS_AARCH64=${RUNNER_TEMP}/aarch64-libs" >> "${GITHUB_ENV}"
+      - name: Build
+        run: zig build release -Drelease-lib-dir-aarch64="${LIBS_AARCH64}" --summary all
+      - name: Check
+        run: |
+          version=$(sed -n 's/^ *\.version = "\([^"]*\)",.*/\1/p' build.zig.zon | head -n 1)
+          .github/release-check.sh zig-out/release "${version}" "$(git rev-parse HEAD)"

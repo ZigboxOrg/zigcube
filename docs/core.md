@@ -1,0 +1,645 @@
+# The control-plane core
+
+**Status: C0 slice 5a (2026-10-26).** What the core is, the step model every controller follows,
+how a shell drives it, and what the simulation proves and does not. The rule that keeps it pure
+is in [wasm.md](wasm.md); the key layout and records are in [keys.md](keys.md); the API in
+[api.md](api.md).
+
+## What is in it
+
+Everything below is listed in `src/core.zig`, compiles for `wasm32-freestanding` and has no
+thread, socket, file, libc, `std.Io` value, real clock, source of randomness or blocking call.
+
+| Module | What it is |
+| --- | --- |
+| `records.zig` | The records of keys.md as types, their JSON, the key builders, decision ids |
+| `controller.zig` | `Context`, `Wakeup`, `Batch`, the snapshot reader, the one way to write a decision |
+| `replica_controller.zig` | The service and replica controller, with the C0 placement |
+| `retention.zig` | Decision retention, a page of the index at a time |
+| `apply.zig` | What the API writes on apply and delete (generation rules, change summary) |
+| `agent.zig` | The node agent's reconcile step |
+| `agent_api.zig`, `agent_client.zig` | The server's side of the agent endpoints, and `Store` over them on a `Transport` |
+| `agent_loop.zig` | The agent's loop policy as a state machine over virtual time |
+| `agent_state.zig` | What the agent persists, behind `AgentState`; `SimState` models what fsynced files guarantee, with `arm_crash` (a crash at a write point) and `crash_now` (between calls) |
+| `agent_records.zig` | The container records and adoption rules, over `AgentState`; shared by `FakeRuntime` and `sim_node.zig` |
+| `sim_net.zig` | The network between agents and server: drop, delay, duplicate, reorder, one-way partitions; parked requests arrive when the cluster calls `tick` with the clock |
+| `sim_clock.zig` | A node's monotonic clock: an offset from the server's, a bounded rate error, jumps forward (a suspend), never backwards |
+| `sim_store.zig` | `AckLossStore`: the lost acknowledgement (a transaction that commits and returns an error) over the memory store, and a switch for outages |
+| `sim_node.zig` | One simulated node: a `SimRuntime` and a `SimState` joined by `agent_records` |
+| `why.zig` | `zcube why`: subject to causal chain, structured steps, and their text |
+| `api.zig` | The read-only endpoints of api.md, bytes to bytes |
+| `runtime_codes.zig` | The placeholder `ZBX-` codes ([runtime-codes.md](runtime-codes.md)) |
+| `sim_runtime.zig` | `Runtime` implemented in the core, deterministic, with faults |
+| `sim_world.zig` | The smallest honest shell: server, agent, store, runtime on virtual time |
+| `sim_c0.zig` | The C0 simulation and its fuzz variant |
+| `sim_cluster.zig` | The cluster simulation: N agents, a network, a store, the controllers, one seed ([below](#the-cluster-simulation)) |
+| `chunk_summary.zig`, `fetch_plan.zig`, `sim_images.zig`, `sim_swarm.zig` | C2's summary, locality estimate and fetch plan, and their simulation ([swarm.md](swarm.md)) |
+
+## The step model
+
+A controller is `reconcile(ctx) -> Wakeup`. It reads what it needs, does what is due, writes each
+action together with its decision record in one transaction, and returns. It never waits: not on
+a `Watch`, not on `Runtime.events`, not on `Runtime.stop`.
+
+```zig
+pub const Wakeup = struct {
+    at_ms: u64,                    // run again no later than this (on the Clock's scale)
+    prefixes: []const []const u8,  // or sooner, if a key under one of these changes
+    acted: u32,                    // transactions this step committed; 0 when converged
+};
+```
+
+`Context` holds the `Store`, the `Clock`, an arena (`request_arena_bytes_max`, freed whole when
+the step ends) and a `*Diag`. The agent's context also holds the `Runtime`. A failed step returns
+an error with a diagnostic in `ctx.diag`; the shell decides when to retry.
+
+Four rules make this work:
+
+- **Level-triggered and idempotent.** A step compares desired state with observed state and
+  acts on the difference; on a converged system it writes nothing (`acted == 0`, tested). It does
+  not matter which event woke it, or whether one was lost.
+- **Partial progress is normal.** A transaction touches at most four replicas, so a change to a
+  service of 100 replicas takes several steps. The step returns `at_ms = now`; the next call
+  carries on from what the store then says. A transaction whose compare fails (the state moved
+  under the plan) writes nothing, and the next step plans again.
+- **Whatever cannot finish now becomes state the next step checks.** The agent asks for a stop
+  once, remembers the container's name and the end of its grace period, and on a later step kills
+  what still runs. A held replica is a decision in the store, not a flag in memory.
+- **Identity is a parameter.** Decision ids use the time (the `Clock`, which must be Unix
+  milliseconds for `at_ms` to mean what keys.md says), a controller instance number from the shell
+  and a counter. A restarted server takes a new instance number.
+
+## What the shell does
+
+The shell is whatever calls the steps: `zcube-server` and `zcube-agent`, `sim_world.zig`, and
+later the browser. For each side it loops:
+
+1. wait until `Wakeup.at_ms`, or a change under `Wakeup.prefixes` (a `Watch` with a timeout; the
+   memory store and the simulation compare revisions instead), whichever is first;
+2. build a `Context` with a fresh arena and call `reconcile`;
+3. on an error, render the diagnostic, wait a backoff and retry.
+
+The shell also owns what the core must not: calling `Store.expire_leases` and `Store.compact` on
+timers (the world does both), the real clock, threads, HTTP, and the long-poll wait of
+`GET /v1/watch` (below).
+
+**API handlers.** `Api.handle(ctx, Request) -> Response`: method, path, query and the client's
+request id in; status, request id, JSON body out. A failure is a DIAGNOSTICS diagnostic whose
+status the blame decides. Watch answers what is ready with a bookmark; if nothing is ready and the
+client asked to wait, `Response.hold_ms` and `hold_prefixes` tell the shell it may hold the reply
+until a key under one of the prefixes changes, then call `handle` again with the same request.
+
+## What the controller decides
+
+| Situation | Decisions (subject) | Cause |
+| --- | --- | --- |
+| fewer replicas than wanted | `scale_up` (service), `create_replica`, `place_replica` (replica) | `desired` |
+| more than wanted | `scale_down` (service), `stop_replica` (replica) | `desired` |
+| container ended, or lost | `delete_replica` or `mark_replica_lost` (replica), `replace_replica` (service) | `observed`, with the diagnostic copied in |
+| start failed through the user's fault | `hold_failed_replica` (service), once per observed record | `observed` |
+| replica behind the service's `generation` | `replace_replica` (service), `stop_replica` | `desired` |
+| service deleted | `scale_down` (the gone service), `stop_replica` | `desired` |
+
+A replica-count change does not bump `generation`; a failed start is held, not retried; a held
+replica is replaced when the service changes. Placement is the C0 scheduler: a node whose declared
+capacity fits the replica's resolved requests (its limits, else 250m CPU and 128 MiB, which the
+placing decision says), the fewest replicas of the service first. A replica no node fits waits,
+unplaced, with no decision; `why` says "waiting for a node".
+
+B6 puts a filter ahead of fit: among the ready nodes, one is a candidate only if it carries every
+`placement.require` pair of the run as a `key=value` label and, for each `exclusive=K` label it
+has, the run's `require` names `K` with the node's value. The order is readiness, then that filter,
+then fit, spread, locality, least allocated, name. A run no node passes waits with the hold reason
+"no ready node has tenant=acme" (or "<node> is exclusive to tenant=acme"); a replica carries no
+`require`, so it never passes an exclusive node. Only the run's hold reason names the filter.
+
+## What the simulation proves
+
+`zig build sim-c0 [-Dseed=N] [-Dops=N]` runs `sim_c0.zig` natively and as WebAssembly, for one
+seed, and compares the two reports byte for byte. **It is a simulation, not `demo-c0`.** It runs
+the core against a memory store and a simulated runtime on virtual time, through HANDOFF's C0
+steps (apply 3, kill one, scale to 5 and to 2, apply `broken`, `why`, the store down, restarts),
+asserting each outcome, including the rendered `zcube why service broken` chain.
+
+It proves that the core makes the decisions the demo script asks for, deterministically, with
+every fault under test control; that the two cores cooperate through the store alone; that native
+and WASM builds agree (the report ends with a hash of the whole store); and, with the fuzz
+variant, that under random applies, deletes, runtime faults, store outages that begin mid-step,
+restarts and compaction:
+
+- a node that cannot reach the store stops its containers within `lost_grace_ms + 2 × check_interval_ms` of its fence deadline (a node that is down is not counted);
+- the runtime never holds more running containers than services want for more than 30 s of store
+  uptime;
+- every decision has a reason and a cause; a cause that names a decision names one that exists,
+  unless retention dropped decisions (a counter says whether it did);
+- `why` terminates for every service and replica, and ends in a cause, not a decision;
+- once healed, every service has the replicas it asked for (held ones for a broken image) and the
+  runtime holds nothing else.
+
+It does not prove: real processes and `kill -9`, Postgres or SQLite (the stores' conformance suite
+covers the store contract), the `zcube` command, real time, or anything about `zbx`. A passing
+simulation is never a passed demo. It also cannot show what a model of the runtime leaves out:
+the simulated runtime stops a container at once unless told to be slow (see below), and ends a
+container only through the faults it has.
+
+Seeds: `-Dseed=N` (default 1). A fuzz failure prints its seed and the virtual time; `zig build
+sim-c0-exe` installs the native runner for loops over many seeds (`sim_c0 <seed> fuzz <ops>`, best
+built with `-Doptimize=ReleaseSafe`).
+
+## Where the core is lazier or narrower than the contracts
+
+- **`Runtime.stop` returns early in the simulation** when a container ignores the polite stop
+  (`slow_stop`). The contract says it returns once the container has stopped; a runtime in
+  virtual time cannot wait. The agent never relies on a stop having completed, so a blocking
+  adapter is also correct for it. This is the one place the simulated runtime departs.
+  `Runtime.signal` has no such departure: it acts at once (TERM is ignored by a `slow_stop`
+  container, KILL ends any), and the fence uses it.
+  *Effect on sim-c0 fuzz reports (C2 slice 3).* The fence used to call `stop` with a grace, which
+  moved a `slow_stop` container to `.stopping`; `signal` TERM leaves it `.running`. Fuzz runs that
+  fence therefore differ in their counters (`sim_c0 99 fuzz 300`: agent failures 4491 became 4489;
+  `sim_c0 5 fuzz 300`: 4923 became 4922); plain scenarios and sim-cluster are unchanged. Cause
+  confirmed for seed 99 by making TERM on a slow container enter `.stopping`: 4491 came back. It
+  is an intended difference of the simulated runtime, not a change in the agent's decisions.
+- **The runtime does not report when a container started**, so the agent's `started_at_ms` is
+  the time it started or first saw it (kept across re-adoption if a record exists). Zigbox's
+  `Listing` could carry it.
+- **Nobody writes `lease_expired` yet.** Lost-node detection is C1. `why` renders the cause (a
+  test writes one by hand) and the node's registration is on a lease the agent keeps alive.
+- **An agent that loses its lease re-registers and keeps its workloads running.** Stopping them
+  (so a replica never runs twice) is C1's acceptance criterion.
+- **Retention runs in the controller's step, a few pages at a time, not in the transaction that
+  writes a decision** as keys.md words it: a count needs a list.
+- **The API's write endpoints** arrived in slice 5b as a proposal (api.md, "Writes"): `POST
+  /v1/apply` and `DELETE /v1/services/{name}`, `apply.zig` behind a route. `apply` now returns the
+  decision id and the change summary, and `plan` is a dry run.
+
+## What the shell revealed about the step model (C0 slice 5b)
+
+`zcube-server` is the first shell that drives the core on real threads, a real clock and real
+stores (`src/server*.zig`). The model held: the controller, the agent's step and the handlers were
+driven as they were, and the same handlers answer HTTP and the browser. Two small changes came out
+of it (`Request.hold`, an atomic request counter), and the rest of what it taught is below:
+
+- **`Wakeup.prefixes` is several prefixes; `Store.watch` takes one.** The driver opens one watch on
+  every key and filters locally against the prefixes. That also delivers every decision write, which
+  the controller ignores; on Postgres it keeps the cost to one connection, where a watch per prefix
+  would be four.
+- **A step that acted always wakes itself.** Its own writes are under the prefixes it named, so the
+  next wait ends at once and the following step finds `acted == 0`. It costs one extra snapshot read
+  per acting step. It is harmless and honest; if snapshots grow, `Wakeup` could carry "ignore up to
+  revision R" for the step's own writes.
+- **"Call `handle` again with the same request" was not enough for a held watch.** The same request
+  would ask to be held again. `Request.hold` (default true) is the shell's way to say "answer with
+  what is ready and nothing more"; the first, empty answer is what a timed-out hold sends. The
+  shell opens its store watch from the revision it read *before* calling `handle`, so a change
+  between the handler's look and the shell's wait cannot be missed.
+- **`Api.handle` needed `*Api`, which made it serial.** Only the request counter and the decision
+  source are mutable: the counter is atomic now, so reads run side by side, and writes (which move
+  the source) take a mutex in the shell.
+- **The memory store does not wait.** `Watch.next(timeout)` returns at once on it, so every loop that
+  waits on a watch (the driver, a held request) naps `server_poll_ms` when an empty batch comes back
+  early. On SQLite and Postgres the call itself waits. The memory store also needs a mutex in a
+  threaded shell (`server_store.zig`, `Locked`).
+- **Identity is the shell's.** The controller's instance number is derived from the start time so a
+  restarted server takes a new one; the API's source keeps instance 0, so the two never share a
+  decision id.
+- **Failure shows once.** A store that goes down fails every step; the driver prints the diagnostic
+  when the code changes or every 30 s, backs off 250 ms doubling to 5 s, drops and reopens its
+  watch, and prints one line when it recovers. Nothing in the core had to know.
+- **The arena limit is real.** Each request and each step has a `BoundedArena` of
+  `request_arena_bytes_max`; the core already reports a full arena as `ZC-E0207`. With 64
+  connections that is a worst case of 1 GiB of address space, touched only if requests are that
+  large.
+- **`SO_REUSEADDR`, without `SO_REUSEPORT`** (`server_listen.zig`). The standard library ties
+  `SO_REUSEADDR` to `SO_REUSEPORT` (`Io.net.IpAddress.ListenOptions`): with both, a second server on
+  the same port starts without complaint. Without `SO_REUSEADDR`, a server cannot listen on its port
+  for a minute after it closed a connection first (an idle client, a reply that ends the connection,
+  a connection open when it stops: the connection sits in `TIME_WAIT`), so a restart was `ZC-E0107`.
+  So on Linux the listening socket is made by hand with `SO_REUSEADDR` alone: a restart works at
+  once, and a second live server on the same port is still refused loudly (`SO_REUSEADDR` does not
+  allow a port with an active listener; `server_test.zig` checks both). Elsewhere the strict listen
+  of the standard library is used, with the old limit.
+  **Slices 6a and 6c found this from the client side first**: the agent, then the `zcube` command
+  (which sent `Connection: close` and read to the end), made the server close first. Both clients now
+  close first, which is still good manners, but the server no longer depends on it; review showed that
+  an idle connection, a browser or `curl` could still block a restart.
+
+## The cluster simulator's pieces so far (C1 slice 2b)
+
+- **Crash model.** `SimState` models what the agent's files guarantee. A `put_atomic` is whole after
+  any crash and durable once it returns (temporary file and directory both fsynced); a `remove` is
+  durable once it returns; an `append` guarantees nothing, and a simulated host crash can drop the
+  unsynced tail of any file. `arm_crash(n, kind)` crashes at the nth write point of the next calls;
+  `crash_now(kind)` crashes between two calls, which a write point cannot express (the step
+  boundaries). After a crash every call fails with `Crashed` until `restart`.
+- **Delivery by the clock.** `SimNet` parks a reordered request with a delivery time. The cluster
+  calls `SimNet.tick(now_ms)` after every advance of the clock, and that, not a later call on the
+  link, delivers what is due: so a stale write can land after the server's own clock has moved on.
+- **Records.** `sim_node.zig` runs the same `agent_records` code as `FakeRuntime`; an unknown image
+  is refused and writes nothing in both. `scan` skips a container whose spec the host cannot read.
+
+## The cluster simulation
+
+`zig build sim-cluster` (`src/sim_cluster.zig`, run by `sim_cluster_main.zig` natively and by
+`wasm_core.zig` as WebAssembly) is `sim-c0` for a fleet: the server's controllers and API, up to
+four nodes, each with the real `Agent`, the real `agent_loop` policy and `agent_client` over
+`SimNet`, a clock of its own, a `SimNode` (containers that outlive the agent, agent files that a
+crash leaves as the files would be), and the memory store behind a lost-acknowledgement layer. One
+seed fixes everything; the run's report ends in a hash of the whole store and every node's runtime,
+so one seed twice gives one hash and the native and WASM reports agree byte for byte. `sim_world.zig`
+and `sim_c0.zig` are untouched: `sim-c0`'s report is what it was.
+
+**The swarm.** The seed picks the node count (1 to 4), the rate of every fault below (zero a
+quarter of the time, so some worlds have no partitions and some no crashes) and the weights of the
+workload, and the run prints them first. A report therefore says which world it ran in.
+
+**The faults**, each at the seed's rate and kept low enough that a cluster still works while faulty
+(the run fails if the fault phase got too little agent work done):
+
+| Layer | Faults |
+| --- | --- |
+| Network, per link and direction | drop a request, drop a reply (after the server committed: the agent sees a failure for a write that happened, the case the simulator makes common), delay, duplicate, reorder (a parked request lands when the clock reaches it, even after the world moved on), one-way and two-way partitions that heal |
+| Store | a lost acknowledgement (commit, then an error to the caller), outages |
+| Server | restarts (a new instance number, memory gone, store kept) |
+| Agent | crash at any step boundary or at any write point of its files (`SimState`: a put that is renamed into place is whole or absent, an append can lose its tail), restart that adopts by replica id |
+| Node clock | a rate error up to the swarm's `clock_rate_ppm_max`, an offset, a suspend that jumps the node's `CLOCK_BOOTTIME`-like clock forward |
+| Runtime | `random_fault` of `SimRuntime`: an oom, a pid limit, a lost container, a crash exit |
+| Workload | apply, scale, delete, a broken image, the passage of time |
+
+**What it proves.** Each virtual second and after each operation (during the heal as well): `sim-c0`'s
+invariants read over the whole store (every decision has a reason and a cause that exists; `why`
+terminates and ends in a cause); no container lives longer than 120 s of reachable time on a node
+that no replica assigns it to; a placed replica of a good image is running on its node within 24 s
+of reachable, working time; no node's agent works in a busy loop (200 steps per minute of uptime; 300 in the burst world, whose bursts of short jobs legitimately take more steps, #202)
+and the cluster does not starve (5 successful agent steps per minute of uptime over all nodes
+together, checked when they were up 120 s in the fault phase). With
+**liveness mode**, the default, the faults run for the first `H` operations, `H` drawn from the seed
+alone between half the run and all of it, then every fault is off for the rest of the operations,
+and 240 s of virtual time after the last one every service has the replicas it asked for (held ones
+for a broken image), each in the image and generation it asked for, and no node runs anything
+else. `-Dliveness=false` keeps the faults to the end and checks only safety.
+
+**Duplicates are counted, not failed.** Without leases and fencing (slice 6) a partition can leave a
+replica running on two nodes. The report prints the replica-seconds, with the note that the number
+is counted and not a pass; slice 6 turns the counter into a failure. Nobody should read it as a pass.
+
+**What it does not prove.** Real processes, `kill -9` and real supervisors (`agent-smoke` and
+`demo-c0` start those); Postgres and SQLite (the conformance suite covers the store contract; the
+simulator's store is the memory store, and a lost acknowledgement is what a real database's
+connection loss after commit would look like, not a model of its failure modes); the real `zbx`
+(the runtime is `SimRuntime`, which stops at once unless told to be slow); the `zcube` command;
+real time and the real OS clock; TCP and HTTP framing (the network carries the bytes of
+`agent_api`, and the transport faults are the ones above); a disk that corrupts rather than loses a
+tail; the scheduler and node controller (slice 3: placement is C0's). A bug in any of those, and
+anything the models leave out, can pass every seed. A passing simulation is never a passed demo.
+
+**Teeth.** A simulator that never fails proves nothing, so the agent has one test-only fault:
+`agent.fault_ignore_stop`, "the agent ignores every order to stop a container". It is a constant
+that a program's root file switches on by declaring `agent_teeth_ignore_stop`; the only root that
+does is `src/sim_teeth_main.zig`, which only `zig build sim-teeth` compiles. The shipped binaries
+have other roots, and `zcube_agent.zig` asserts at compile time that it is off, as a unit test
+does for the test build. `zig build sim-teeth` runs that simulator over seeds 1 to 10 at 100
+operations and passes only if a seed fails: it fails at seed 1 (20 of 20 seeds fail in a first
+trial) with "a container runs that no replica assigns to its node". `check` runs it. It builds in
+Debug because that takes 7 s where ReleaseSafe takes 50.
+
+**Commands.**
+
+```
+zig build sim-cluster [-Dseed=N] [-Dops=N] [-Dnodes=N] [-Dliveness=false] [-Dprofile=NAME|auto] [-Dauto-shape]
+zig build -Doptimize=ReleaseSafe sim-cluster-exe
+zig-out/bin/sim_cluster <seed> <ops|auto> [<nodes>] [--liveness=false] [--heal-at=H]
+    [--profile=NAME|auto] [--lease-ttl-ms=N] [--replicas-pct=N]
+zig-out/bin/sim_cluster --seeds A..B <ops|auto> [<nodes>] [--liveness=false] [--shrink] [--trace-steps]
+    [--profile=NAME|auto] [--lease-ttl-ms=N] [--replicas-pct=N]
+```
+
+The first runs one seed natively and as WASM and compares. The range form prints a line per failing
+seed (`seed N: FAILED: <what>`, `  step: <faults|healed|convergence|end>`: where in the run the check
+failed) and its replay command, then a count; the exit code is 1 if any
+failed. **Replay:** the printed command reruns exactly that seed; its `--heal-at` is the heal point
+the run printed. **Shrink:** `--shrink` bisects the operations of each failing seed to the smallest
+count that fails with the same symptom, holding `H` where the full run had it (it is drawn from the
+operation count, so a shorter run would otherwise heal elsewhere); the printed replay of the shrunk
+count carries `--heal-at`, so it is the same run, cut short. It assumes that more operations keep
+failing, and checks only that its answer fails and one fewer does not fail the same way, so on a
+failure that comes and goes it may not be the smallest. `zig build sim-teeth-exe` installs the
+fault-on runner (`zig-out/bin/sim_teeth`, same flags) to try shrinking on the teeth fault. A run at
+100 operations takes about 0.7 s natively in ReleaseSafe. The range output is what the simulation
+fleet reads (`ops/sim-fleet/README.md`): it files a failure by its check and step, so a change to
+either line's format is a change to `src/sim_fleet_issue.zig` too.
+**The strong world (B2 slice 4, `--strong`).** Two faults that older worlds never had, behind one
+option so that every replay line written before it (`c1_regressions`, `sim-c1-regress`, the
+replay commands of open `sim-fleet` issues) draws the same numbers as before (`--strong` adds no draws without it; B2's other changes to the simulated world, the spend rule, restart timing and job memory, alter every world, so a pre-B2 replay line runs a different world and a "passes on replay" close of an old issue needs a cause, not the replay alone): with `--strong`,
+every other host crash also loses the node's disk (state directory and containers; `wipes=` in the
+report), and every thirteenth job asks for more cpu than any node has, so that no node claims it
+(J8's second clause), and every third job names a relay (no draw; B3 slice 3: the simulated runtime opens a listener at
+start and closes it on every ending, `jobs: relays opened=.. closed=..` in the report, and R1 to R3 judge it, below). `auto` operations and the teeth `job_wipe`, `job_unclaimed`, `job_evicted`, `relay_leak` and `relay_dropped` switch it on,
+and the replay line then carries `--strong`. **What it does not cover:** a state directory removed
+by hand while the host and its containers stay up. The simulated node's runtime keeps each
+container's record in that directory, so the containers would run on with nothing that lists them;
+no agent can find such a container and J1, J8 and I1b fail on it (measured: 42 of 200 seeds at 100
+operations, plain). A real adapter keeps its containers' labels in the runtime, where the agent
+still lists them, so the case needs a runtime model that lists containers apart from the agent's
+files; that is a coverage cut, not a pass.
+**Profiles and shapes (C3 fleet 1).** `--profile=` is `mixed` (default: the draws every earlier
+build made), `partitions`, `skew`, `crash_heavy`, `slow_store` or `auto` (drawn from
+the seed, weights 3 2 2 2 2). A profile other than `mixed` zeroes every fault class but its own
+and forces its own on. `<ops>` = `auto` (`-Dauto-shape` in `zig build`) draws the run's size from
+the seed as well: nodes 1 to 16, lease ttl 8,000 to 10,000 ms (the shipped 10 s 40 % of the time),
+replica counts 100 to 300 %, operations 40 to 99 / 100 to 199 / 200 to 399, one run in ten 400 to
+800, with operations times nodes at most 5,000. `--lease-ttl-ms=` and `--replicas-pct=` set those
+two by hand, which is what a replay line carries (with the concrete nodes, `--profile=` and
+`--heal-at=`), so a replay draws nothing. An explicit `<ops>` keeps the seed-picked node count,
+the 10 s ttl and 100 % replicas. A failing seed prints `  profile:` and `  shape:` lines after
+its `  step:` line; the fleet's parser ignores them. The `auto` range summary reads
+`sim-cluster: seeds A..B, drawn operations: F of T failed`. The drawn ttl floor is 8,000 ms, which is also the shortest ttl the server admits
+(`docs/decisions/2026-11-06-renewal-before-fence.md`). Every draw has its
+own generator (the seed xor a salt); the
+decision is `docs/decisions/2026-11-04-fleet-profiles-and-shapes.md`.
+**Crashes:** the range form flushes each failing seed's report as it is printed, so a later seed
+that panics loses no earlier one. `--trace-steps` (either form) writes `step: <name>` to stderr,
+unbuffered, as the run enters each step (`faults`, `healed`, `convergence`, `end`), so the step a
+crashed seed was in is the last such line; the fleet replays a crashed range seed by seed with it.
+Before each seed's run it also writes `replay: <command>` (the concrete command, as a failing seed
+prints it), so the last such line names the seed a crash or a timeout was in and how to replay it.
+A seed whose world cannot be built (out of memory) reports `step: setup`.
+
+**Lost nodes in the report.** The report's `lost nodes:` line counts the `mark_lost` decisions and
+the replicas replaced after a lost node's grace (a `mark_replica_lost` caused by a decision). A
+leased node's partition (1 to 9 s) is shorter than the 10 s lease, so it alone never expires a
+lease; the crashes, suspends and store outages the seeds also draw do. Seeds 1 to 40 at 100
+operations: 30 of 40 mark a node lost and 27 replace replicas after the grace, which the
+`lost_grace` check judges; the rest never reach it, so a change to the lost path is judged over a
+range of seeds, not one.
+
+**The fleet's per-seed budget (B2 slice 4).** A `--seeds` batch is `SIM_FLEET_BATCH` (100) seeds
+under `SIM_FLEET_BATCH_TIMEOUT` (3,600 s), so a seed has 36 s on average and a batch is lost
+(one crash record, no verdict for any of its seeds) when the batch's total passes 3,600 s. No
+single seed has a limit of its own. Measured 2026-11-08 in ReleaseSafe, `--c1 auto
+--profile=auto`, five seeds at once on four cores (so inflated): seed 44 95 s, 19 144 s, 69 154 s,
+12 247 s, 27 344 s (786 operations on 3 nodes, `partitions`). A profile of seed 27 (gdb samples,
+25) puts about 90% of the time in `MemoryStore`: `find` and `select_page` scan the whole `live`
+table, which is unsorted (`store_memory.zig`), so every `get` and `list` of the sim's store costs
+the number of live keys and a run costs about operations squared. The cost is that slow path, not
+the size of the world, so the draw (`cost_max`) is not capped. A hash index on `live` (key to
+position) would remove it; it is a change to the `Store` implementation the conformance suite
+covers, left to its own slice.
+
+`zig build check` runs `sim-cluster` on a fresh seed (printed as `sim-cluster: seed N`) at 40
+operations with `-Dprofile=auto` (the shape stays fixed), native against WASM, and `sim-teeth`; then `sim-swarm` (100 operations) and
+`sim-swarm-teeth` ([swarm.md](swarm.md)).
+
+## sim-c1
+
+`zig build sim-c1 [-Dseed=N] [-Dops=N] [-Dnodes=N]` is the cluster simulation with `Options.c1` on
+(`sim_cluster --c1` natively): clock skew and wedged (frozen) agents are added to the swarm, a
+`TapStore` beneath the lost-acknowledgement layer (`src/sim_tap.zig`) lets `src/sim_c1.zig` check
+every committed revision, and native and WASM reports must agree byte for byte. It is a profile,
+not a new simulator, because the faults and the real controllers, agents and store are the same
+(docs/DECISIONS.md, 2026-11-03).
+
+What it checks (docs/authority.md §4). Two of the checks run after each commit, and two just ahead
+of one, over the head the transaction will commit over (the tap's `before`; the verdict counts only
+if the transaction then commits, because a failed compare is the store doing its job):
+
+- **I1a** one assignment per replica id. **I6** allocations equal the sum of assignments, none
+  above capacity. **I7** no placement onto a node that is not ready for its tenure.
+- **I1b** a replaced replica stops on its old node within the overlap bound (5 s), unless a node
+  running it was wedged now or within `wedge_memory_ms`; the bound then runs from the last moment
+  of the wedge (a wedge long past excuses nothing), and the report counts the excused overlaps
+  separately. A node whose agent is down counts as wedged: until slice 6's self-fencing nothing
+  stops its containers (docs/DECISIONS.md). The same replica executing on two nodes at once
+  (`duplicates`) fails the run. A full overlap table is counted in the report, never silent.
+- **I2** every put under `/observed/<node>/` carries a compare on `/nodes/<node>` (the tenure)
+  and every write to `/assigned/<node>/<id>` a compare on that key (the placement epoch), and
+  the compared revision is the key's current one. The store refuses a stale compare, so this
+  finds a transaction that left the compare out, or a store that did not enforce it.
+- **I3** (authority.md §3, at the head the decision commits over): each decision citing an agent's
+  report (`cause.kind` `observed`, a key under `/observed/`) cites one whose `tenure` is its
+  node's current registration, whose `assignment`, when it has one, is the current revision of
+  `/assigned/<node>/<id>`, and whose node's `/node-status/<node>` is `ready`. The report itself is
+  read at the cited revision: a missing one fails, one compaction took is counted as unjudged
+  (the report prints judged, unjudged and the citations of other keys, a node or an allocation,
+  that are not §3's). Until slice 6 the agent does not stamp `assignment` (keys.md), so that
+  condition is judged for reports that have it and waits for the rest.
+- **I4** no transaction's puts and deletes span the keys of two writer roles, touch a key under no
+  prefix, or name two nodes' agent keys (`writers.foreign_key`). The tap sees the transaction and
+  not who sent it, so "the actual role matches the table" would need the role passed through the
+  `Store` interface, which is an Ask-first change; this is the weaker, role-free form.
+- **I5** every `why` is complete or truncated with a reason; a decision `why` cannot explain when
+  it commits, or the recorder cannot hold, fails the run.
+
+- **Jobs** (B1 slice 5, `src/sim_jobs.zig`; on unless `--jobs=false`, which also leaves the workload's
+  job draws out of the seed). The workload creates, cancels and ends jobs (`jb-<n>`: image, a
+  deadline of 3 to 43 s or 10 minutes, a grace of 0 to 2 s). **J1** a job container is not alive
+  more than `overlap_ms_max` after its job reached a terminal status. **J2** no run id is
+  started twice, in any node and any agent life (a ledger fed by the simulated runtime's start
+  hook). **J3** a terminal job status never changes to another status or to other content, and
+  a status is deleted only in the transaction that deletes its job (the brief's further half, that
+  a deleted status is not recreated while its job exists, is slice 6). **J5** a run, once its stop is
+  committed, is never assigned again. **J6** a container runs no longer than `stop_bound_ms`
+  after its run's `stop` committed. **J7** each start has a committed claim of this run, tenure
+  and epoch, and the run has no stop. **J8** a container runs no longer than `deadline_bound_ms`
+  after the tracker first saw it (the run's start on the ledger, within a tick), and after the
+  heal no run is open long after its latest possible end. **J4** a client that follows the endings through `GET /v1/jobs/watch` (`src/sim_jobs_watch.zig`), is killed now and then (away for under a minute, or for minutes: the sim compacts to the head every `server_compact_ms`, so a longer outage gets the 410 and the list) and resumes from its revision, has seen every ending the store committed by the end of the run (each terminal `/job-status/` put the tap saw), and is never given an event twice. Age retention (`src/job_retention.zig`) is covered by its unit tests: the sim's runs are minutes long, far below `job_finished_age_ms_min`.
+  A node's clock moves inside a step: a call to the server costs the time it takes
+  (`src/sim_clock.zig`, `spend_until`), so the agent sees time pass between its calls and the sim
+  does not freeze the node's clock for a step (fleet issues #151 and #142). `zig build
+  sim-c1-regress` (ReleaseSafe) replays the newest fleet lines of #135, #136, #143, #151, #166
+  and #176, which fail on main a864e89 and pass here, the original lines of #135, #137, #142,
+  #143 and #151 (smoke: they pass on a864e89 too), three seeds that fail J8 without the next
+  change (31, 53, 102 at their auto shapes) and the restart-rule seeds below. J8 counts from the run's true start (the sim records it when the runtime
+  starts the container), not from the tick that first saw the container: a step's true time is
+  frozen while the node's clock ran ahead inside it, and 17 of 2,000 seeds failed J8 without
+  this. The agent runs
+  every stage of a step even when one fails (a replica whose start errors, the job pass), so a
+  replica error that repeats does not withhold a cancel, a stop or a later replica; the first
+  error is the step's, the others are counted. A simulated agent that has died sends nothing in
+  the rest of its step (seed 1272 failed self-fencing before this: the job pass wrote after the
+  crash).
+  Restart rule (#171): a step runs whole at its start, and the node's clock already includes the
+  time its calls spent (`busy_until_true_ms`), so an agent that died inside a step has a clock
+  ahead of true time. A crashed node therefore restarts at `max(drawn downtime,
+  busy_until_true_ms + 200)`, only once true time has caught up with its clock; `step_once`
+  asserts it. Without it a restart stamped a lease from a clock ahead of true time and fenced
+  late, an artefact (seeds 1384, 1612, 893), not an agent that acts past its fence. The rule only
+  lengthens downtime, so it hides nothing in the safety direction. Coverage cut: a crash inside
+  a long step (a slow store, many calls) is no longer followed by a fast restart, so a bug that
+  shows only then is out of the simulator's reach. The lengthened downtimes are not counted.
+  The clocks are never restarted. A node that was wedged (its agent down or frozen, or a
+  container ignoring a stop) is not judged until `wedge_memory_ms` after, and its wedged time is
+  added to the J6 and J8 bounds (in J8, only the time wedged after the deadline). J8 gives a cut
+  link or store nothing: the agent enforces the deadline from its own records and clock, so every
+  node gets only the deadline, the grace, the clocks' rate error, the kill and the granularity (a
+  tick and two check intervals: when the simulator looks). A deadline enforced merely late fails
+  (`sim-c1-teeth-job_deadline_late`: 9 s late), and so does one enforced only through the server
+  or the fence (`sim-c1-teeth-job_deadline_offline`).
+
+The evidence acceptance test (§5, `src/why_acceptance.zig`): each decision's terminal evidence is
+recorded as `why` renders it right after commit; at the end of the run every cited key is deleted or
+changed and the store compacted past them; `why` is asked again for every decision and must be
+complete with the same evidence, or truncated with a reason and nothing it cannot back. The same
+test runs over the real core in `zig build test`.
+
+Negative tests (`zig build sim-c1-teeth`, one step per test, each passes only if its check fires):
+a wedged node, not excused, breaks I1b (the overlap tracker's own sentence); skew beyond the
+bound fires the older fencing check (a container running on a node whose lease ran out longer ago
+than the lost grace), which sim-c1 labels I1b, not the overlap tracker; skipping the allocation
+compare breaks I6; skipping the readiness compare with a node lost between planning and commit
+breaks I7; a node that registers again between a controller's read of a report and the decision's
+commit (as if the tenure were not compared) breaks I3; a scheduler that ranks locality ahead of
+spread breaks L1 (C2 slice 5: each placement is no worse on spread, among the nodes that fit, than an order of fit and
+spread alone would choose, `scheduler.placement_problem`; every node holds a seed-chosen subset of
+the images and advertises it as `/node-store/<node>`).  The job teeth (`sim-c1-teeth-job_restart|claim|double|rewrite|cancel|deadline|deadline_late|deadline_offline|gap`, and the later `stale|refused_loop|unclaimed|wipe|evicted|pass_break`): an
+agent that starts a stopped run again breaks J2; one that skips its claim breaks J7; a scheduler
+that leaves the run's compare out of a placement, with a `stop` committed between its read and its commit, breaks J5; a controller that rewrites a terminal status breaks J3; an
+agent that ignores a cancel breaks J6, and so does one whose job pass ends at the first failure of the server (`job_pass_break`, the agent before #247's fix: an orphan's committed stop waits for the next pass, seeds 225 and 180 of the `job_evicted` world) (a server that cuts a node's runs read while a stop is asked and answers its keepalives once broke it too; the agent's job fence holds it now, and `sim-c1-runs-unread` is that world's positive run, docs/decisions/2026-11-15-j6-143-job-fence.md); one that ignores the deadline, enforces it 9 s late, or enforces it only when it can reach the server (with cuts of up to 33 s and short deadlines turned up, so that deadlines fall in them), breaks J8; a jobs watch that drops the events of some endings breaks J4. Their
+`sim-c1-teeth-job_evicted`: a job controller that judges only the first 512 jobs of each sweep (test-only, `job_controller.zig`) never ends an unplaceable job past the 512th, which J8's second clause (read over `job_admitted_window_max` runs, and a refused list is a failure) catches in the burst world with `--strong`; seed 186 (seed 32 until B2.1 slice 6; the fleet canary runs 1..186; `docs/decisions/2026-11-11-job-evicted-tooth-sparse.md`). switches live in `src/c1_teeth.zig`, read from the test's root file; `zcube-server` and
+`zcube-agent` assert at compile time that none is on.
+
+`sim-c1-teeth-register_unchecked` (#237): with `SimNet.late_registration` on (the tooth turns it on;
+`--late-registration` and `sim-c1-late` turn it on with the fix in), the network first grants a
+lease of its own when the agent asks for one, an earlier attempt's, older than the agent's. After
+the agent's registration is accepted, a copy of it under that older lease is parked and delivered
+`lease_ttl_ms - 1000` ms later, as a late attempt would land (`late_registrations=` and `landed=` in
+the report; nothing is drawn from the seed). The server refuses it (ZC-E0510: the key is on a newer
+lease). With that lease-order check skipped (test-only, `c1_teeth.register_unchecked`) the key
+moves onto the older lease, which nobody renews and which expires: the node is marked lost and its
+replicas are replaced while the agent still runs them, I1b (23 of 40 seeds, 1..40, 100
+operations, `--c1`; 15 others fail on liveness, such as `agents kept fencing`).
+
+`sim-c1-teeth-job_reuse` (B2.1 slice 4): the reuse world. A store-side retention jump
+(`Cluster.retention_jump`; it ticks no agent, and first lets the J4 client catch up, since the
+jump stands for an hour that client would have polled in) runs `job_retention.prune` twice on a
+clock moved past the retention age, every third `job_create` operation; creates then name deleted
+jobs, preferring one whose node still holds a stopped container that exited. The run id is
+`<name>-job`, so a reused name meets that container: the agent's stale-epoch rule must not take it
+for the new run's. The ledger of starts is keyed by incarnation (the run's `/job-runs` create
+revision) in this world, and J11 fails a run whose status is `exited` (or failed by `oom` or
+`pid_limit`: endings only a real container has) that no node started in its own incarnation.
+`running` (reported ahead of the start) and `failed deadline` (a start record whose step aborted
+before `runtime.start`) are not judged. The tooth makes the simulated node's listing
+(`sim_node.zig`) report every job container's `zcube.created` as the newest epoch; the agent is
+unchanged. `sim-c1-reuse` is the world with the agent right (seeds 1..60, 300 operations). Opening
+the world exposed that I4 model gap: retention's sweep of stray `/job-observed/` keys spans nodes
+and jobs, which I4's `retention_only` rejected; `writers.foreign_key` accepts a delete-only request on
+that prefix only while `Cluster.retention_jump` runs retention (the tap is told so). The report adds `jobs: reuse jumps=.. dropped=.. held assigned=.. reused creates=.. met a
+container=..` in this world only; every other world is unchanged bit for bit.
+`docs/decisions/2026-11-11-job-reuse-tooth.md`.
+
+Since #243 the scheduler is down before every jump in this world (`Scheduler.runs_held`, set
+from `Cluster.reuse_runs_held` from the create before the jump to the reuse after it): no run's
+assignment is released, so retention meets ended jobs whose runs are still assigned and must keep
+them (`held assigned=..` counts them). `sim-c1-teeth-job_reuse_assigned` turns off every part of
+the fix (retention's `/assigned/` check, the job controller's incarnation compare in
+`World.placement`, and the revision rule in the agent API and the agent): a reused name then takes the old run's assignment, and the agent starts the
+new run under it again (J2) or reports the old ending for it (J4). Under that tooth only, the
+simulated runtime and node let a running container be replaced under the same name. It is sparse:
+7 of seeds 1..60 fail at 300 operations, so the negative test runs 30..60 (first hit at 33) and
+also seed 40. `docs/decisions/2026-11-18-job-incarnation.md`.
+
+**Relays (B3 slice 3).** `SimRuntime` models the listener of a job's relay (`Spec.relay`): open from the
+start, closed by every ending (exit, signal, stop, deadline, a lost supervisor), gone with a wiped disk;
+an agent restart keeps it with the container. Three checks, judged on every tick by every run with jobs:
+**R1** no listener is open on a stopped container, or was left open on one the runtime forgot (evicted
+or replaced; sticky), so a relay is closed before its ending can be reported; **R2** (a restatement of J2 and R1 for listeners keyed by run id; no tooth of its own) no two listeners
+are open for one run (across nodes); **R3** (also: a started job's spec carries the relay the job asked for, judged against the job's name, not the spec's own field; `relay_dropped` blanks it and must fail R3) a running relayed container has its listener open. Only
+the `strong` world makes relayed jobs, so a run without `--strong` makes no relayed jobs and draws as before.
+`sim-c1-teeth-relay_leak` (`c1_teeth.relay_leak`, which implies `--strong`) leaves the listener open at
+the ending and must fail R1, with or without `--c1`. The fleet's canary list gains `sim_c1_teeth_relay_leak`.
+
+**Certificates (B4 slice 3, `src/sim_certs.zig`).** In the `strong` world each running relayed
+container's supervisor asks for its workload certificate once a second until it has one, on any
+tick its link to the server is not cut. The issuer is `job_cert.decide` over the store as committed:
+the job, its status, and the claim and assignment of the node the status names. The issuer's `now`
+is the asking node's clock, because a run's `started_at_ms` is its node's reading and a simulated
+node's clock has an offset of its own. While the certificate is valid the container opens up to 4
+relayed connections. Its ending, or a stop, closes them. On 15 % of ticks a forged ask stands for
+O4's unauthenticated request: an earlier epoch, another node's name, another image, or a run that
+may have ended. The report adds `certs: asks=.. issued=.. refused=.. ..` and `certs: refused by ..`.
+There are four checks:
+
+- **R4.** A certificate goes only to the node holding the run's claim, at the epoch named by the
+  claim and the assignment, for the image the job pins, for a run that is assigned, started, not
+  terminal and not reported stopped; and no forged ask gets one. It is judged once, at each issue,
+  against the records the issuer read.
+- **R5.** No certificate's `not_after` passes the claim's start + `deadline_ms` + `grace_ms` +
+  `workload_cert_slack_ms`. It is judged once, at each issue.
+- **R6.** No relayed connection is open after the node's `/job-observed` record of that run (same
+  run id and epoch) says `stopped`, nor on a container the runtime forgot. It is judged from
+  `safety()` (every `check_interval_ms` and after every operation) with or without `--c1`, and
+  under `--c1` also at every committed revision.
+- **R7.** No relayed connection stays open more than `relay_cancel_ms_max` (2 x `relay_poll_ms`,
+  100 ms) after its container was told to stop, whether it is still in its grace or has since
+  ended (a sticky flag, so a stop and its end between two checks cannot hide a late close). Judged
+  from `safety()`. Half the relayed runs take their grace when told to stop (a hash of the job's name, no
+  draw), so R7 has a window to judge; a TERM, the fence's, still ends them at once.
+
+R6 and R7 test the simulated runtime's connection counters and the agent's ordering of stop, end
+and report, not slice 2's relay (`relay_pump.zig`), whose own tests do that.
+The checker reads the records itself rather than calling `job_cert` (it parses the job's
+`b3:<hex>` digest itself), so it does not judge the rule by the rule. Its generator is its own
+(seeded from the run's seed), so no other draw of the world changes. A world with relayed jobs
+differs only by the clock readings and store reads the model makes. The teeth are
+`sim-c1-teeth-job_cert_stale` (the issuer skips the epoch compare and must fail R4 with "a
+certificate was issued for a stale epoch"), `job_cert_image` (the issuer skips the image compare;
+R4, "a certificate names another image than the job pins"), `job_cert_long` (`not_after` counts
+the slack twice, R5), `relay_conn_leak` (connections are not closed at the ending, R6) and
+`relay_stop_leak` (connections are not closed when a slow container is told to stop, R7). All five
+imply `strong`, run with or without `--c1`, and are in the fleet's canary list. A failing tooth's
+replay line names its own runner and `--strong`.
+`docs/decisions/2026-11-13-b4-slice3-sim-certs.md`, `docs/decisions/2026-11-13-b4-slice3-fixes.md`.
+
+**Signed jobs (B5 slice 3).** `--signed` (`Options.signed`; `src/sim_trust.zig`) opens B5's
+trust world. Five Ed25519 keys come from the seed; the first four can be trusted, the fifth never
+is. Each node draws a Zigbox trust policy: one in eight has none (no `--trust-policy`), one in
+eight an open policy (`require_signature = false`), the rest require a signature from a subset of
+the four (the first key in seven of eight). Every job names one tree image (`sim_trust.image`) and
+carries up to three `zbx trust export` lines drawn from fifteen envelopes signed ahead of the run:
+tree-only statements of that tree, statements of another tree, and statements bound to a manifest
+(which count for no job: a sim job has no pinned `source`). The lines are a function of the seed
+and the job's number, so a name made again carries the same ones. The agent judges a run with the
+real `job_trust.judge_run` against its node's policy; the simulator keeps its own oracle (a
+`require` node admits a run only if some line is a tree-only statement of the job's tree by a key
+it trusts; a unit test holds it to the real verdict). **J12**: no run of a job that its node's
+policy refuses ever starts (judged at each start), and every refused run ends `refused` exactly
+once: judged on each terminal `/job-status/` put the tap sees (a run that ended refused never ends
+again; it was placed on a node whose policy refuses it) and at rest (a terminal run on a refusing
+node, not ended by a stop cause, ended `refused`). The report adds `jobs: trust nodes none=..
+open=.. require=.. starts=.. checked=.. refused endings=.. judged at rest=..`; without `--signed`
+nothing is drawn and every world is unchanged bit for bit. `sim-c1` runs its seed twice, without
+and with `--signed`, each natively and as WASM. `sim-c1-signed` runs seeds 1..20 at drawn shapes
+and profiles (CI's `sim-worlds` job). The tooth, `sim-c1-teeth-job_untrusted`
+(`c1_teeth.job_untrusted`, which opens the world on its own), has the agent skip the check and must
+fail J12, with or without `--c1`. The fleet's sim-c1 workers pass `--signed`; the canaries do not
+(the tooth's runner opens the world itself, and every other canary keeps the world it was measured
+in). `docs/decisions/2026-11-13-b5-slice3-handoff.md`.
+
+**P1** (B6 slice 2, docs/briefs/b6.md, as the supervisor ruled it on 2026-11-13: no exclusive node holds
+a job of another tenant or a service, across node loss, re-registration with other labels and partitions;
+`src/sim_tenancy.zig`, `docs/decisions/2026-11-13-b6-slice2-p1.md`). Only the tenant world (`--tenants`,
+which drawn `auto` operations switch on) has tenants, and draws none from the cluster's generator
+(`label_prng`, apart from `prng`): a run without `--tenants` is the world it was before, `--strong`
+included. Nodes carry `tenant=a` or `tenant=b`, and the nodes of odd index (the second, the fourth, ...)
+may also be `exclusive=tenant`; the nodes of even index never are, and `replicas_for` counts only those, so
+the services always fit. A restart of an agent, half the time, comes back configured with other labels, and
+before one operation in eight (until the heal) an operator reinstalls one node with a different set (a host
+crash that loses its disk; an odd node half the time, toggled between its shared and exclusive set;
+`relabels=` and `operator restarts` in the report). An agent sends new labels only with a new tenure (after a
+fence or a lost disk), which starts empty, so what a relabel leaves refused is the stale assignments of the
+old tenure, until the controllers act. Jobs name `tenant=a` or `b` (`job_tenant`, no draw), every fourth
+none (and only a non-exclusive node may run it), every eleventh `tenant=c`, which no node carries (it stays
+pending and ends `not_started`). The judge is independent: it records the labels each agent registered
+with (each new `/nodes/<n>` revision), each job's tenant from the simulation's own `job_tenant`, and decides
+with its own rule. **P1a** (`--c1`, in `before_commit`): no new assignment lands on a node whose registered
+labels refuse it, and a stored run's `require` is the job's. **P1b** (every simulated second the store is
+healthy): a hold its node's registration refuses is acted on (the replica removed, the run stopped, ended or
+replaced) within 5 s (`acted_ms_max`) of when it is first seen or the store last failed; at rest none remains. A node with
+no registration is I7's. `sim-c1-teeth-placement_exclusive` (`c1_teeth.placement_exclusive`, which implies
+`--tenants`) skips the scheduler's `exclusive` rule and must fail P1; `sim-c1-teeth-relabel_kept`
+(`c1_teeth.relabel_kept`, which implies `--tenants`) turns off the controllers' relabel eviction and must
+fail P1.
+
+`zig build check` runs `sim-c1` on a fresh seed (`sim-c1: seed N`). It does not run `sim-c1-teeth`;
+CI's `sim-c1-teeth` shards do.

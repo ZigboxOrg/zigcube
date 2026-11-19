@@ -1,0 +1,194 @@
+//! The control-plane core: the modules that must stay free of the shell, and the two checks that
+//! hold them to it (docs/wasm.md). The core is controllers, scheduler and API handlers written as
+//! functions over `Store`, `Runtime` and `Clock`, plus the types and diagnostics they share. The
+//! shell is what supplies those three and everything else a process needs: HTTP, Postgres and
+//! SQLite, threads, files, the real clock, `std.Io`.
+//!
+//! The rule is checked by compiling, not by reading: `zig build wasm` builds these modules for
+//! `wasm32-freestanding`, a target with no libc, no OS, no threads and no `std.Io`, so an import
+//! of any of them fails the build; `zig build wasm-test` runs the modules' own unit tests under
+//! WASI. A module joins the core by being listed here, and nothing else changes.
+
+const std = @import("std");
+
+pub const modules = .{
+    @import("agent.zig"),
+    @import("agent_api.zig"),
+    @import("agent_client.zig"),
+    @import("agent_jobs.zig"),
+    @import("agent_loop.zig"),
+    @import("fencing.zig"),
+    @import("agent_records.zig"),
+    @import("agent_state.zig"),
+    @import("allocations.zig"),
+    @import("api.zig"),
+    @import("api_scope.zig"),
+    @import("state_view.zig"),
+    @import("auditor.zig"),
+    @import("job_api.zig"),
+    @import("job_cert.zig"),
+    @import("job_trust.zig"),
+    @import("job_trust_fixture.zig"),
+    @import("apply.zig"),
+    @import("chunk_summary.zig"),
+    @import("mtls_smoke.zig"),
+    @import("node_store.zig"),
+    @import("fetch_plan.zig"),
+    @import("sim_images.zig"),
+    @import("sim_shape.zig"),
+    @import("sim_swarm.zig"),
+    @import("clock.zig"),
+    @import("compare_sets.zig"),
+    @import("control_plane.zig"),
+    @import("controller.zig"),
+    @import("console_sim.zig"),
+    @import("constants.zig"),
+    @import("core_smoke.zig"),
+    @import("diag.zig"),
+    @import("diag/codes.zig"),
+    @import("node_controller.zig"),
+    @import("peer.zig"),
+    @import("peer_ca.zig"),
+    @import("peer_limit.zig"),
+    @import("pem.zig"),
+    @import("peer_serve.zig"),
+    @import("records.zig"),
+    @import("replica_controller.zig"),
+    @import("runtime_codes.zig"),
+    @import("retention.zig"),
+    @import("pull_retention.zig"),
+    @import("job_retention.zig"),
+    @import("job_controller.zig"),
+    @import("scheduler.zig"),
+    @import("runtime.zig"),
+    @import("sim_c0.zig"),
+    @import("sim_c1.zig"),
+    @import("sim_certs.zig"),
+    @import("evidence.zig"),
+    @import("why_acceptance.zig"),
+    @import("c1_teeth.zig"),
+    @import("sim_checks.zig"),
+    @import("sim_clock.zig"),
+    @import("sim_cluster.zig"),
+    @import("sim_jobs.zig"),
+    @import("sim_jobs_watch.zig"),
+    @import("sim_net.zig"),
+    @import("sim_node.zig"),
+    @import("sim_runtime.zig"),
+    @import("sim_store.zig"),
+    @import("sim_tap.zig"),
+    @import("sim_trust.zig"),
+    @import("sim_world.zig"),
+    @import("store.zig"),
+    @import("store_failures.zig"),
+    @import("store_memory.zig"),
+    @import("store_verified.zig"),
+    @import("test_util.zig"),
+    @import("testing/history.zig"),
+    @import("edge_host.zig"),
+    @import("text.zig"),
+    @import("tls_client.zig"),
+    @import("tls_server.zig"),
+    @import("tls_schedule.zig"),
+    @import("tls_wire.zig"),
+    @import("x509.zig"),
+    @import("x509_der.zig"),
+    @import("x509_identity.zig"),
+    @import("x509_p256.zig"),
+    @import("why.zig"),
+    @import("writers.zig"),
+};
+
+/// References every public declaration of every core module, and of the types they declare, so
+/// that all of it is analysed and generated and not only what a scenario reaches. Zig analyses
+/// only what is referenced, so a banned call inside a function nobody calls would otherwise go
+/// unseen. Two levels are followed: a module, then the types declared in it.
+pub fn reference_all() void {
+    // Walking every declaration of every module takes more comptime branches than the default.
+    @setEvalBranchQuota(1_000_000);
+    inline for (modules) |module| reference_declarations(module);
+}
+
+fn reference_declarations(comptime container: type) void {
+    inline for (comptime std.meta.declarations(container)) |declaration| {
+        const value = @field(container, declaration);
+        reference_value(value);
+        if (@TypeOf(value) == type) {
+            switch (@typeInfo(value)) {
+                .@"struct", .@"union", .@"enum", .@"opaque" => {
+                    inline for (comptime std.meta.declarations(value)) |inner| {
+                        reference_value(@field(value, inner));
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+}
+
+/// Takes the address of a function, so that it is analysed and generated. Generic functions and
+/// non-functions have no address to take and are skipped.
+fn reference_value(comptime value: anytype) void {
+    const T = @TypeOf(value);
+    if (T == type) return;
+    if (@typeInfo(T) != .@"fn") return;
+    if (@typeInfo(T).@"fn".is_generic) return;
+    _ = &value;
+}
+
+test "every core module's tests are in this root" {
+    // Goal: `zig build wasm-test` compiles this file for WASI and runs it, so the unit tests of
+    // the core modules run on a 32-bit address space with a single thread. Method: import each
+    // module, which brings its tests in.
+    inline for (modules) |module| _ = module;
+}
+
+test "the single-threaded store conformance tests are in this root" {
+    // Goal: the memory store's semantics are checked in the environment the browser uses.
+    // Method: `store_conformance_single.zig` has no thread and runs against `MemoryStore`
+    // (`conformance_options` names the memory backend in this build); importing it brings its
+    // tests into this root, so `zig build wasm-test` runs them under WASI.
+    _ = @import("store_conformance_single.zig");
+}
+
+test "the peer handshake's tests are in this root" {
+    // Goal: the handshake runs under WASI too (32-bit, single thread). Method: import its tests;
+    // they use no file, clock or environment.
+    _ = @import("peer_test.zig");
+}
+
+test "the X.509 tests are in this root" {
+    // Goal: the certificate writer and parser run under WASI too (32-bit, single thread). Method:
+    // import their tests; they use no file, clock or environment.
+    _ = @import("x509_test.zig");
+    _ = @import("x509_foreign_test.zig");
+    _ = @import("x509_p256_test.zig");
+}
+
+test "the TLS key schedule and record layer tests are in this root" {
+    // Goal: the schedule and the record protection run under WASI too (32-bit, single thread).
+    // Method: import their tests; they use no file, clock or environment.
+    _ = @import("tls_schedule_test.zig");
+}
+
+// Plain `test {}`: a named test would hide these imports from `-Dtest-filter`.
+test {
+    // The controllers' tests run under WASI too: they use only the memory store, a manual clock
+    // and the testing allocator.
+
+    // The TLS client's tests run under WASI too. They are imported here, not in a named test,
+    // because a `-Dtest-filter` on a TLS test name hides tests inside a named one. The scripted
+    // server they use is a fixture and is imported only here.
+    _ = @import("tls_client_test.zig");
+    _ = @import("tls_server_test.zig");
+    _ = @import("tls_server_public_test.zig");
+    _ = @import("tls_wire_test.zig");
+    _ = @import("replica_controller_test.zig");
+    _ = @import("scheduler_test.zig");
+    _ = @import("job_controller_test.zig");
+    _ = @import("api_test.zig");
+    _ = @import("agent_api_test.zig");
+    _ = @import("agent_fence_test.zig");
+    _ = @import("agent_client_test.zig");
+    _ = @import("agent_jobs_test.zig");
+}

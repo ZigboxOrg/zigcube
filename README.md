@@ -1,0 +1,79 @@
+# Zigcube
+
+An orchestrator for Zigbox workloads: store-aware scheduling, peer chunk distribution, trust checked on every node, and grant-based networking.
+
+- **Coding handoff (C0, C1):** [HANDOFF.md](HANDOFF.md).
+- **How the code is written and tested:** [docs/STYLE.md](docs/STYLE.md) (Zigbox's TigerStyle rules, with Zigcube's departures).
+- **Diagnostics standard, shared with Zigbox:** [DIAGNOSTICS.md](DIAGNOSTICS.md).
+- **Rules for contributors and agents:** [AGENTS.md](AGENTS.md), with the self-review checklist [REVIEW.md](REVIEW.md) and the decision log [docs/decisions/](docs/decisions/).
+- **Plan and supervisor handoff:** [docs/supervisor-handoff.md](docs/supervisor-handoff.md).
+- **Web console (design and clickable prototype):** [docs/console.md](docs/console.md), with the HTTP API it needs proposed in [docs/api.md](docs/api.md).
+
+## Status
+
+*As of 2026-10-27. Pre-alpha. **C0 is demonstrated**: `demo-c0` is green in CI on Postgres and SQLite ([run 40556942364](https://github.com/Zigbox/zigcube/actions/runs/40556942364), on `main` at the merge of [PR #15](https://github.com/Zigbox/zigcube/pull/15)). Everything runs against `FakeRuntime` (plain host processes), not real Zigbox, and on one node. How it fits together: [the architecture page](site/architecture.html), published at https://zigbox.github.io/zigcube/architecture.html.*
+
+| Milestone | What it adds | Status |
+| --- | --- | --- |
+| C0 · Loop | One node keeps a promise: apply, get, why | **Demonstrated** 2026-10-27, [CI run](https://github.com/Zigbox/zigcube/actions/runs/40556942364) |
+| C1 · Fleet | Placement across nodes, failover on lease expiry | **Demonstrated** 2026-11-03: demo-c1 green on main on SQLite and Postgres ([run](https://github.com/Zigbox/zigcube/actions/runs/41605325965)); all 10 slices reviewed and merged (scheduler, node controller and replacement, sim-c1, agent leases, surfaces and `zcube local up\|down`, demo-c1, the simulation fleet, the store under faults); plan in [docs/briefs/c1.md](docs/briefs/c1.md) |
+| C2 · Swarm | Images reach nodes fast: peer chunks, warm-node scheduling | **Demonstrated** 2026-11-05: demo-c2 green on main ([job](https://github.com/Zigbox/zigcube/actions/runs/41978728250/job/127083637195)); all 9 slices merged (the real Zigbox runtime, `source`, `Runtime.signal`, the swarm core, locality scheduling, the peer handshake, the chunk server and fetch worker, pull stats, Zigbox integration with registry-once fetch, and the demo). Release review gate and retro: [docs/retros/c2.md](docs/retros/c2.md); follow-ups: [docs/demos/c2.md](docs/demos/c2.md) |
+| B1 · Jobs | Finite jobs for Botpike: run once, deadlines and grace, cancel, adoption after a crash, `zcube job watch` | **Demonstrated** 2026-11-07: demo-b1 green on main, SQLite and Postgres ([run 42364827492](https://github.com/Zigbox/zigcube/actions/runs/42364827492)); all slices merged except slice 8 (`job logs`, cut). Release reviews' MUSTs fixed in #148 and #150; ships without the 24-hour fleet run ([decision](docs/decisions/2026-11-07-b1-ships-without-fleet-soak.md)). Retro: [docs/retros/b1.md](docs/retros/b1.md) |
+| B2 · Hardening | Fixes from B1's release reviews and the simulation fleet; a hardening release | **Shipped** 2026-11-11, tag `b2` at main 97cd643: every CI job green on it ([run 42939538049](https://github.com/Zigbox/zigcube/actions/runs/42939538049)), demo-c0, demo-c1, demo-b1 and demo-c2 included. Both release reviews' MUSTs fixed (#201, #203, #204); the J6 regression found after them fixed in #212. Ships without the `job_reuse` tooth ([decision](docs/decisions/2026-11-09-b2-ships-without-job-reuse.md)) and without the 24-hour fleet run (waived by the owner). Retro: [docs/retros/b2.md](docs/retros/b2.md); follow-ups land as B2.1 |
+| B3 · Relay | A relayed job's only route out is its relay: no internet, node, metadata, server, other relay, DNS or raw socket | **Demonstrated** 2026-11-12: all 4 slices merged (slice 1 is Zigbox M8b); `demo-b3` green on main 1e48688 ([run 43143701151](https://github.com/Zigbox/zigcube/actions/runs/43143701151/job/130936519678)). **Shipped** 2026-11-15, tag `b3` at 00f35c1 |
+| mTLS client | Certificates and a TLS 1.3 client with client authentication, checked against OpenSSL and JDK 21 | All 8 slices merged ([docs/mtls.md](docs/mtls.md)). Not a milestone, so no demo |
+| B4–B7 · Release 0.5.2 | Job certificates, signed jobs, tenant placement, the API over mTLS | **Shipped** 2026-11-17 as Zigcube 0.5.2 (tag `v0.5.2`, release B7) at main 144e41e ([#272](https://github.com/Zigbox/zigcube/pull/272)), pinned to Zigbox v0.5.2; every CI job green on it ([run 44020895061](https://github.com/Zigbox/zigcube/actions/runs/44020895061)); open review items moved to 0.6.0 ([decision](docs/decisions/2026-11-17-0.5.2-known-issues-to-0.6.0.md)) |
+| C3 · Rollout | Image changes roll out gradually, gated by health, and roll back on failure | **In progress**, for 0.6.0: slices 1 to 12 of 16 built on stacked branches, none merged yet; `demo-c3` in review ([#264](https://github.com/Zigbox/zigcube/pull/264)) |
+| C4 · Mesh | Services find each other by name and talk only along declared grants | **In progress**, for 0.6.0: slices 1 to 5 of 12 built on stacked branches ([#263](https://github.com/Zigbox/zigcube/pull/263)), none merged; slices 6 to 12 not started (slice 7 needs Zigbox ZB-1 and ZB-2) |
+| C5–C8 | Edge, Trust, State, Jobs | C5 brief written ([#269](https://github.com/Zigbox/zigcube/pull/269), waiting on owner answers); 0.6.0 bundles C3, C4 and C5 and is gated on Jepsen ([decision](docs/decisions/2026-11-15-0.6.0-bundles-c3-c4-c5.md)); C6 to C8 not started |
+
+A milestone is marked **demonstrated** only when its `demo-cN` job is green in CI, with a link to that run.
+
+### C0 in detail
+
+C0 was built in nine slices, each reviewed adversarially before it was merged. [docs/demos/c0.md](docs/demos/c0.md) says what the demo asserts, and what it cuts and does not cover.
+
+| Slice | Contents | Status |
+| --- | --- | --- |
+| 1 · Scaffold and contracts | Zig 0.17.0 pinned, CI, the `ZC-` registry, the approved `Store` and `Runtime` contracts, the memory store | Merged, [PR #4](https://github.com/Zigbox/zigcube/pull/4) |
+| 2 · SQLite and conformance | `zig build tidy`, the SQLite backend, the store conformance suite | Merged, [PR #5](https://github.com/Zigbox/zigcube/pull/5) |
+| 3 · Postgres | The Postgres backend (revisions serialised on the meta row, `LISTEN`/`NOTIFY` with a bounded poll), `pg-up`/`pg-down`, a CI job on Postgres 16 | Merged, [PR #7](https://github.com/Zigbox/zigcube/pull/7) |
+| 4 · Contracts and WASM | Contract additions, Zigbox's diagnostics through the pinned `zigbox` package, the core on `wasm32-freestanding` | Merged, [PR #9](https://github.com/Zigbox/zigcube/pull/9) |
+| 5a · Core | Controllers as steps, decision records, `why`, retention, the simulated runtime, `sim-c0` (native against WASM) | Merged, [PR #11](https://github.com/Zigbox/zigcube/pull/11) |
+| 5b · Server | `zcube-server`, the write endpoints, the console on the real core in WASM | Merged, [PR #12](https://github.com/Zigbox/zigcube/pull/12) |
+| 6a · Agent | `zcube-agent`, `FakeRuntime` with a supervisor per container, the agent endpoints, `agent-smoke` | Merged, [PR #14](https://github.com/Zigbox/zigcube/pull/14) |
+| 6b · CLI | `zcube`, bundles, golden tests for every code, the no-stack-trace check, error pages | Merged, [PR #13](https://github.com/Zigbox/zigcube/pull/13) |
+| 6c · Demo | `demo-c0` on Postgres and SQLite, and the two defects it found | Merged, [PR #15](https://github.com/Zigbox/zigcube/pull/15); **green in CI** |
+
+Not run yet: OrioleDB, real Zigbox, more than one node.
+
+## Building
+
+Requires Zig 0.17.0 exactly ([download](https://ziglang.org/download/)), and the SQLite 3 and libpq development files (`libsqlite3-dev`, `libpq-dev`) to run the tests.
+
+```sh
+zig build                                   # zig-out/bin/zcube, zcube-server, zcube-agent
+zig build test                              # unit and snapshot tests
+zig build tidy                              # formatting and mechanical style rules
+zig build test-store -Dbackend=sqlite       # the store conformance suite (memory | sqlite | postgres)
+zig build wasm-check                        # the core as wasm32-freestanding, run in Node (needs node)
+zig build wasm-test                         # the core's unit tests under WASI in Node
+zig build pg-up                             # a throwaway Postgres for -Dbackend=postgres (pg-down removes it)
+zig build demo-c0 -Dbackend=sqlite          # the C0 demo: real server, agent and CLI processes (or postgres)
+```
+
+The conformance suite draws a new random seed on every run. A failing test prints it; `-Dseed=N` replays that run.
+
+## Layout
+
+- `site/` — the project website (`index.html`, `architecture.html`, generated `errors/`), deployed to GitHub Pages by `.github/workflows/pages.yml`.
+- `web/` — the web console: static files, no build step, no external requests. `python3 -m http.server -d web`, then open `/?mock=c0` (or `c1`) to click through it against the in-browser mock.
+- `src/` — the three executables, the core (listed in `src/core.zig`) and the shell around it.
+
+## Updating the site
+
+Milestone status, demo output and docs entries live in the `SITE`, `MILESTONES` and `DOCS` objects at the top of the script in `site/index.html`. Set a milestone's `status` to `"wip"` when work starts. When it ships, set `"done"`, record its `slices` count, replace its `demo` lines with output recorded by the green `demo-cN` CI run, and set `recorded: {url, date}` to that run, which shows the "recorded in CI" badge. Update this README's status table in the same push.
+
+## Licence
+
+Apache 2.0, with a standing pledge never to relicense. Contributions are accepted under a [Developer Certificate of Origin](https://developercertificate.org/) sign-off (`git commit -s`); there is no CLA.

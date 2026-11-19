@@ -1,0 +1,1162 @@
+//! Tests of `zcube-server` as a running server: real sockets on 127.0.0.1, real threads, the real
+//! clock. They start `Server` in-process on a port the system picks, talk to it with plain
+//! HTTP/1.1 over a socket, and stop it. Test code, so it may use threads (docs/STYLE.md).
+//!
+//! What they cover: routing (the API, the console, what is neither), request ids, the limits of
+//! constants.zig (body, head, connections), and the acceptance criterion of HANDOFF C0, that
+//! restarting `zcube-server` changes nothing because the store is the only state, on SQLite,
+//! with a simulated agent keeping a service running while the server restarts.
+
+test {
+    _ = @import("server_register_barrier_test.zig"); // #237's barrier, in a real server.
+}
+
+const std = @import("std");
+const testing = std.testing;
+const net = std.Io.net;
+const agent_mod = @import("agent.zig");
+const config_mod = @import("server_config.zig");
+const constants = @import("constants.zig");
+const diag_mod = @import("diag.zig");
+const private_dir = @import("testing/private_dir.zig");
+const server_mod = @import("server.zig");
+const server_store = @import("server_store.zig");
+const sim_runtime = @import("sim_runtime.zig");
+
+const Diag = diag_mod.Diag;
+const Json = std.json.Value;
+
+/// A threaded `Io` with room for a server's tasks, owned by the test.
+const TestIo = struct {
+    threaded: std.Io.Threaded,
+
+    fn start(self: *TestIo) std.Io {
+        const room = constants.http_connections_max + constants.http_refusals_max +
+            constants.server_threads_extra + 8;
+        self.threaded = .init(testing.allocator, .{ .concurrent_limit = .limited(room) });
+        return self.threaded.io();
+    }
+
+    fn stop(self: *TestIo) void {
+        self.threaded.deinit();
+    }
+};
+
+fn config_for(store: config_mod.Store, create: bool) config_mod.Config {
+    var diag: Diag = undefined;
+    diag.reset();
+    return .{
+        // A literal.
+        .insecure_listen = config_mod.parse_listen("127.0.0.1:0", &diag) catch unreachable,
+        .store = store,
+        .create_store = create,
+        .verbose = false,
+        .quiet = true,
+    };
+}
+
+fn start_server(io: std.Io, config: config_mod.Config) !*server_mod.Server {
+    try private_dir.state_dir(io, config);
+    var diag: Diag = undefined;
+    diag.reset();
+    return server_mod.Server.start(testing.allocator, io, config, .{
+        .version = "0.0.0-test",
+        .report_failures = false,
+        .log_requests = false,
+    }, &diag) catch |err| {
+        if (diag.code) |code| std.debug.print("server did not start: {s}\n", .{@tagName(code)});
+        return err;
+    };
+}
+
+// ---- A client: one request per connection, read to the end --------------------------------------
+
+const Reply = struct {
+    status: u16,
+    /// Everything before the blank line.
+    head: []const u8,
+    body: []const u8,
+    raw: []u8,
+
+    fn header(reply: Reply, name: []const u8) ?[]const u8 {
+        var lines = std.mem.splitSequence(u8, reply.head, "\r\n");
+        _ = lines.next();
+        while (lines.next()) |line| {
+            const colon = std.mem.findScalar(u8, line, ':') orelse continue;
+            if (!std.ascii.eqlIgnoreCase(line[0..colon], name)) continue;
+            return std.mem.trim(u8, line[colon + 1 ..], " ");
+        }
+        return null;
+    }
+
+    fn free(reply: Reply) void {
+        testing.allocator.free(reply.raw);
+    }
+
+    fn json(reply: Reply, arena: std.mem.Allocator) !Json {
+        return std.json.parseFromSliceLeaky(Json, arena, reply.body, .{});
+    }
+};
+
+fn exchange(io: std.Io, address: net.IpAddress, request: []const u8) !Reply {
+    var stream = try address.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var write_buffer: [1024]u8 = undefined;
+    var writer = stream.writer(io, &write_buffer);
+    try writer.interface.writeAll(request);
+    try writer.interface.flush();
+    var read_buffer: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buffer);
+    const raw = try reader.interface.allocRemaining(testing.allocator, .limited(16 * 1024 * 1024));
+    errdefer testing.allocator.free(raw);
+    const split = std.mem.find(u8, raw, "\r\n\r\n") orelse return error.NoHead;
+    return .{
+        .status = try std.fmt.parseInt(u16, raw[9..12], 10),
+        .head = raw[0..split],
+        .body = raw[split + 4 ..],
+        .raw = raw,
+    };
+}
+
+fn get(io: std.Io, address: net.IpAddress, path: []const u8) !Reply {
+    var buffer: [1024]u8 = undefined;
+    const format = "GET {s} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
+    return exchange(io, address, try std.fmt.bufPrint(&buffer, format, .{path}));
+}
+
+fn send(
+    io: std.Io,
+    address: net.IpAddress,
+    method: []const u8,
+    path: []const u8,
+    body: []const u8,
+) !Reply {
+    const request = try std.fmt.allocPrint(
+        testing.allocator,
+        "{s} {s} HTTP/1.1\r\nHost: test\r\nConnection: close\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ method, path, body.len, body },
+    );
+    defer testing.allocator.free(request);
+    return exchange(io, address, request);
+}
+
+fn expect_diagnostic(reply: Reply, status: u16, code: []const u8) !void {
+    if (reply.status != status) std.debug.print("{s}\n", .{reply.raw});
+    try testing.expectEqual(status, reply.status);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const body = try reply.json(arena_state.allocator());
+    const first = body.object.get("diagnostics").?.array.items[0];
+    try testing.expectEqualStrings(code, first.object.get("code").?.string);
+    const id = body.object.get("request_id").?.string;
+    try testing.expectEqualStrings(id, reply.header("x-request-id").?);
+}
+
+const hello_json =
+    \\{"name":"hello","image":"b3:51aa9c03","replicas":2,"command":["sh","-c","sleep 1"]}
+;
+
+// ---- Tests --------------------------------------------------------------------------------------
+
+test "the server routes the API and the console, and every reply has a request id" {
+    // Goal: docs/api.md "Request ID" and the route table of the shell. Method: start on the memory
+    // store; ask for status, the page, a script, the module, a path that is nothing, a wrong method
+    // on the page and on the API; send a request id of our own and a bad one.
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    const server = try start_server(io, config_for(.memory, false));
+    defer server.stop();
+    const address = server.address();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    const status = try get(io, address, "/v1/status");
+    defer status.free();
+    try testing.expectEqual(@as(u16, 200), status.status);
+    try testing.expectEqualStrings("application/json", status.header("content-type").?);
+    try testing.expect(status.header("x-request-id").?.len >= constants.request_id_bytes_min);
+    const body = try status.json(arena_state.allocator());
+    const backend = body.object.get("store").?.object.get("backend").?;
+    try testing.expectEqualStrings("memory", backend.string);
+
+    const page = try get(io, address, "/");
+    defer page.free();
+    try testing.expectEqual(@as(u16, 200), page.status);
+    try testing.expect(std.mem.startsWith(u8, page.header("content-type").?, "text/html"));
+    const policy = page.header("content-security-policy").?;
+    try testing.expect(std.mem.indexOf(u8, policy, "default-src 'self'") != null);
+    const console = try get(io, address, "/console/");
+    defer console.free();
+    try testing.expectEqualStrings(page.body, console.body);
+    const script = try get(io, address, "/console/js/main.js");
+    defer script.free();
+    try testing.expectEqual(@as(u16, 200), script.status);
+    const module = try get(io, address, "/console/sim/zcube_console.wasm");
+    defer module.free();
+    try testing.expectEqualStrings("application/wasm", module.header("content-type").?);
+    try testing.expectEqualSlices(u8, "\x00asm", module.body[0..4]);
+
+    const nothing = try get(io, address, "/nothing");
+    defer nothing.free();
+    try expect_diagnostic(nothing, 404, "ZC-E0101");
+    const wrong_page = try send(io, address, "POST", "/", "{}");
+    defer wrong_page.free();
+    try expect_diagnostic(wrong_page, 405, "ZC-E0104");
+    const wrong_api = try send(io, address, "PUT", "/v1/apply", hello_json);
+    defer wrong_api.free();
+    try expect_diagnostic(wrong_api, 400, "ZC-E0104");
+
+    const own = "GET /v1/status HTTP/1.1\r\nConnection: close\r\n" ++
+        "X-Request-Id: my-request-0001\r\n\r\n";
+    const echoed = try exchange(io, address, own);
+    defer echoed.free();
+    try testing.expectEqualStrings("my-request-0001", echoed.header("x-request-id").?);
+    const bad = "GET /v1/status HTTP/1.1\r\nConnection: close\r\nX-Request-Id: no good\r\n\r\n";
+    const refused = try exchange(io, address, bad);
+    defer refused.free();
+    try expect_diagnostic(refused, 400, "ZC-E0104");
+    try testing.expect(!std.mem.eql(u8, "no good", refused.header("x-request-id").?));
+}
+
+test "a POST without Content-Length has no body, and the connection carries the next request" {
+    // Goal: RFC 9112 6.3 and `zcube repair allocations`, which POSTs no body on a kept-alive
+    // connection (std.http asserted when it answered one). Method: a repair of a node with no
+    // finding (E0402 comes before the confirmation is asked for) with neither
+    // Content-Length nor Transfer-Encoding, unconfirmed then confirmed, each followed on the same
+    // connection by a status request; both replies must arrive.
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    const server = try start_server(io, config_for(.memory, false));
+    defer server.stop();
+    const address = server.address();
+    const cases = [_]struct { query: []const u8, status: []const u8, code: []const u8 }{
+        .{ .query = "", .status = "409", .code = "ZC-E0402" },
+        .{ .query = "?confirm=true", .status = "409", .code = "ZC-E0402" },
+    };
+    for (cases) |case| {
+        var buffer: [256]u8 = undefined;
+        const request = try std.fmt.bufPrint(&buffer, "POST /v1/repair/allocations/node1{s} " ++
+            "HTTP/1.1\r\nHost: test\r\n\r\nGET /v1/status HTTP/1.1\r\nHost: test\r\n" ++
+            "Connection: close\r\n\r\n", .{case.query});
+        const reply = try exchange(io, address, request);
+        defer reply.free();
+        if (!std.mem.startsWith(u8, reply.raw[9..], case.status)) {
+            std.debug.print("{s}\n", .{reply.raw});
+        }
+        try testing.expect(std.mem.startsWith(u8, reply.raw[9..], case.status));
+        try testing.expect(std.mem.indexOf(u8, reply.body, case.code) != null);
+        try testing.expect(std.mem.indexOf(u8, reply.body, "HTTP/1.1 200") != null);
+    }
+}
+
+test "the limits of constants.zig are enforced with a coded reply" {
+    // Goal: body, head and connection limits each end in a registered diagnostic, not a hang or a
+    // bare status. Method: a body over the limit, a head over the limit, a chunked body, then
+    // `http_connections_max` idle connections and one more.
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    const server = try start_server(io, config_for(.memory, false));
+    defer server.stop();
+    const address = server.address();
+
+    const too_big = "POST /v1/apply HTTP/1.1\r\nConnection: close\r\nContent-Length: 65537\r\n\r\n";
+    const big = try exchange(io, address, too_big);
+    defer big.free();
+    try expect_diagnostic(big, 413, "ZC-E0108");
+
+    const chunked = "POST /v1/apply HTTP/1.1\r\nConnection: close\r\n" ++
+        "Transfer-Encoding: chunked\r\n\r\n";
+    const unsized = try exchange(io, address, chunked);
+    defer unsized.free();
+    try expect_diagnostic(unsized, 411, "ZC-E0104");
+
+    // Request smuggling: `gzip` leaves std's `transfer_encoding` at `.none`, so the body once
+    // parsed as a second request. It must be refused, and the second request never served.
+    const smuggle = "POST /v1/apply HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n" ++
+        "GET /v1/smuggled HTTP/1.1\r\nConnection: close\r\n\r\n";
+    const smuggled = try exchange(io, address, smuggle);
+    defer smuggled.free();
+    try expect_diagnostic(smuggled, 411, "ZC-E0104");
+    try testing.expectEqual(@as(?usize, null), std.mem.find(u8, smuggled.raw, "smuggled"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, smuggled.raw, "HTTP/1.1 "));
+
+    const padding = try testing.allocator.alloc(u8, constants.http_head_bytes_max);
+    defer testing.allocator.free(padding);
+    @memset(padding, 'a');
+    const long_head = try std.fmt.allocPrint(
+        testing.allocator,
+        "GET /v1/status HTTP/1.1\r\nConnection: close\r\nX-Padding: {s}\r\n\r\n",
+        .{padding},
+    );
+    defer testing.allocator.free(long_head);
+    const oversize = try exchange(io, address, long_head);
+    defer oversize.free();
+    try expect_diagnostic(oversize, 431, "ZC-E0108");
+
+    // Fill every slot with a connection that sends nothing; the next one is told so and closed.
+    var idle: [constants.http_connections_max]net.Stream = undefined;
+    for (&idle) |*stream| stream.* = try address.connect(io, .{ .mode = .stream });
+    defer for (idle) |stream| stream.close(io);
+    var tries: u32 = 0;
+    while (server.connections() < constants.http_connections_max) : (tries += 1) {
+        try testing.expect(tries < 500);
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    const full = try get(io, address, "/v1/status");
+    defer full.free();
+    try expect_diagnostic(full, 503, "ZC-E0108");
+}
+
+test "a GET that announces Content-Length: 0, as the agent sends, is answered" {
+    // Goal: regression for the zigbox-smoke crash: the server segfaulted (a write to the constant
+    // `Reader.ending`) on every request of a method without a body that carried a Content-Length.
+    // Method: GET with 0 bytes announced is answered 200; GET with a body is refused, coded.
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    const server = try start_server(io, config_for(.memory, false));
+    defer server.stop();
+    const address = server.address();
+
+    const empty = try send(io, address, "GET", "/v1/status", "");
+    defer empty.free();
+    try testing.expectEqual(@as(u16, 200), empty.status);
+    const body = try send(io, address, "GET", "/v1/status", "{}");
+    defer body.free();
+    try expect_diagnostic(body, 400, "ZC-E0104");
+}
+
+test "a client that goes quiet is closed by the watchdog, not kept for ever" {
+    // Goal: a slow client cannot hold a slot for ever. Method: connect, send half a head, wait for
+    // the idle timeout, and see the server close the connection and free the slot. Takes about
+    // `http_idle_timeout_ms` plus a watchdog period.
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    const server = try start_server(io, config_for(.memory, false));
+    defer server.stop();
+    var stream = try server.address().connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var write_buffer: [64]u8 = undefined;
+    var writer = stream.writer(io, &write_buffer);
+    try writer.interface.writeAll("GET /v1/sta");
+    try writer.interface.flush();
+    var tries: u32 = 0;
+    while (server.connections() == 0) : (tries += 1) {
+        try testing.expect(tries < 500);
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    const limit_ms = constants.http_idle_timeout_ms + 3 * constants.http_watchdog_ms;
+    var waited_ms: u32 = 0;
+    while (server.connections() > 0) : (waited_ms += 50) {
+        try testing.expect(waited_ms <= limit_ms + 2000);
+        try io.sleep(.fromMilliseconds(50), .awake);
+    }
+    const earliest = constants.http_idle_timeout_ms - 2 * constants.http_watchdog_ms;
+    try testing.expect(waited_ms >= earliest);
+}
+
+test "a client that stalls half way through a large body is closed, and frees its slot" {
+    // Goal: the body read is bounded like the head (REVIEW.md: every socket read has a deadline).
+    // Method: announce a 425,984-byte body to POST /v1/jobs, send 1,000 bytes and stop; the
+    // watchdog must close the connection within the idle timeout plus a few watchdog periods.
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    const server = try start_server(io, config_for(.memory, false));
+    defer server.stop();
+    var stream = try server.address().connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var write_buffer: [2048]u8 = undefined;
+    var writer = stream.writer(io, &write_buffer);
+    try writer.interface.print(
+        "POST /v1/jobs HTTP/1.1\r\nHost: x\r\nContent-Length: {d}\r\n\r\n",
+        .{constants.job_request_bytes_max},
+    );
+    try writer.interface.splatByteAll('a', 1000);
+    try writer.interface.flush();
+    var tries: u32 = 0;
+    while (server.connections() == 0) : (tries += 1) {
+        try testing.expect(tries < 500);
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    const limit_ms = constants.http_idle_timeout_ms + 3 * constants.http_watchdog_ms;
+    var waited_ms: u32 = 0;
+    while (server.connections() > 0) : (waited_ms += 50) {
+        try testing.expect(waited_ms <= limit_ms + 2000);
+        try io.sleep(.fromMilliseconds(50), .awake);
+    }
+}
+
+test "a held watch ends when a key under its prefix changes, and times out empty otherwise" {
+    // Goal: the long poll of docs/api.md through the real shell. Method: hold a watch on
+    // /services/ for 5 s on one thread and apply a service from another; the answer arrives with
+    // the event, long before 5 s. A watch on another prefix is held to its timeout and is empty.
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    const server = try start_server(io, config_for(.memory, false));
+    defer server.stop();
+    const address = server.address();
+
+    const Held = struct {
+        fn ask(h_io: std.Io, h_address: net.IpAddress, path: []const u8, out: *?Reply) void {
+            out.* = get(h_io, h_address, path) catch null;
+        }
+    };
+    var answer: ?Reply = null;
+    const path = "/v1/watch?from=1&timeout=5000&prefix=%2Fservices%2F";
+    var future = try io.concurrent(Held.ask, .{ io, address, path, &answer });
+    var tries: u32 = 0;
+    while (server.holds() == 0) : (tries += 1) {
+        try testing.expect(tries < 500);
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    const started = std.Io.Clock.real.now(io);
+    const applied = try send(io, address, "POST", "/v1/apply", hello_json);
+    defer applied.free();
+    try testing.expectEqual(@as(u16, 200), applied.status);
+    future.await(io);
+    defer if (answer) |reply| reply.free();
+    const took_ms = started.durationTo(std.Io.Clock.real.now(io)).toMilliseconds();
+    try testing.expect(took_ms < 2000);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const body = try answer.?.json(arena_state.allocator());
+    const events = body.object.get("events").?.array.items;
+    try testing.expect(events.len > 0);
+    const first_key = events[0].object.get("kv").?.object.get("key").?;
+    try testing.expectEqualStrings("/services/hello", first_key.string);
+
+    const quiet = try get(io, address, "/v1/watch?from=999&timeout=0");
+    defer quiet.free();
+    try expect_diagnostic(quiet, 400, "ZC-E0204");
+    const idle_start = std.Io.Clock.real.now(io);
+    const idle = try get(io, address, "/v1/watch?from=1&timeout=700&prefix=%2Fnodes%2F");
+    defer idle.free();
+    try testing.expectEqual(@as(u16, 200), idle.status);
+    const idle_ms = idle_start.durationTo(std.Io.Clock.real.now(io)).toMilliseconds();
+    try testing.expect(idle_ms >= 600);
+    try testing.expect(std.mem.indexOf(u8, idle.body, "\"events\":[]") != null);
+    try testing.expectEqual(@as(u32, 0), server.holds());
+}
+
+test "held watches are bounded: one past http_holds_max is a 503 with a coded reply" {
+    // Goal: the limit on concurrent long polls. Method: hold `http_holds_max` watches, ask for one
+    // more and get ZC-E0108; a write ends every hold and the slots are free again.
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    const server = try start_server(io, config_for(.memory, false));
+    defer server.stop();
+    const address = server.address();
+
+    const Held = struct {
+        fn ask(h_io: std.Io, h_address: net.IpAddress, out: *?Reply) void {
+            const path = "/v1/watch?from=1&timeout=20000&prefix=%2Fservices%2F";
+            out.* = get(h_io, h_address, path) catch null;
+        }
+    };
+    var answers: [constants.http_holds_max]?Reply = @splat(null);
+    defer for (answers) |answer| if (answer) |reply| reply.free();
+    var futures: [constants.http_holds_max]std.Io.Future(void) = undefined;
+    for (&futures, &answers) |*future, *answer| {
+        future.* = try io.concurrent(Held.ask, .{ io, address, answer });
+    }
+    var tries: u32 = 0;
+    while (server.holds() < constants.http_holds_max) : (tries += 1) {
+        try testing.expect(tries < 1000);
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    const over = try get(io, address, "/v1/watch?from=1&timeout=20000&prefix=%2Fservices%2F");
+    defer over.free();
+    try expect_diagnostic(over, 503, "ZC-E0108");
+
+    const applied = try send(io, address, "POST", "/v1/apply", hello_json);
+    defer applied.free();
+    for (&futures) |*future| future.await(io);
+    for (answers) |answer| {
+        try testing.expectEqual(@as(u16, 200), answer.?.status);
+        try testing.expect(std.mem.indexOf(u8, answer.?.body, "/services/hello") != null);
+    }
+    try testing.expectEqual(@as(u32, 0), server.holds());
+}
+
+test "a port in use, and a store that is not there, are coded start-up failures" {
+    // Goal: DIAGNOSTICS for start-up. Method: start a server, start another on its port (ZC-E0107,
+    // environment); open a SQLite file that does not exist without --create-store (ZC-E0201).
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    const first = try start_server(io, config_for(.memory, false));
+    defer first.stop();
+    var taken = config_for(.memory, false);
+    taken.insecure_listen = first.address();
+    var diag: Diag = undefined;
+    diag.reset();
+    const options: server_mod.Options = .{ .version = "0.0.0-test" };
+    const in_use = server_mod.Server.start(testing.allocator, io, taken, options, &diag);
+    try testing.expectError(error.StartFailed, in_use);
+    try testing.expectEqual(@as(?@import("diag/codes.zig").Code, .E0107), diag.code);
+    try testing.expectEqual(constants.exit_environment, diag.exit_code());
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [128]u8 = undefined;
+    const format = ".zig-cache/tmp/{s}/missing.db";
+    const path = try std.fmt.bufPrint(&path_buffer, format, .{tmp.sub_path});
+    diag.reset();
+    const missing = config_for(.{ .sqlite = path }, false);
+    const absent = server_mod.Server.start(testing.allocator, io, missing, options, &diag);
+    try testing.expectError(error.StartFailed, absent);
+    try testing.expectEqual(@as(?@import("diag/codes.zig").Code, .E0201), diag.code);
+}
+
+test "a server started in a cancelled task is Canceled with no diagnostic, and leaves nothing" {
+    // Goal: a cancel while the CA key is drawn is passed to `zcube-server`, which stops quietly;
+    // before, `open_ca` asserted a diagnostic and panicked. Method: the server's `Io` with a
+    // `randomSecure` that is cancelled, a memory store; the test allocator checks for leaks.
+    var test_io: TestIo = undefined;
+    const base = test_io.start();
+    defer test_io.stop();
+    var vtable: std.Io.VTable = undefined;
+    const io = @import("secure_random.zig").canceled_io(base, &vtable);
+    var diag: Diag = undefined;
+    diag.reset();
+    const started = server_mod.Server.start(testing.allocator, io, config_for(.memory, false), .{
+        .version = "0.0.0-test",
+        .report_failures = false,
+        .log_requests = false,
+    }, &diag);
+    try testing.expectError(error.Canceled, started);
+    try testing.expect(diag.code == null);
+}
+
+// ---- Restart safety (HANDOFF C0 acceptance) -----------------------------------------------------
+
+/// The part of the cluster that is not the server: a simulated node agent over the same store,
+/// stepped by the test, so a service really runs while the server starts and stops.
+const Node = struct {
+    agent: *agent_mod.Agent,
+    runtime: *sim_runtime.SimRuntime,
+    arena: std.heap.ArenaAllocator,
+    store: @import("store.zig").Store,
+    /// The node's own clock: it outlives any one server, so it cannot be a server's.
+    real: server_store.RealClock,
+    diag: Diag,
+
+    fn start(io: std.Io, store: @import("store.zig").Store) !*Node {
+        const node = try testing.allocator.create(Node);
+        node.real = .{ .io = io };
+        node.agent = try testing.allocator.create(agent_mod.Agent);
+        node.runtime = try testing.allocator.create(sim_runtime.SimRuntime);
+        node.runtime.init(testing.allocator, node.real.clock(), 1, &sim_runtime.default_fixtures);
+        node.agent.init(.{
+            .node = "node1",
+            .capacity = .{ .cpu_millis = 4000, .memory_bytes = 8 * 1024 * 1024 * 1024 },
+            .address = "10.0.0.5:7070",
+        });
+        node.arena = std.heap.ArenaAllocator.init(testing.allocator);
+        node.store = store;
+        node.diag.reset();
+        return node;
+    }
+
+    fn stop(node: *Node) void {
+        node.arena.deinit();
+        node.runtime.deinit();
+        testing.allocator.destroy(node.runtime);
+        testing.allocator.destroy(node.agent);
+        testing.allocator.destroy(node);
+    }
+
+    /// One step of the agent. A store that fails the step is the test's to see in the result.
+    fn step(node: *Node) !void {
+        _ = node.arena.reset(.retain_capacity);
+        node.diag.reset();
+        const ctx: agent_mod.Context = .{
+            .store = node.store,
+            .runtime = node.runtime.interface(),
+            .clock = node.real.clock(),
+            .arena = node.arena.allocator(),
+            .diag = &node.diag,
+        };
+        _ = node.agent.reconcile(&ctx) catch return error.AgentStepFailed;
+    }
+};
+
+/// The keys and modification revisions under `/`, as one string: what "nothing changed" compares.
+fn fingerprint(io: std.Io, address: net.IpAddress, arena: std.mem.Allocator) ![]const u8 {
+    const reply = try get(io, address, "/v1/list?prefix=%2F&limit=500");
+    defer reply.free();
+    try testing.expectEqual(@as(u16, 200), reply.status);
+    const body = try reply.json(arena);
+    var text: std.ArrayList(u8) = .empty;
+    try text.print(arena, "rev={d}\n", .{body.object.get("revision").?.integer});
+    for (body.object.get("kvs").?.array.items) |kv| {
+        try text.print(arena, "{s} {d}\n", .{
+            kv.object.get("key").?.string, kv.object.get("mod_revision").?.integer,
+        });
+    }
+    return text.items;
+}
+
+test "restarting the server changes nothing: apply, run, restart, compare (SQLite)" {
+    // Goal: HANDOFF C0 acceptance, "restarting zcube-server mid-demo changes nothing", for the
+    // real server on the real SQLite store. Method: start a server on a new file, apply `hello`
+    // with 2 replicas over HTTP, let a simulated agent run them, record every key and revision,
+    // stop the server, start another on the same file, let both controllers settle, and compare.
+    // The second server must also have run controller steps, or "nothing changed" proves nothing.
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/zcube.db", .{tmp.sub_path});
+    const store_spec: config_mod.Store = .{ .sqlite = path };
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const first = try start_server(io, config_for(store_spec, true));
+    var first_open = true;
+    defer if (first_open) first.stop();
+    const node = try Node.start(io, first.backend.handle());
+    defer node.stop();
+
+    const status = try get(io, first.address(), "/v1/status");
+    defer status.free();
+    const status_body = try status.json(arena);
+    const store_part = status_body.object.get("store").?;
+    try testing.expectEqualStrings("sqlite", store_part.object.get("backend").?.string);
+    try testing.expect(store_part.object.get("ok").?.bool);
+
+    const applied = try send(io, first.address(), "POST", "/v1/apply", hello_json);
+    defer applied.free();
+    try testing.expectEqual(@as(u16, 200), applied.status);
+    try run_until_running(io, first, node, 2);
+
+    const listed = try get(io, first.address(), "/v1/list?prefix=%2Fservices%2F");
+    defer listed.free();
+    const listed_body = try listed.json(arena);
+    try testing.expectEqual(@as(usize, 1), listed_body.object.get("kvs").?.array.items.len);
+    const before = try fingerprint(io, first.address(), arena);
+
+    // The restart: the server goes away and a new process-worth of server opens the same file.
+    // The agent, which is not part of the server, keeps its containers.
+    const containers = node.runtime.containers.items.len;
+    first.stop();
+    first_open = false;
+    const second = try start_server(io, config_for(store_spec, false));
+    defer second.stop();
+    node.store = second.backend.handle();
+    for (0..40) |_| {
+        try node.step();
+        try io.sleep(.fromMilliseconds(50), .awake);
+    }
+    try testing.expect(second.steps() > 0);
+    const after = try fingerprint(io, second.address(), arena);
+    try testing.expectEqualStrings(before, after);
+    try testing.expectEqual(containers, node.runtime.containers.items.len);
+    try testing.expectEqual(@as(u32, 2), node.runtime.running_count());
+}
+
+/// Steps the agent until the service shows `count` replicas running, through the API's own
+/// `why`, or fails after a few seconds.
+fn run_until_running(io: std.Io, server: *server_mod.Server, node: *Node, count: u32) !void {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var expected: [64]u8 = undefined;
+    const format = "service hello: {d}/{d} running";
+    const want = try std.fmt.bufPrint(&expected, format, .{ count, count });
+    for (0..200) |_| {
+        try node.step();
+        const reply = try get(io, server.address(), "/v1/why/service/hello");
+        defer reply.free();
+        if (reply.status == 200) {
+            const body = try reply.json(arena_state.allocator());
+            const text = body.object.get("state").?.object.get("text").?.string;
+            if (std.mem.eql(u8, text, want)) return;
+        }
+        try io.sleep(.fromMilliseconds(50), .awake);
+    }
+    return error.NeverConverged;
+}
+
+fn tmp_file(buffer: []u8, tmp: testing.TmpDir, name: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buffer, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
+}
+
+test "a server restarted on a store that went backwards halts until the operator accepts it" {
+    // Goal: the remembered pair outlives the server (10b). Method: a server on `data.db` applies
+    // `hello` and stops; the file is replaced by an empty database at the same path (a restore of
+    // an old backup), and a second server on it answers ZC-E0215 and does not step; accepting
+    // resumes it. A restore under another path is a new database, not checked (operations.md).
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var state_buffer: [128]u8 = undefined;
+    const state = try tmp_file(&state_buffer, tmp, "state");
+    var long_buffer: [128]u8 = undefined;
+    const long_path = try tmp_file(&long_buffer, tmp, "data.db");
+    var long_config = config_for(.{ .sqlite = long_path }, true);
+    long_config.state_dir = state;
+    var short_config = long_config;
+
+    const first = try start_server(io, long_config);
+    const applied = try send(io, first.address(), "POST", "/v1/apply", hello_json);
+    defer applied.free();
+    try testing.expectEqual(@as(u16, 200), applied.status);
+    const healthy = try get(io, first.address(), "/v1/status");
+    defer healthy.free();
+    try testing.expectEqual(@as(u16, 200), healthy.status);
+    first.stop();
+    for ([_][]const u8{ "data.db", "data.db-wal", "data.db-shm", "data.db-journal" }) |name| {
+        tmp.dir.deleteFile(io, name) catch {};
+    }
+
+    const second = try start_server(io, short_config);
+    var second_open = true;
+    defer if (second_open) second.stop();
+    const refused = try get(io, second.address(), "/v1/status");
+    defer refused.free();
+    try testing.expectEqual(@as(u16, 200), refused.status);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const status_body = try refused.json(arena_state.allocator());
+    const store_part = status_body.object.get("store").?;
+    try testing.expect(!store_part.object.get("ok").?.bool);
+    const code = store_part.object.get("diagnostic").?.object.get("code").?.string;
+    try testing.expectEqualStrings("ZC-E0215", code);
+    const write_refused = try send(io, second.address(), "POST", "/v1/apply", hello_json);
+    defer write_refused.free();
+    try expect_diagnostic(write_refused, 502, "ZC-E0215");
+    const steps = second.steps();
+    try io.sleep(.fromMilliseconds(300), .awake);
+    try testing.expectEqual(steps, second.steps());
+
+    const accept_path = "/v1/store/accept-rollback?confirm=true";
+    const accepted = try send(io, second.address(), "POST", accept_path, "");
+    defer accepted.free();
+    try testing.expectEqual(@as(u16, 200), accepted.status);
+    const resumed = try get(io, second.address(), "/v1/status");
+    defer resumed.free();
+    try testing.expectEqual(@as(u16, 200), resumed.status);
+    second.stop();
+    second_open = false;
+
+    short_config.create_store = false;
+    const third = try start_server(io, short_config);
+    defer third.stop();
+    const again = try get(io, third.address(), "/v1/status");
+    defer again.free();
+    try testing.expectEqual(@as(u16, 200), again.status);
+}
+
+test "two SQLite stores in one directory remember separately" {
+    // Goal: one remembered pair per database (10b review). Method: a server on `one.db` applies
+    // `hello` and stops; a server on a new `two.db` in the same directory, whose state directory
+    // is not named, starts and is not refused; each database has its own remembered file.
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var one_buffer: [128]u8 = undefined;
+    const one_path = try tmp_file(&one_buffer, tmp, "one.db");
+    var two_buffer: [128]u8 = undefined;
+    const two_path = try tmp_file(&two_buffer, tmp, "two.db");
+    const first = try start_server(io, config_for(.{ .sqlite = one_path }, true));
+    const applied = try send(io, first.address(), "POST", "/v1/apply", hello_json);
+    defer applied.free();
+    try testing.expectEqual(@as(u16, 200), applied.status);
+    first.stop();
+    const second = try start_server(io, config_for(.{ .sqlite = two_path }, true));
+    defer second.stop();
+    const status = try get(io, second.address(), "/v1/status");
+    defer status.free();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const body = try status.json(arena_state.allocator());
+    try testing.expect(body.object.get("store").?.object.get("ok").?.bool);
+    for ([_][]const u8{ one_path, two_path }) |path| {
+        const name = try remembered_name(io, arena_state.allocator(), path);
+        _ = try tmp.dir.statFile(io, name, .{});
+    }
+}
+
+test "a restore under another path is a new database and is not checked" {
+    // Goal: pin the documented limit of keying by path. Method: the long store at `a/data.db`
+    // applies `hello`; an empty store at `b/data.db` starts with the same state directory and is
+    // served, not halted.
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "a");
+    try tmp.dir.createDirPath(io, "b");
+    var state_buffer: [128]u8 = undefined;
+    const state = try tmp_file(&state_buffer, tmp, "state");
+    var a_buffer: [128]u8 = undefined;
+    var b_buffer: [128]u8 = undefined;
+    var config = config_for(.{ .sqlite = try tmp_file(&a_buffer, tmp, "a/data.db") }, true);
+    config.state_dir = state;
+    const first = try start_server(io, config);
+    const applied = try send(io, first.address(), "POST", "/v1/apply", hello_json);
+    defer applied.free();
+    try testing.expectEqual(@as(u16, 200), applied.status);
+    first.stop();
+    config.store = .{ .sqlite = try tmp_file(&b_buffer, tmp, "b/data.db") };
+    const second = try start_server(io, config);
+    defer second.stop();
+    const status = try get(io, second.address(), "/v1/status");
+    defer status.free();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const body = try status.json(arena_state.allocator());
+    try testing.expect(body.object.get("store").?.object.get("ok").?.bool);
+}
+
+test "two databases with one file name share a state directory and keep two pairs" {
+    // Goal: the file is keyed by the database's path, not its base name (10b second review).
+    // Method: `a/zcube.db` and `b/zcube.db`, one `state_dir`; each starts, and there are two files.
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "a");
+    try tmp.dir.createDirPath(io, "b");
+    try tmp.dir.createDirPath(io, "state");
+    var state_buffer: [128]u8 = undefined;
+    const state = try std.fmt.bufPrint(&state_buffer, ".zig-cache/tmp/{s}/state", .{tmp.sub_path});
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var names: [2][]const u8 = undefined;
+    for ([_][]const u8{ "a", "b" }, &names) |dir, *name| {
+        var buffer: [128]u8 = undefined;
+        const path = try std.fmt.bufPrint(&buffer, ".zig-cache/tmp/{s}/{s}/zcube.db", .{
+            tmp.sub_path, dir,
+        });
+        var config = config_for(.{ .sqlite = path }, true);
+        config.state_dir = state;
+        const running = try start_server(io, config);
+        const reply = try get(io, running.address(), "/v1/status");
+        reply.free();
+        running.stop();
+        name.* = try remembered_name(io, arena_state.allocator(), path);
+    }
+    try testing.expect(!std.mem.eql(u8, names[0], names[1]));
+    for (names) |name| {
+        var buffer: [256]u8 = undefined;
+        const sub = try std.fmt.bufPrint(&buffer, "state/{s}", .{name});
+        _ = try tmp.dir.statFile(io, sub, .{});
+    }
+}
+
+/// The remembered file's name for the SQLite file at `path` (relative to the working directory).
+fn remembered_name(io: std.Io, arena: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const cwd = try std.process.currentPathAlloc(io, arena);
+    const absolute = try std.fs.path.resolveAlloc(arena, &.{ cwd, path });
+    const buffer = try arena.create([300]u8);
+    return @import("server_remember.zig").Remembered.file_for(absolute, buffer).?;
+}
+
+test "an unreadable remembered file stops the start with ZC-E0216, and Postgres needs a state dir" {
+    // Goal: the start-up failures of the guard are coded. Method: a remembered file that does not
+    // parse (ZC-E0216, never "no file"); a Postgres config without `state_dir` (ZC-E0106).
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/data.db", .{tmp.sub_path});
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const file = try remembered_name(io, arena_state.allocator(), path);
+    try tmp.dir.writeFile(io, .{ .sub_path = file, .data = "not a pair\n" });
+    var diag: Diag = undefined;
+    diag.reset();
+    const options: server_mod.Options = .{ .version = "0.0.0-test", .report_failures = false };
+    const refused = server_mod.Server.start(
+        testing.allocator,
+        io,
+        config_for(.{ .sqlite = path }, true),
+        options,
+        &diag,
+    );
+    try testing.expectError(error.StartFailed, refused);
+    try testing.expectEqual(@as(?@import("diag/codes.zig").Code, .E0216), diag.code);
+
+    diag.reset();
+    const config = config_for(.{ .postgres = "host=nowhere" }, false);
+    try testing.expect(server_mod.Server.state_path(config, &diag) == null);
+    try testing.expectEqual(@as(?@import("diag/codes.zig").Code, .E0106), diag.code);
+}
+
+test "request ids are not issued twice across server starts" {
+    // Goal: DIAGNOSTICS, "every API request gets a request ID" so a client's error can be matched
+    // to a log: a restart must not repeat the ids of the start before it. Method: start, ask, stop,
+    // start again, ask; the first ids differ, and so do the counters' first values.
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    var seen: [2][64]u8 = undefined;
+    var lengths: [2]usize = undefined;
+    for (&seen, &lengths) |*buffer, *length| {
+        const server = try start_server(io, config_for(.memory, false));
+        defer server.stop();
+        const reply = try get(io, server.address(), "/v1/status");
+        defer reply.free();
+        const id = reply.header("x-request-id").?;
+        @memcpy(buffer[0..id.len], id);
+        length.* = id.len;
+        try io.sleep(.fromMilliseconds(5), .awake);
+    }
+    try testing.expect(!std.mem.eql(u8, seen[0][0..lengths[0]], seen[1][0..lengths[1]]));
+}
+
+/// A client that does what the agent does: one request on a connection that stays open, the reply
+/// read by its `Content-Length`, and then the client closes the connection, first.
+fn keep_alive_client(io: std.Io, address: net.IpAddress, path: []const u8, done: *bool) void {
+    defer done.* = true;
+    var stream = address.connect(io, .{ .mode = .stream }) catch return;
+    defer stream.close(io);
+    var write_buffer: [512]u8 = undefined;
+    var writer = stream.writer(io, &write_buffer);
+    writer.interface.print("GET {s} HTTP/1.1\r\nHost: test\r\n\r\n", .{path}) catch return;
+    writer.interface.flush() catch return;
+    var read_buffer: [512]u8 = undefined;
+    var reader = stream.reader(io, &read_buffer);
+    var head: [2048]u8 = undefined;
+    var length: usize = 0;
+    while (length < head.len) {
+        head[length] = reader.interface.takeByte() catch return;
+        length += 1;
+        if (std.mem.endsWith(u8, head[0..length], "\r\n\r\n")) break;
+    }
+    const marker = "content-length: ";
+    const lowered = std.ascii.lowerString(&head, head[0..length]);
+    const at = std.mem.find(u8, lowered, marker) orelse return;
+    const end = std.mem.findPos(u8, lowered, at, "\r\n") orelse return;
+    const size = std.fmt.parseInt(usize, lowered[at + marker.len .. end], 10) catch return;
+    var body: [512]u8 = undefined;
+    if (size > body.len) return;
+    reader.interface.readSliceAll(body[0..size]) catch return;
+}
+
+test "a server stopped while it answers a held watch leaves its port free to start again" {
+    // Goal: the acceptance criterion "restarting zcube-server changes nothing" needs the port back.
+    // Whoever sends the first FIN keeps the connection in TIME_WAIT on its port, and the server
+    // does not set SO_REUSEADDR, so a server that closed first could not start on its port for a
+    // minute. Method: hold a watch from a client that closes its connection after the reply,
+    // stop the server (which ends the hold and answers), and start another on the same port.
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    const first = try start_server(io, config_for(.memory, false));
+    const address = first.address();
+    var done = false;
+    const path = "/v1/watch?from=1&timeout=5000&prefix=%2Fnothing%2F";
+    var client = try io.concurrent(keep_alive_client, .{ io, address, path, &done });
+    var tries: u32 = 0;
+    while (first.holds() == 0) : (tries += 1) {
+        try testing.expect(tries < 500);
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    first.stop();
+    client.await(io);
+    try testing.expect(done);
+
+    var diag: Diag = undefined;
+    diag.reset();
+    var text: [32]u8 = undefined;
+    const listen = try std.fmt.bufPrint(&text, "127.0.0.1:{d}", .{address.getPort()});
+    var config = config_for(.memory, false);
+    config.insecure_listen = try config_mod.parse_listen(listen, &diag);
+    const second = try start_server(io, config);
+    second.stop();
+}
+
+test "a server that closed a connection first can be restarted on its port at once" {
+    // Goal: "restarting zcube-server changes nothing". The side that closes a connection first
+    // keeps it in TIME_WAIT on its port; the server closes first for an idle client, for a reply
+    // that ends the connection, and for one still open when it stops. Without SO_REUSEADDR the
+    // next server could not listen there for a minute (ZC-E0107). Found by demo-c0, reproduced
+    // by review with an idle connection. Method: a request with `Connection: close` (the server
+    // closes first), stop, start another on the same port at once. A second server beside a
+    // running one must still fail loudly (SO_REUSEPORT would let it start).
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    const first = try start_server(io, config_for(.memory, false));
+    const address = first.address();
+    const reply = try get(io, address, "/v1/status");
+    reply.free();
+    first.stop();
+
+    var diag: Diag = undefined;
+    diag.reset();
+    var text: [32]u8 = undefined;
+    const listen = try std.fmt.bufPrint(&text, "127.0.0.1:{d}", .{address.getPort()});
+    var config = config_for(.memory, false);
+    config.insecure_listen = try config_mod.parse_listen(listen, &diag);
+    const second = try start_server(io, config);
+    defer second.stop();
+    const status = try get(io, second.address(), "/v1/status");
+    status.free();
+
+    diag.reset();
+    const options: server_mod.Options = .{ .version = "0.0.0-test" };
+    const third = server_mod.Server.start(testing.allocator, io, config, options, &diag);
+    try testing.expectError(error.StartFailed, third);
+    try testing.expectEqual(@as(?@import("diag/codes.zig").Code, .E0107), diag.code);
+}
+
+fn job_body(arena: std.mem.Allocator, io: std.Io, name: []const u8, input: []const u8) ![]const u8 {
+    const now: u64 = @intCast(@max(0, std.Io.Clock.real.now(io).toMilliseconds()));
+    return std.fmt.allocPrint(arena,
+        \\{{"name":"{s}","image":"b3:51aa9c03","command":["sh","-c","cat"],"deadline_ms":60000,
+    ++
+        \\"submit_by_ms":{d},"input_env":"PAYLOAD","input":"{s}"}}
+    , .{ name, now + 30_000, input });
+}
+
+test "POST /v1/jobs takes the worst-case input over the wire; every other body stays at 64 KiB" {
+    // Goal: the owner's decision (job-input-wire-size): a 64 KiB input of control characters is
+    // about 384 KiB of JSON, and the job route (only) takes it; the arena asserts hold. Method:
+    // POST that input, then one byte more (ZC-E0130, decoded), then a body over the job limit
+    // (413 naming it), then 65537 bytes to /v1/apply (413 as before).
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    const server = try start_server(io, config_for(.memory, false));
+    defer server.stop();
+    const address = server.address();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const unit = "\\u0001";
+    const worst = try arena.alloc(u8, constants.job_input_bytes_max * unit.len);
+    for (0..constants.job_input_bytes_max) |index| {
+        @memcpy(worst[index * unit.len ..][0..unit.len], unit);
+    }
+    try testing.expect(worst.len > constants.api_request_bytes_max);
+    const made = try send(io, address, "POST", "/v1/jobs", try job_body(arena, io, "worst", worst));
+    defer made.free();
+    if (made.status != 201) std.debug.print("{s}\n", .{made.raw[0..@min(made.raw.len, 600)]});
+    try testing.expectEqual(@as(u16, 201), made.status);
+    const same = try send(io, address, "POST", "/v1/jobs", try job_body(arena, io, "worst", worst));
+    defer same.free();
+    try testing.expectEqual(@as(u16, 200), same.status);
+
+    const over = try arena.alloc(u8, worst.len + 1);
+    @memcpy(over[0..worst.len], worst);
+    over[worst.len] = 'a';
+    const over_body = try job_body(arena, io, "over", over);
+    const refused = try send(io, address, "POST", "/v1/jobs", over_body);
+    defer refused.free();
+    try expect_diagnostic(refused, 400, "ZC-E0130");
+
+    const huge = try arena.alloc(u8, constants.job_request_bytes_max + 1);
+    @memset(huge, 'a');
+    const too_big = try send(io, address, "POST", "/v1/jobs", huge);
+    defer too_big.free();
+    try expect_diagnostic(too_big, 413, "ZC-E0108");
+    try testing.expect(std.mem.indexOf(u8, too_big.body, "425984") != null);
+
+    const apply_body = huge[0 .. constants.http_body_bytes_max + 1];
+    const small = try send(io, address, "POST", "/v1/apply", apply_body);
+    defer small.free();
+    try expect_diagnostic(small, 413, "ZC-E0108");
+    try testing.expect(std.mem.indexOf(u8, small.body, "425984") == null);
+}
+
+// ---- B5: the trust policy from the configuration file to the refusal ------------------------
+
+const trust_fixture = @import("job_trust_fixture.zig");
+
+test "a server started from --config with a trust policy refuses an unsigned job with 403" {
+    // Goal: the production path of B5 slice 1, end to end (PR #241 review): `--config` names a
+    // policy, `server_config.load` reads it, `Server.start` gives the API its scratch, and
+    // POST /v1/jobs judges by it. Method: write a policy trusting key 7 and a configuration
+    // naming it, load them as zcube-server does, start a real server under the testing
+    // allocator (a leaked or twice-freed scratch fails the test), POST an unsigned job (403
+    // ZBX-E0905, and no job), then the same job signed by key 7 (201).
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    const public = trust_fixture.public_text(7);
+    const policy = try std.fmt.allocPrint(arena, ".{{ .version = 1, .keys = .{{ .{{ " ++
+        ".name = \"key-7\", .public = \"{s}\" }} }}, .require_signature = true }}", .{&public});
+    try tmp.dir.writeFile(io, .{ .sub_path = "trust.zon", .data = policy });
+    const settings = try std.fmt.allocPrint(arena, ".{{ .insecure_listen = \"127.0.0.1:0\", " ++
+        ".store = \"memory\", .trust = .{{ .policy = \"{s}/trust.zon\" }} }}", .{directory});
+    try tmp.dir.writeFile(io, .{ .sub_path = "server.zon", .data = settings });
+    const config_path = try std.fmt.allocPrint(arena, "{s}/server.zon", .{directory});
+
+    var diag: Diag = undefined;
+    diag.reset();
+    const command = config_mod.load(arena, io, &.{ "--config", config_path }, &diag) catch |err| {
+        std.debug.print("load: {s} {s}\n", .{ @errorName(err), diag.causes.slice()[0].slice() });
+        return err;
+    };
+    var config = command.run;
+    try testing.expect(config.trust != null);
+    config.quiet = true;
+    const server = try start_server(io, config);
+    defer server.stop();
+    const address = server.address();
+
+    var fixture = try trust_fixture.Fixture.init(testing.allocator);
+    defer fixture.deinit(testing.allocator);
+    const unsigned = try trust_body(arena, io, &.{});
+    const refused = try send(io, address, "POST", "/v1/jobs", unsigned);
+    defer refused.free();
+    try expect_diagnostic(refused, 403, "ZBX-E0905");
+    const absent = try get(io, address, "/v1/jobs/guarded");
+    defer absent.free();
+    try testing.expectEqual(@as(u16, 404), absent.status);
+
+    const line = try fixture.sign_manifest(arena, 7, 1, 9);
+    const signed = try trust_body(arena, io, &.{line});
+    const admitted = try send(io, address, "POST", "/v1/jobs", signed);
+    defer admitted.free();
+    if (admitted.status != 201) std.debug.print("{s}\n", .{admitted.raw});
+    try testing.expectEqual(@as(u16, 201), admitted.status);
+}
+
+/// The job `guarded` over `tree(1)`, pinned to the manifest of `source(9)`, with `signatures`.
+fn trust_body(arena: std.mem.Allocator, io: std.Io, signatures: []const []const u8) ![]const u8 {
+    var image_buffer: [67]u8 = undefined;
+    var source_buffer: [128]u8 = undefined;
+    const image = trust_fixture.image(&image_buffer, 1);
+    const source = trust_fixture.source(&source_buffer, 9);
+    var list: std.Io.Writer.Allocating = .init(arena);
+    for (signatures, 0..) |line, index| {
+        if (index > 0) try list.writer.writeAll(",");
+        try list.writer.print("{f}", .{std.json.fmt(line, .{})});
+    }
+    const now: u64 = @intCast(@max(0, std.Io.Clock.real.now(io).toMilliseconds()));
+    return std.fmt.allocPrint(arena,
+        \\{{"name":"guarded","image":"{s}","source":"{s}","command":["true"],"deadline_ms":60000,
+    ++
+        \\"submit_by_ms":{d},"signatures":[{s}]}}
+    , .{ image, source, now + 30_000, list.written() });
+}

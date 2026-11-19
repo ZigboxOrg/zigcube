@@ -1,0 +1,12 @@
+// The image digests the fake runtime treats as present on the node. A start with any other digest
+// fails with ZBX-E0410, "no tree with that digest". A real runtime
+// has a store of images; this list stands in for it until Zigbox's M4.
+//
+// Read by `zcube-agent --images` (default: fixtures/images.zon, relative to where it runs).
+.{
+    .images = .{
+        "b3:51aa9c03", // HANDOFF's `hello`
+        "b3:9d20c4f1", // a second image, to change a running service to
+        "b3:51aa9c0351aa9c0351aa9c0351aa9c0351aa9c0351aa9c0351aa9c0351aa9c03", // a full digest: a relayed job's image must be one (B4)
+    },
+}

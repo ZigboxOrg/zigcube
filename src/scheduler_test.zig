@@ -1,0 +1,1363 @@
+//! Tests of the scheduler on the memory store and a manual clock. The tests write `/nodes/`,
+//! `/node-status/` and `/replicas/` records themselves, as the roles that own them, so each one
+//! pins the scheduler's behaviour and nothing of the controllers' or the agent's. After every
+//! pass the accounting is reconstructed and compared with the records (I6).
+
+const std = @import("std");
+const testing = std.testing;
+const constants = @import("constants.zig");
+const controller = @import("controller.zig");
+const node_store = @import("node_store.zig");
+const records = @import("records.zig");
+const scheduler = @import("scheduler.zig");
+const store = @import("store.zig");
+const writers = @import("writers.zig");
+const ManualClock = @import("clock.zig").ManualClock;
+const MemoryStore = @import("store_memory.zig").MemoryStore;
+const Diag = @import("diag.zig").Diag;
+
+const gib: u64 = 1024 * 1024 * 1024;
+
+const Fixture = struct {
+    manual: ManualClock,
+    memory: *MemoryStore,
+    arena_state: std.heap.ArenaAllocator,
+    /// Holds what a test reads back, freed when the test ends.
+    keep: std.heap.ArenaAllocator,
+    diag: Diag,
+    sc: scheduler.Scheduler,
+
+    fn start(self: *Fixture) !void {
+        self.manual = .{ .ms = 1761350000000 };
+        self.memory = try testing.allocator.create(MemoryStore);
+        self.memory.init(testing.allocator, self.manual.clock());
+        self.arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        self.keep = std.heap.ArenaAllocator.init(testing.allocator);
+        self.diag.reset();
+        self.sc = scheduler.Scheduler.init(3);
+    }
+
+    fn stop(self: *Fixture) void {
+        self.arena_state.deinit();
+        self.keep.deinit();
+        self.memory.deinit();
+        testing.allocator.destroy(self.memory);
+    }
+
+    fn context(self: *Fixture) controller.Context {
+        _ = self.arena_state.reset(.retain_capacity);
+        return .{
+            .store = self.memory.interface(),
+            .clock = self.manual.clock(),
+            .arena = self.arena_state.allocator(),
+            .diag = &self.diag,
+        };
+    }
+
+    fn put(self: *Fixture, role: writers.Role, key: []const u8, value: anytype) !void {
+        const ctx = self.context();
+        const bytes = try records.encode(ctx.arena, value, &self.diag);
+        const op: store.Op = .{ .put = .{ .key = key, .value = bytes } };
+        const done = try writers.txn(ctx.store, role, .{ .on_success = &.{op} }, &self.diag);
+        try testing.expect(done.succeeded);
+    }
+
+    /// Writes `bytes` as they are, for a record this release could not have written.
+    fn put_raw(self: *Fixture, role: writers.Role, key: []const u8, bytes: []const u8) !void {
+        const ctx = self.context();
+        const op: store.Op = .{ .put = .{ .key = key, .value = bytes } };
+        const done = try writers.txn(ctx.store, role, .{ .on_success = &.{op} }, &self.diag);
+        try testing.expect(done.succeeded);
+    }
+
+    fn revision_of(self: *Fixture, key: []const u8) !store.Revision {
+        const ctx = self.context();
+        const got = try ctx.store.get(ctx.arena, key, null, &self.diag);
+        return if (got.kv) |kv| kv.mod_revision else 0;
+    }
+
+    /// Registers a node and, if `ready`, marks it ready for that tenure.
+    fn node(self: *Fixture, name: []const u8, cpu: u32, memory: u64, ready: bool) !void {
+        try self.node_labelled(name, cpu, memory, ready, &.{});
+    }
+
+    /// `node` with labels (`key=value` words, and `exclusive=key`).
+    fn node_labelled(
+        self: *Fixture,
+        name: []const u8,
+        cpu: u32,
+        memory: u64,
+        ready: bool,
+        labels: []const []const u8,
+    ) !void {
+        const value: records.Node = .{
+            .name = name,
+            .labels = labels,
+            .capacity = .{ .cpu_millis = cpu, .memory_bytes = memory },
+        };
+        try self.put(.{ .agent = name }, records.node_key(name).slice(), value);
+        if (ready) try self.status(name, .ready, 0);
+    }
+
+    /// Writes the node's status for its current tenure, plus `skew` (a status of another tenure).
+    fn status(self: *Fixture, name: []const u8, state: records.NodeState, skew: u64) !void {
+        const tenure = try self.revision_of(records.node_key(name).slice());
+        const value: records.NodeStatus = .{
+            .state = state,
+            .tenure = tenure -% skew,
+            .at_ms = self.manual.ms,
+            .decision = "x",
+        };
+        try self.put(.node_controller, records.node_status_key(name).slice(), value);
+    }
+
+    fn replica(
+        self: *Fixture,
+        service: []const u8,
+        id: []const u8,
+        cpu: ?u32,
+        memory: ?u64,
+    ) !void {
+        const value: records.Replica = .{
+            .id = id,
+            .service = service,
+            .generation = 1,
+            .image = "b3:51aa9c03",
+            .command = &.{"true"},
+            .limits = .{ .cpu_millis = cpu, .memory_bytes = memory },
+        };
+        try self.put(.replica_controller, records.replica_key(service, id).slice(), value);
+    }
+
+    /// Writes a job's run and its status, as the job controller would.
+    fn job(self: *Fixture, name: []const u8, cpu: ?u32, state: records.JobState) !void {
+        try self.job_requiring(name, cpu, state, &.{});
+    }
+
+    /// `job` whose placement requires `require`.
+    fn job_requiring(
+        self: *Fixture,
+        name: []const u8,
+        cpu: ?u32,
+        state: records.JobState,
+        require: []const records.Pair,
+    ) !void {
+        var buffer: [constants.job_run_id_bytes_max]u8 = undefined;
+        const run: records.JobRun = .{
+            .id = records.job_run_id(&buffer, name),
+            .job = name,
+            .image = "b3:51aa9c03",
+            .command = &.{"true"},
+            .limits = .{ .cpu_millis = cpu, .memory_bytes = gib },
+            .deadline_ms = 60 * 1000,
+            .start_by_ms = self.manual.ms + 60 * 1000,
+            .created_at_ms = self.manual.ms,
+            .placement = if (require.len == 0) null else .{ .require = require },
+        };
+        try self.put(.job_controller, records.job_run_key(name).slice(), run);
+        try self.job_state(name, state);
+    }
+
+    fn job_state(self: *Fixture, name: []const u8, state: records.JobState) !void {
+        const terminal = records.job_state_terminal(state);
+        const record: records.JobStatus = .{
+            .state = state,
+            .ended_at_ms = if (terminal) self.manual.ms else null,
+            .end = if (!terminal) null else switch (state) {
+                .exited => .{ .kind = .exited, .code = 0 },
+                .cancelled => .{ .kind = .cancelled },
+                else => .{ .kind = .failed, .cause = .unknown },
+            },
+            .reported_at_ms = self.manual.ms,
+        };
+        try self.put(.job_controller, records.job_status_key(name).slice(), record);
+    }
+
+    /// Writes the node's `/node-store` summary: the fake trees of `digests`.
+    fn summary(self: *Fixture, name: []const u8, digests: []const []const u8) !void {
+        var fake: node_store.FakeImages = .{ .digests = digests };
+        // `put` resets the fixture's arena, so the record lives in a scratch one.
+        var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+        defer scratch.deinit();
+        const held = try fake.images().summary(scratch.allocator(), &.{});
+        const record = try node_store.record_of(scratch.allocator(), name, held);
+        try self.put(.{ .agent = name }, records.node_store_key(name).slice(), record);
+    }
+
+    /// One pass, then the I6 check.
+    fn step(self: *Fixture) !controller.Wakeup {
+        const ctx = self.context();
+        const wake = try self.sc.reconcile(&ctx);
+        try self.accounting_holds();
+        return wake;
+    }
+
+    /// One pass without the I6 check, for a test that writes an allocation record by hand.
+    fn sc_step_unchecked(self: *Fixture) !controller.Wakeup {
+        const ctx = self.context();
+        return self.sc.reconcile(&ctx);
+    }
+
+    /// Passes until one writes nothing.
+    fn settle(self: *Fixture) !void {
+        for (0..32) |_| {
+            if ((try self.step()).acted == 0) return;
+        }
+        return error.DidNotSettle;
+    }
+
+    fn accounting_holds(self: *Fixture) !void {
+        const ctx = self.context();
+        const found = try scheduler.find_mismatch(&ctx);
+        if (found) |mismatch| {
+            std.debug.print("I6 broken on {s}\n", .{mismatch.node});
+            return error.AccountingBroken;
+        }
+    }
+
+    fn assigned_to(self: *Fixture, id: []const u8) !?[]const u8 {
+        const ctx = self.context();
+        const page = try ctx.store.list(ctx.arena, .{
+            .prefix = records.prefix_assigned,
+            .limit = constants.store_list_limit_max,
+        }, &self.diag);
+        for (page.kvs) |kv| {
+            if (!std.mem.endsWith(u8, kv.key, id)) continue;
+            const rest = kv.key[records.prefix_assigned.len..];
+            const name = rest[0..std.mem.indexOfScalar(u8, rest, '/').?];
+            return try testing.allocator.dupe(u8, name);
+        }
+        return null;
+    }
+
+    fn expect_on(self: *Fixture, id: []const u8, want: ?[]const u8) !void {
+        const got = try self.assigned_to(id);
+        defer if (got) |name| testing.allocator.free(name);
+        if (want) |name| {
+            try testing.expect(got != null);
+            try testing.expectEqualStrings(name, got.?);
+        } else try testing.expect(got == null);
+    }
+
+    fn allocation(self: *Fixture, name: []const u8) !records.Allocation {
+        const ctx = self.context();
+        const key = records.allocation_key(name);
+        const got = try ctx.store.get(ctx.arena, key.slice(), null, &self.diag);
+        return try records.read(records.Allocation, self.keep.allocator(), got.kv.?, &self.diag);
+    }
+
+    /// The decisions of one action, oldest first; the strings are the test allocator's.
+    fn decisions(self: *Fixture, action: []const u8) ![]records.Decision {
+        const ctx = self.context();
+        const page = try ctx.store.list(ctx.arena, .{
+            .prefix = records.prefix_decisions,
+            .limit = constants.store_list_limit_max,
+        }, &self.diag);
+        var found: std.ArrayList(records.Decision) = .empty;
+        for (page.kvs) |kv| {
+            const keep = self.keep.allocator();
+            const decision = try records.read(records.Decision, keep, kv, &self.diag);
+            if (std.mem.eql(u8, decision.action, action)) {
+                try found.append(testing.allocator, decision);
+            }
+        }
+        return found.toOwnedSlice(testing.allocator);
+    }
+
+    fn count(self: *Fixture, action: []const u8) !usize {
+        const found = try self.decisions(action);
+        defer testing.allocator.free(found);
+        return found.len;
+    }
+};
+
+test "a replica is placed on the only node, with its decision and its allocation" {
+    // Goal: the basic placement. Method: one node, one replica with limits; the assignment,
+    // the allocation record and the `place_replica` decision all exist after one pass.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 4000, 8 * gib, true);
+    try fixture.replica("hello", "hello-1", 500, gib);
+    try testing.expectEqual(@as(u32, 1), (try fixture.step()).acted);
+    try fixture.expect_on("hello-1", "n1");
+    const allocation = try fixture.allocation("n1");
+    try testing.expectEqual(@as(u32, 500), allocation.allocated.cpu_millis);
+    try testing.expectEqual(gib, allocation.allocated.memory_bytes);
+    try testing.expectEqual(@as(u32, 1), allocation.count);
+    try testing.expectEqual(@as(usize, 1), try fixture.count("place_replica"));
+    const again = try fixture.step();
+    try testing.expectEqual(@as(u32, 0), again.acted);
+    try testing.expect(again.at_ms > fixture.manual.ms);
+}
+
+test "fit is checked on CPU and on memory, each failing alone" {
+    // Goal: either resource alone keeps a replica off a node, and the hold names which.
+    // Method: n1 has little CPU and a lot of memory, n2 the reverse; a replica too big for
+    // each on one resource only is held, and the evidence shows that resource for that node.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 1000, 8 * gib, true);
+    try fixture.node("n2", 8000, gib, true);
+    try fixture.replica("big", "big-1", 2000, 2 * gib);
+    try fixture.settle();
+    try fixture.expect_on("big-1", null);
+    const holds = try fixture.decisions("hold_pending");
+    defer testing.allocator.free(holds);
+    try testing.expectEqual(@as(usize, 1), holds.len);
+    const evidence = holds[0].cause_evidence.?.text;
+    try testing.expect(std.mem.indexOf(u8, evidence, "\"cpu_short\":{\"n1\":1000}") != null);
+    const memory_short = "\"memory_short\":{\"n2\":1073741824}";
+    try testing.expect(std.mem.indexOf(u8, evidence, memory_short) != null);
+    // A replica that fits one of them is placed there.
+    try fixture.replica("small", "small-1", 1000, gib);
+    try fixture.settle();
+    try fixture.expect_on("small-1", "n1");
+}
+
+test "the spread order: fewest of the service, then least allocated, then name" {
+    // Goal: the three tie-breaks, in order. Method: each case sets the nodes up so that only
+    // the tie-break under test separates them.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("a", 4000, 8 * gib, true);
+    try fixture.node("b", 4000, 8 * gib, true);
+    try fixture.node("c", 4000, 8 * gib, true);
+    // Name: three equal empty nodes, so the first replica goes to the lowest name.
+    try fixture.replica("web", "web-1", 100, gib);
+    try fixture.settle();
+    try fixture.expect_on("web-1", "a");
+    // Fewest of the service: a has one web, so b and c are ahead; the name decides between them.
+    try fixture.replica("web", "web-2", 100, gib);
+    try fixture.settle();
+    try fixture.expect_on("web-2", "b");
+    try fixture.replica("web", "web-3", 100, gib);
+    try fixture.settle();
+    try fixture.expect_on("web-3", "c");
+    // Least allocated: another service's load makes b the fullest and c the emptiest of the
+    // nodes with no `db`; `db-1` goes to the least allocated (CPU fraction), not the lowest name.
+    try fixture.replica("load", "load-1", 2000, gib);
+    try fixture.settle();
+    try fixture.expect_on("load-1", "a"); // All hold one web; a is the lowest name.
+    try fixture.replica("load", "load-2", 1000, gib);
+    try fixture.settle();
+    try fixture.expect_on("load-2", "b"); // b and c hold none of `load`; equal; name.
+    try fixture.replica("db", "db-1", 100, gib);
+    try fixture.settle();
+    try fixture.expect_on("db-1", "c"); // Nobody holds a db; c has the least CPU allocated.
+}
+
+test "a node is excluded when it is not ready, judged an older tenure, in audit, or over" {
+    // Goal: each exclusion alone, and the hold names it. Method: five nodes, each broken one
+    // way; a sixth healthy node is added afterwards and takes the replica.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 4000, 8 * gib, false); // No status.
+    try fixture.node("n2", 4000, 8 * gib, true);
+    try fixture.status("n2", .lost, 0);
+    try fixture.node("n3", 4000, 8 * gib, true);
+    try fixture.status("n3", .ready, 1); // Judged an older tenure.
+    try fixture.node("n4", 4000, 8 * gib, true);
+    const audit: records.Audit = .{
+        .recorded = .{ .allocated = .{ .cpu_millis = 0, .memory_bytes = 0 }, .count = 0 },
+        .reconstructed = .{ .allocated = .{ .cpu_millis = 1, .memory_bytes = 1 }, .count = 1 },
+        .revision = 1,
+        .decision = "x",
+    };
+    try fixture.put(.auditor, records.audit_key("n4").slice(), audit);
+    try fixture.node("n5", 1000, gib, true);
+    try fixture.put(.scheduler, records.allocation_key("n5").slice(), records.Allocation{
+        .allocated = .{ .cpu_millis = 2000, .memory_bytes = 2 * gib },
+        .count = 1,
+        .node_revision = 1,
+    });
+    try fixture.replica("hello", "hello-1", 100, gib);
+    _ = try fixture.sc_step_unchecked();
+    try fixture.expect_on("hello-1", null);
+    const holds = try fixture.decisions("hold_pending");
+    defer testing.allocator.free(holds);
+    try testing.expectEqual(@as(usize, 1), holds.len);
+    const evidence = holds[0].cause_evidence.?.text;
+    for ([_][]const u8{
+        "\"no_status\":[\"n1\"]",
+        "\"lost\":[\"n2\"]",
+        "\"older_tenure\":[\"n3\"]",
+        "\"audit_open\":[\"n4\"]",
+        "\"over_capacity\":[\"n5\"]",
+    }) |expected| try testing.expect(std.mem.indexOf(u8, evidence, expected) != null);
+    try fixture.node("n6", 4000, 8 * gib, true);
+    _ = try fixture.sc_step_unchecked();
+    try fixture.expect_on("hello-1", "n6");
+}
+
+test "a hold names every node of a full cluster within the evidence bound" {
+    // Goal: the evidence stays within `decision_evidence_bytes_max` with `nodes_max` nodes and
+    // still names them all. Method: 64 nodes short on CPU alone; then the worst case, short on
+    // both, where the bound is kept and the nodes that do not fit are counted.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    var names: [constants.nodes_max][3]u8 = undefined;
+    for (&names, 0..) |*name, index| {
+        _ = std.fmt.bufPrint(name, "n{d:0>2}", .{index}) catch unreachable; // Three bytes hold it.
+        try fixture.node(name, 100, 8 * gib, true);
+    }
+    try fixture.replica("big", "big-1", 200, gib);
+    try fixture.settle();
+    var holds = try fixture.decisions("hold_pending");
+    try testing.expectEqual(@as(usize, 1), holds.len);
+    var evidence = holds[0].cause_evidence.?.text;
+    try testing.expect(evidence.len <= constants.decision_evidence_bytes_max);
+    for (names) |name| {
+        const quoted = try std.fmt.allocPrint(testing.allocator, "\"{s}\"", .{name});
+        defer testing.allocator.free(quoted);
+        try testing.expect(std.mem.indexOf(u8, evidence, quoted) != null);
+    }
+    try testing.expect(std.mem.indexOf(u8, evidence, "omitted") == null);
+    testing.allocator.free(holds);
+
+    try fixture.replica("huge", "huge-1", 200, 16 * gib);
+    try fixture.settle();
+    holds = try fixture.decisions("hold_pending");
+    defer testing.allocator.free(holds);
+    evidence = holds[holds.len - 1].cause_evidence.?.text;
+    try testing.expect(evidence.len <= constants.decision_evidence_bytes_max);
+    try testing.expect(std.mem.indexOf(u8, evidence, "\"omitted\":") != null);
+}
+
+test "one hold_pending per change in the reason, not per pass" {
+    // Goal: a held replica is written about when the reason changes. Method: hold; pass twice
+    // (one decision); add a node that is too small too (the reason changed: a second); pass
+    // again (still two); add a node that fits (it is placed, with no further hold).
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 1000, 8 * gib, true);
+    try fixture.replica("big", "big-1", 2000, gib);
+    _ = try fixture.step();
+    _ = try fixture.step();
+    try testing.expectEqual(@as(usize, 1), try fixture.count("hold_pending"));
+    try fixture.node("n2", 1500, 8 * gib, true);
+    _ = try fixture.step();
+    _ = try fixture.step();
+    try testing.expectEqual(@as(usize, 2), try fixture.count("hold_pending"));
+    try fixture.node("n3", 4000, 8 * gib, true);
+    try fixture.settle();
+    try fixture.expect_on("big-1", "n3");
+    try testing.expectEqual(@as(usize, 2), try fixture.count("hold_pending"));
+    // A decision with no locality members is still written at version 2, which a C1 build reads.
+    const holds = try fixture.decisions("hold_pending");
+    defer testing.allocator.free(holds);
+    for (holds) |hold| try testing.expectEqual(records.decision_version_plain, hold.v);
+}
+
+test "a released assignment frees its allocation, and a gone replica is released once" {
+    // Goal: release. Method: place two replicas, delete one replica record; the assignment goes,
+    // the allocation shrinks, one `release_replica` decision; nothing more on the next pass.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 4000, 8 * gib, true);
+    try fixture.replica("hello", "hello-1", 500, gib);
+    try fixture.replica("hello", "hello-2", 500, gib);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 2), (try fixture.allocation("n1")).count);
+    const ctx = fixture.context();
+    const key = records.replica_key("hello", "hello-1");
+    const delete: store.Op = .{ .delete = key.slice() };
+    const ops: store.TxnRequest = .{ .on_success = &.{delete} };
+    _ = try writers.txn(ctx.store, .replica_controller, ops, &fixture.diag);
+    try testing.expectEqual(@as(u32, 1), (try fixture.step()).acted);
+    try fixture.expect_on("hello-1", null);
+    try fixture.expect_on("hello-2", "n1");
+    const allocation = try fixture.allocation("n1");
+    try testing.expectEqual(@as(u32, 1), allocation.count);
+    try testing.expectEqual(@as(u32, 500), allocation.allocated.cpu_millis);
+    try testing.expectEqual(@as(usize, 1), try fixture.count("release_replica"));
+    try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
+}
+
+test "a replica without limits takes the defaults, and a move changes both allocations" {
+    // Goal: `requests_of` resolves the defaults, and `move_replica` keeps I6 across two nodes.
+    // Method: place one defaulted replica on n1, move it to n2, then to a node that is lost.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 4000, 8 * gib, true);
+    try fixture.node("n2", 4000, 8 * gib, true);
+    try fixture.node("n3", 4000, 8 * gib, true);
+    try fixture.status("n3", .lost, 0);
+    try fixture.replica("hello", "hello-1", null, null);
+    try fixture.settle();
+    try fixture.expect_on("hello-1", "n1");
+    const first = try fixture.allocation("n1");
+    try testing.expectEqual(constants.request_default_cpu_millis, first.allocated.cpu_millis);
+    try testing.expectEqual(constants.request_default_memory_bytes, first.allocated.memory_bytes);
+
+    // The world lives in its own arena: the fixture's helpers reset theirs on every call.
+    var ctx = fixture.context();
+    ctx.arena = fixture.keep.allocator();
+    var world = try scheduler.read_world(&ctx);
+    const spec: scheduler.MoveSpec = .{ .replica = "hello-1", .to = "n2", .reason = "test move" };
+    try testing.expect((try fixture.sc.move_replica(&ctx, &world, spec)) == .moved);
+    try fixture.accounting_holds();
+    try fixture.expect_on("hello-1", "n2");
+    try testing.expectEqual(@as(u32, 0), (try fixture.allocation("n1")).count);
+    try testing.expectEqual(@as(u32, 1), (try fixture.allocation("n2")).count);
+    // The world the move left behind is current: a pass over it writes nothing.
+    try testing.expectEqual(@as(u32, 0), (try fixture.sc.reconcile_world(&ctx, &world)).acted);
+
+    const lost: scheduler.MoveSpec = .{ .replica = "hello-1", .to = "n3", .reason = "test move" };
+    const refused = try fixture.sc.move_replica(&ctx, &world, lost);
+    try testing.expect(refused == .refused);
+    try testing.expectEqual(scheduler.Reason.lost, refused.refused.reason);
+    try fixture.expect_on("hello-1", "n2");
+}
+
+test "a request near the top of u64 is short on memory, not an overflow" {
+    // Goal: the fit sum cannot overflow. Method: n1 holds 1 GiB; a replica asking for almost
+    // 2^64 bytes would overflow `allocated + need`, and is held with memory short.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 4000, 8 * gib, true);
+    try fixture.replica("hello", "hello-1", 100, gib);
+    try fixture.settle();
+    const huge: u64 = std.math.maxInt(u64) - 1024;
+    try fixture.replica("huge", "huge-1", 100, huge);
+    try fixture.settle();
+    try fixture.expect_on("huge-1", null);
+    const holds = try fixture.decisions("hold_pending");
+    defer testing.allocator.free(holds);
+    try testing.expectEqual(@as(usize, 1), holds.len);
+    const evidence = holds[0].cause_evidence.?.text;
+    try testing.expect(std.mem.indexOf(u8, evidence, "\"memory_short\":{\"n1\":") != null);
+    try testing.expect(std.mem.indexOf(u8, evidence, "\"cpu_short\"") == null);
+}
+
+test "more held replicas than the old memory held converge: a second pass writes nothing" {
+    // Goal: the hold memory covers every replica there can be. Method: 300 replicas that fit
+    // nowhere; passes settle (the old 256 slots never would), and one more writes nothing.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 1000, 8 * gib, true);
+    for (0..300) |number| {
+        var id: [16]u8 = undefined;
+        const name = std.fmt.bufPrint(&id, "big-{d}", .{number + 1}) catch unreachable; // Fits.
+        try fixture.replica("big", name, 2000, gib);
+    }
+    try fixture.settle();
+    try testing.expectEqual(@as(usize, 300), try fixture.count("hold_pending"));
+    try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
+    try testing.expectEqual(@as(usize, 300), try fixture.count("hold_pending"));
+}
+
+test "a hold is not rewritten when only the amounts change, not the shape" {
+    // Goal: the dedupe key is the shape of the reason. Method: big-1 is short on CPU on both
+    // nodes; a small replica placed on n1 makes n1 short by more, which writes no new hold.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 1000, 8 * gib, true);
+    try fixture.node("n2", 1500, 8 * gib, true);
+    try fixture.replica("big", "big-1", 2000, gib);
+    try fixture.settle();
+    try testing.expectEqual(@as(usize, 1), try fixture.count("hold_pending"));
+    try fixture.replica("small", "small-1", 100, gib);
+    try fixture.settle();
+    try fixture.expect_on("small-1", "n1");
+    try testing.expectEqual(@as(usize, 1), try fixture.count("hold_pending"));
+    try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
+}
+
+test "a release cites the decision that stopped the replica, else a resync" {
+    // Goal: `why replica` does not say resync when the replica controller retired it. Method:
+    // one replica gets a `stop_replica` decision in the transaction that deletes it; another
+    // is deleted bare.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 4000, 8 * gib, true);
+    try fixture.replica("hello", "hello-1", 500, gib);
+    try fixture.replica("hello", "hello-2", 500, gib);
+    try fixture.settle();
+    var ctx = fixture.context();
+    var source: controller.DecisionSource = .{ .instance = 9 };
+    var batch: controller.Batch = .{};
+    const stop = try controller.put_decision(&ctx, &source, .{
+        .actor = "replica-controller",
+        .action = "stop_replica",
+        .subject = .{ .kind = .replica, .name = "hello-1" },
+        .reason = "removing hello-1",
+        .cause = .{ .kind = .resync },
+    }, &batch);
+    const gone_key = records.replica_key("hello", "hello-1");
+    batch.delete(gone_key.slice());
+    const done = try controller.commit(&ctx, .replica_controller, &batch);
+    try testing.expect(done == .applied);
+    const bare = records.replica_key("hello", "hello-2");
+    const delete: store.Op = .{ .delete = bare.slice() };
+    const ops: store.TxnRequest = .{ .on_success = &.{delete} };
+    _ = try writers.txn(ctx.store, .replica_controller, ops, &fixture.diag);
+    try fixture.settle();
+    const releases = try fixture.decisions("release_replica");
+    defer testing.allocator.free(releases);
+    try testing.expectEqual(@as(usize, 2), releases.len);
+    for (releases) |release| {
+        if (std.mem.eql(u8, release.subject.name, "hello-1")) {
+            try testing.expectEqual(records.CauseKind.decision, release.cause.kind);
+            try testing.expectEqualStrings(stop.slice(), release.cause.id.?);
+        } else try testing.expectEqual(records.CauseKind.resync, release.cause.kind);
+    }
+}
+
+test "a move is refused, not asserted, for a caller's bad input" {
+    // Goal: `move_replica` returns `refused` for an unknown replica, one that is not assigned,
+    // a move to its own node and an unknown node. Method: each against a settled world.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 4000, 8 * gib, true);
+    try fixture.node("n2", 4000, 8 * gib, true);
+    try fixture.replica("hello", "hello-1", 500, gib);
+    try fixture.settle();
+    try fixture.replica("big", "big-1", 9000, gib);
+    var ctx = fixture.context();
+    ctx.arena = fixture.keep.allocator();
+    var world = try scheduler.read_world(&ctx);
+    const cases = [_]struct { scheduler.MoveSpec, scheduler.Reason }{
+        .{ .{ .replica = "nope-1", .to = "n2", .reason = "t" }, .unknown_replica },
+        .{ .{ .replica = "big-1", .to = "n2", .reason = "t" }, .not_assigned },
+        .{ .{ .replica = "hello-1", .to = "n1", .reason = "t" }, .same_node },
+        .{ .{ .replica = "hello-1", .to = "n9", .reason = "t" }, .unknown_node },
+    };
+    for (cases) |case| {
+        const result = try fixture.sc.move_replica(&ctx, &world, case[0]);
+        try testing.expect(result == .refused);
+        try testing.expectEqual(case[1], result.refused.reason);
+    }
+    try fixture.expect_on("hello-1", "n1");
+    try fixture.accounting_holds();
+}
+
+/// The node controller's view of a lease that ran out: `/nodes/<name>` deleted (by its agent,
+/// as the lease's expiry would) and the status `lost` for the tenure it had, by "mark-lost-1".
+fn lose(fixture: *Fixture, name: []const u8) !void {
+    const key = records.node_key(name);
+    const tenure = try fixture.revision_of(key.slice());
+    const ctx = fixture.context();
+    const op: store.Op = .{ .delete = key.slice() };
+    const role: writers.Role = .{ .agent = name };
+    _ = try writers.txn(ctx.store, role, .{ .on_success = &.{op} }, &fixture.diag);
+    const value: records.NodeStatus = .{
+        .state = .lost,
+        .tenure = tenure,
+        .at_ms = fixture.manual.ms,
+        .decision = "mark-lost-1",
+    };
+    try fixture.put(.node_controller, records.node_status_key(name).slice(), value);
+}
+
+test "a lost node's replica stays put for the scheduler, past any grace" {
+    // Goal: the scheduler does not move a lost node's replica (the replica controller replaces it
+    // under a new id, authority.md §3), and places nothing more on the lost node.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 4000, 8 * gib, true);
+    try fixture.replica("hello", "hello-1", 500, gib);
+    try fixture.settle();
+    try fixture.node("n2", 4000, 8 * gib, true);
+    try lose(&fixture, "n1");
+    fixture.manual.ms += constants.lost_grace_ms_max;
+    try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
+    try fixture.expect_on("hello-1", "n1");
+    try fixture.replica("hello", "hello-2", 500, gib);
+    try fixture.settle();
+    try fixture.expect_on("hello-2", "n2");
+}
+
+test "a replica retired off a lost node has its assignment released there" {
+    // Goal: the reaction to the replica controller's replacement: n1 has no `/nodes` record, and
+    // its allocation still comes down with the release, caused by the `mark_replica_lost`.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 4000, 8 * gib, true);
+    try fixture.replica("hello", "hello-1", 500, gib);
+    try fixture.settle();
+    try lose(&fixture, "n1");
+    const ctx = fixture.context();
+    const key = records.replica_key("hello", "hello-1");
+    const op: store.Op = .{ .delete = key.slice() };
+    _ = try writers.txn(ctx.store, .replica_controller, .{ .on_success = &.{op} }, &fixture.diag);
+    try fixture.settle();
+    try fixture.expect_on("hello-1", null);
+    try testing.expectEqual(@as(u32, 0), (try fixture.allocation("n1")).count);
+    try testing.expectEqual(@as(usize, 1), try fixture.count("release_replica"));
+    try fixture.accounting_holds();
+}
+
+// ---- The allocation auditor and repair (C1 slice 4c, 4d) -------------------------------------
+
+const allocations = @import("allocations.zig");
+const auditor_mod = @import("auditor.zig");
+
+fn audit_pass(fixture: *Fixture, auditor: *auditor_mod.Auditor) !u32 {
+    const ctx = fixture.context();
+    return (try auditor.reconcile(&ctx)).acted;
+}
+
+fn finding_of(fixture: *Fixture, name: []const u8) !?records.Audit {
+    const ctx = fixture.context();
+    const got = try ctx.store.get(ctx.arena, records.audit_key(name).slice(), null, &fixture.diag);
+    const kv = got.kv orelse return null;
+    const keep = fixture.keep.allocator();
+    var audit = try records.read(records.Audit, keep, kv, &fixture.diag);
+    audit.decision = try keep.dupe(u8, audit.decision); // The context's arena is reset.
+    return audit;
+}
+
+/// Overwrites n1's allocation record with one more assignment and 250 more cpu millis than it
+/// holds, as a defect would.
+fn corrupt(fixture: *Fixture, name: []const u8) !void {
+    var wrong = try fixture.allocation(name);
+    wrong.count += 1;
+    wrong.allocated.cpu_millis += 250;
+    try fixture.put(.scheduler, records.allocation_key(name).slice(), wrong);
+}
+
+test "the auditor opens one finding on a corrupted record, and the scheduler only releases" {
+    // Goal: ZC-B0003 once, not once per pass; placement stops and release goes on. Method: two
+    // replicas on n1, corrupt the record, audit twice; a new replica is held, a retired one is
+    // released.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    var auditor = auditor_mod.Auditor.init(7);
+    try fixture.node("n1", 4000, 8 * gib, true);
+    try fixture.replica("hello", "hello-1", 500, gib);
+    try fixture.replica("hello", "hello-2", 500, gib);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 0), try audit_pass(&fixture, &auditor));
+    try corrupt(&fixture, "n1");
+    try testing.expectEqual(@as(u32, 1), try audit_pass(&fixture, &auditor));
+    try testing.expectEqual(@as(u32, 0), try audit_pass(&fixture, &auditor));
+    const found = try fixture.decisions(auditor_mod.action_mismatch);
+    defer testing.allocator.free(found);
+    try testing.expectEqual(@as(usize, 1), found.len);
+    const decision = found[0];
+    try testing.expectEqualStrings("n1", decision.subject.name);
+    try testing.expectEqual(records.CauseKind.observed, decision.cause.kind);
+    try testing.expectEqualStrings("/allocations/n1", decision.cause.key.?);
+    const diagnostic = decision.cause_diagnostic.?.text;
+    try testing.expect(std.mem.indexOf(u8, diagnostic, "ZC-B0003") != null);
+    const evidence = decision.cause_evidence.?.text;
+    const want = "\"recorded\":{\"cpu_millis\":1250,\"memory_bytes\":2147483648,\"count\":3}";
+    try testing.expect(std.mem.indexOf(u8, evidence, want) != null);
+    const finding = (try finding_of(&fixture, "n1")).?;
+    try testing.expectEqual(@as(u32, 3), finding.recorded.count);
+    try testing.expectEqual(@as(u32, 2), finding.reconstructed.count);
+    try testing.expectEqualStrings(decision.id, finding.decision);
+    // Placement stops on n1; release goes on.
+    try fixture.replica("hello", "hello-3", 500, gib);
+    _ = try fixture.sc_step_unchecked();
+    try fixture.expect_on("hello-3", null);
+    const ctx = fixture.context();
+    const gone: store.Op = .{ .delete = records.replica_key("hello", "hello-1").slice() };
+    _ = try writers.txn(ctx.store, .replica_controller, .{ .on_success = &.{gone} }, &fixture.diag);
+    _ = try fixture.sc_step_unchecked();
+    try fixture.expect_on("hello-1", null);
+    try testing.expectEqual(@as(u32, 2), (try fixture.allocation("n1")).count);
+}
+
+test "repair writes the reconstruction, cites the finding, and the next audit clears it" {
+    // Goal: the operator's way out. Method: corrupt n1, audit, repair as request r-1; the record
+    // equals the assignments' sum, the decision's cause is the finding's decision, the next audit
+    // deletes the finding with `audit_clear`, and a second repair finds nothing to do.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    var auditor = auditor_mod.Auditor.init(7);
+    try fixture.node("n1", 4000, 8 * gib, true);
+    try fixture.replica("hello", "hello-1", 500, gib);
+    try fixture.settle();
+    var source: controller.DecisionSource = .{ .instance = 9 };
+    {
+        const ctx = fixture.context();
+        try testing.expect(try allocations.repair(&ctx, &source, "n1", "r-1") == .no_finding);
+    }
+    try corrupt(&fixture, "n1");
+    try testing.expectEqual(@as(u32, 1), try audit_pass(&fixture, &auditor));
+    const finding = (try finding_of(&fixture, "n1")).?;
+    const ctx = fixture.context();
+    const result = try allocations.repair(&ctx, &source, "n1", "r-1");
+    try testing.expectEqual(@as(u32, 2), result.repaired.recorded.count);
+    try testing.expectEqual(@as(u32, 1), result.repaired.reconstructed.count);
+    const repaired = try fixture.allocation("n1");
+    try testing.expectEqual(@as(u32, 1), repaired.count);
+    try testing.expectEqual(@as(u32, 500), repaired.allocated.cpu_millis);
+    const found = try fixture.decisions(allocations.repair_action);
+    defer testing.allocator.free(found);
+    try testing.expectEqual(@as(usize, 1), found.len);
+    try testing.expectEqualStrings(finding.decision, found[0].cause.id.?);
+    try testing.expect(std.mem.indexOf(u8, found[0].reason, "r-1") != null);
+    try testing.expect((try finding_of(&fixture, "n1")) != null); // The auditor clears it.
+    try fixture.accounting_holds();
+    try testing.expectEqual(@as(u32, 1), try audit_pass(&fixture, &auditor));
+    try testing.expect((try finding_of(&fixture, "n1")) == null);
+    try testing.expectEqual(@as(usize, 1), try fixture.count(auditor_mod.action_clear));
+    try testing.expectEqual(@as(u32, 0), try audit_pass(&fixture, &auditor));
+    const later = fixture.context();
+    try testing.expect(try allocations.repair(&later, &source, "n1", "r-2") == .no_finding);
+}
+
+const image = "b3:51aa9c03";
+
+test "locality breaks a tie, and the decision records what it read" {
+    // Goal: with fit and spread equal, the node that holds the image wins over a lower name, and
+    // the decision carries the bytes and the revision of the summary it read.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("a", 4000, 8 * gib, true);
+    try fixture.node("b", 4000, 8 * gib, true);
+    try fixture.node("c", 4000, 8 * gib, true);
+    try fixture.summary("c", &.{image});
+    try fixture.summary("b", &.{"b3:9d20c4f1"}); // Holds another tree: no credit.
+    try fixture.replica("web", "web-1", 100, gib);
+    try fixture.settle();
+    try fixture.expect_on("web-1", "c");
+    const placed = try fixture.decisions("place_replica");
+    defer testing.allocator.free(placed);
+    try testing.expectEqual(@as(usize, 1), placed.len);
+    try testing.expectEqual(records.decision_version_locality, placed[0].v);
+    try testing.expect(placed[0].locality_bytes.? > 0);
+    try testing.expect(placed[0].node_store_revision.? > 0);
+    try testing.expect(std.mem.indexOf(u8, placed[0].reason, "already there") != null);
+}
+
+test "spread outranks locality, and locality outranks least allocated" {
+    // Goal: the order of the middle steps. Method: c holds the image. web-1 goes to c (locality);
+    // web-2 must not (spread: c has one web); a load on c does not move web-1 off it.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("a", 4000, 8 * gib, true);
+    try fixture.node("c", 4000, 8 * gib, true);
+    try fixture.summary("c", &.{image});
+    try fixture.replica("load", "load-1", 2000, gib); // Loads a or c by name.
+    try fixture.settle();
+    try fixture.replica("web", "web-1", 100, gib);
+    try fixture.settle();
+    try fixture.expect_on("web-1", "c"); // Locality ahead of least allocated.
+    try fixture.replica("web", "web-2", 100, gib);
+    try fixture.settle();
+    try fixture.expect_on("web-2", "a"); // Spread ahead of locality.
+}
+
+test "fit comes first: a node that holds the image but cannot fit is not chosen" {
+    // Goal: locality never overrides fit. Method: c holds the image and has 1 CPU; the replica
+    // needs 2.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("a", 4000, 8 * gib, true);
+    try fixture.node("c", 1000, 8 * gib, true);
+    try fixture.summary("c", &.{image});
+    try fixture.replica("web", "web-1", 2000, gib);
+    try fixture.settle();
+    try fixture.expect_on("web-1", "a");
+}
+
+test "no summary anywhere: the order is as before, and the decision says no summary" {
+    // Goal: a world without /node-store behaves as C1 did. Method: three nodes, no summaries.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("a", 4000, 8 * gib, true);
+    try fixture.node("b", 4000, 8 * gib, true);
+    try fixture.replica("web", "web-1", 100, gib);
+    try fixture.settle();
+    try fixture.expect_on("web-1", "a");
+    const placed = try fixture.decisions("place_replica");
+    defer testing.allocator.free(placed);
+    try testing.expectEqual(@as(u64, 0), placed[0].locality_bytes.?);
+    try testing.expectEqual(@as(u64, 0), placed[0].node_store_revision.?);
+    try testing.expect(std.mem.indexOf(u8, placed[0].reason, "no summary") != null);
+}
+
+test "a damaged summary entry is ignored, not an error" {
+    // Goal: advisory means a bad sample scores 0. Method: c's tree has a sample that is not hex.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("a", 4000, 8 * gib, true);
+    try fixture.node("c", 4000, 8 * gib, true);
+    const bad: records.NodeStore = .{
+        .node = "c",
+        .trees = &.{.{ .tree = image, .bytes = 1, .chunks = 1, .sample = "zz" }},
+    };
+    try fixture.put(.{ .agent = "c" }, records.node_store_key("c").slice(), bad);
+    try fixture.replica("web", "web-1", 100, gib);
+    try fixture.settle();
+    try fixture.expect_on("web-1", "a");
+}
+
+test "a summary whose sample outweighs its tree scores 0, and the scheduler does not panic" {
+    // Goal: MUST 1 of the C2 release review. A record whose tree is one chunk of 1 byte, sampled
+    // as one chunk of 4096 bytes, became the target sketch; scoring node a (no summary) against
+    // it summed 4096 sampled bytes over a 1-byte tree and failed an assertion, so the server
+    // crash-looped. Method: put that record on c and place a replica; it lands by the order
+    // without locality (a, the lower name) and the decision credits no bytes.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("a", 4000, 8 * gib, true);
+    try fixture.node("c", 4000, 8 * gib, true);
+    const lying: records.NodeStore = .{
+        .node = "c",
+        .trees = &.{.{
+            .tree = image,
+            .bytes = 1,
+            .chunks = 1,
+            .sample = "010000000000000000100000", // Key 1, 4096 bytes.
+        }},
+    };
+    try fixture.put(.{ .agent = "c" }, records.node_store_key("c").slice(), lying);
+    try fixture.replica("web", "web-1", 100, gib);
+    try fixture.settle();
+    try fixture.expect_on("web-1", "a");
+    const placed = try fixture.decisions("place_replica");
+    defer testing.allocator.free(placed);
+    try testing.expectEqual(@as(usize, 1), placed.len);
+    try testing.expectEqual(@as(u64, 0), placed[0].locality_bytes.?);
+}
+
+test "a summary that is newer or malformed is skipped, and placement goes on" {
+    // Goal: one node's bad advisory record must not stop every placement (finding 1 of the slice 5
+    // review). Method: a holds a record of version 2, b a truncated one, c a good one that holds
+    // the image; before the fix every pass failed with ZC-E0303 and nothing was placed. The two
+    // bad nodes score 0, so c still wins on locality.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("a", 4000, 8 * gib, true);
+    try fixture.node("b", 4000, 8 * gib, true);
+    try fixture.node("c", 4000, 8 * gib, true);
+    try fixture.put_raw(.{ .agent = "a" }, records.node_store_key("a").slice(),
+        \\{"v":2,"node":"a","trees":[],"new_member":1}
+    );
+    const torn = "{\"v\":1,\"node\":";
+    try fixture.put_raw(.{ .agent = "b" }, records.node_store_key("b").slice(), torn);
+    try fixture.summary("c", &.{image});
+    try fixture.replica("web", "web-1", 100, gib);
+    try fixture.settle();
+    try fixture.expect_on("web-1", "c");
+    const placed = try fixture.decisions("place_replica");
+    defer testing.allocator.free(placed);
+    try testing.expectEqual(@as(usize, 1), placed.len);
+    try testing.expect(placed[0].locality_bytes.? > 0);
+}
+
+test "a locality under 1 MiB is said in KiB, not as 0 MiB" {
+    // Goal: finding 13. Method: the summary advertises a tree of a few chunks of 256 KiB, so the
+    // node holds under 1 MiB of the image; the reason names KiB.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("a", 4000, 8 * gib, true);
+    try fixture.node("c", 4000, 8 * gib, true);
+    try fixture.put(.{ .agent = "c" }, records.node_store_key("c").slice(), small_tree);
+    try fixture.replica("web", "web-1", 100, gib);
+    try fixture.settle();
+    const placed = try fixture.decisions("place_replica");
+    defer testing.allocator.free(placed);
+    try testing.expect(std.mem.indexOf(u8, placed[0].reason, " 0 MiB of the image") == null);
+    try testing.expect(std.mem.indexOf(u8, placed[0].reason, " KiB of the image") != null);
+}
+
+const small_tree: records.NodeStore = .{
+    .node = "c",
+    .trees = &.{.{
+        .tree = image,
+        .bytes = 100 * 1024,
+        .chunks = 1,
+        // One chunk of 100 KiB: key 1, size 102400 (little endian, 12 bytes).
+        .sample = "010000000000000000900100",
+    }},
+};
+
+test "L1 does not fail a placement that lost a race to a change after its read" {
+    // Goal: L1 judges a placement by what the scheduler could have seen. Method: web-1 sits on
+    // `a`; a placement of web-2 onto `a` is a wrong one while `b` (no web) is unchanged since the
+    // decision's read revision, and a lost race once `b` has changed after it.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("a", 4000, 8 * gib, true);
+    try fixture.node("b", 4000, 8 * gib, true);
+    try fixture.replica("web", "web-1", 100, gib);
+    try fixture.settle();
+    try fixture.expect_on("web-1", "a");
+    try fixture.replica("web", "web-2", 100, gib);
+    const read_at = (try fixture.context().store.status(&fixture.diag)).revision;
+
+    const ctx = fixture.context();
+    const decision: records.Decision = .{
+        .id = "1761350000999-sc01-0099",
+        .at_ms = fixture.manual.ms,
+        .actor = "scheduler",
+        .action = "place_replica",
+        .subject = .{ .kind = .replica, .name = "web-2" },
+        .reason = "test",
+        .cause = .{ .kind = .desired, .key = "/replicas/web/web-2", .revision = read_at },
+        .locality_bytes = 0,
+        .node_store_revision = 0,
+        .read_revision = read_at,
+    };
+    const decision_bytes = try records.encode(fixture.keep.allocator(), decision, &fixture.diag);
+    const ops = [_]store.Op{
+        .{ .put = .{ .key = "/assigned/a/web-2", .value = "{}" } },
+        .{ .put = .{ .key = "/decisions/1761350000999-sc01-0099", .value = decision_bytes } },
+    };
+    var judged: u64 = 0;
+    const wrong = scheduler.placement_problem(&ctx, .{ .on_success = &ops }, &judged);
+    try testing.expect(wrong != null);
+    try testing.expect(std.mem.startsWith(u8, wrong.?, "L1:"));
+
+    // `b` changes after the read: the scheduler could not have seen it.
+    try fixture.status("b", .ready, 0);
+    const ctx_after = fixture.context();
+    judged = 0;
+    try testing.expectEqual(
+        @as(?[]const u8, null),
+        scheduler.placement_problem(&ctx_after, .{ .on_success = &ops }, &judged),
+    );
+}
+
+test "a run is placed with its decision, its assignment and its allocation" {
+    // Goal: B1's placement. Method: one node, one job; the assignment is an Assigned v2 for the
+    // run, the allocation counts it, the decision is `place_run` about the job, and a second pass
+    // writes nothing.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 4000, 8 * gib, true);
+    try fixture.job("train", 500, .pending);
+    try testing.expectEqual(@as(u32, 1), (try fixture.step()).acted);
+    try fixture.expect_on("train-job", "n1");
+    const allocation = try fixture.allocation("n1");
+    try testing.expectEqual(@as(u32, 500), allocation.allocated.cpu_millis);
+    try testing.expectEqual(@as(u32, 1), allocation.count);
+    const placed = try fixture.decisions("place_run");
+    defer testing.allocator.free(placed);
+    try testing.expectEqual(@as(usize, 1), placed.len);
+    try testing.expectEqual(records.SubjectKind.job, placed[0].subject.kind);
+    try testing.expectEqualStrings("train", placed[0].subject.name);
+    try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
+}
+
+test "a run whose job has a terminal status or a stop is not placed" {
+    // Goal: nothing is placed for a job that is over or stopping. Method: one run terminal, one
+    // with a stop; neither is assigned.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 4000, 8 * gib, true);
+    try fixture.job("done", 500, .failed);
+    try fixture.job("stopping", 500, .pending);
+    var buffer: [constants.job_run_id_bytes_max]u8 = undefined;
+    const stopping: records.JobRun = .{
+        .id = records.job_run_id(&buffer, "stopping"),
+        .job = "stopping",
+        .image = "b3:51aa9c03",
+        .command = &.{"true"},
+        .deadline_ms = 60 * 1000,
+        .start_by_ms = 1,
+        .created_at_ms = 1,
+        .stop = .{ .cause = .cancel, .at_ms = 2 },
+    };
+    try fixture.put(.job_controller, records.job_run_key("stopping").slice(), stopping);
+    try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
+    try fixture.expect_on("done-job", null);
+    try fixture.expect_on("stopping-job", null);
+}
+
+test "a run is released when its status is terminal or gone, and not before" {
+    // Goal: release. Method: place two runs; one job ends, the other's status and run go; the
+    // assignments and allocations follow, each with one `release_run` decision.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 4000, 8 * gib, true);
+    try fixture.job("a", 500, .pending);
+    try fixture.job("b", 500, .pending);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 2), (try fixture.allocation("n1")).count);
+    try fixture.job_state("a", .running);
+    try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
+    try fixture.job_state("a", .failed);
+    try testing.expectEqual(@as(u32, 1), (try fixture.step()).acted);
+    try fixture.expect_on("a-job", null);
+    try fixture.expect_on("b-job", "n1");
+    const ctx = fixture.context();
+    // A live job (its `/jobs/` record present) with its status, or its status and run, missing is
+    // the job controller's contradiction, not a job that is gone: the workload may be live, so its
+    // node stays booked (review of PR 112).
+    const record: records.Job = .{
+        .name = "b",
+        .image = "b3:51aa9c03",
+        .command = &.{"true"},
+        .deadline_ms = 60 * 1000,
+        .submit_by_ms = 1,
+        .created_at_ms = 1,
+    };
+    try fixture.put(.api, records.job_key("b").slice(), record);
+    const no_status = [_]store.Op{.{ .delete = records.job_status_key("b").slice() }};
+    _ = try writers.txn(ctx.store, .job_controller, .{ .on_success = &no_status }, &fixture.diag);
+    try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
+    try fixture.expect_on("b-job", "n1");
+    const no_run = [_]store.Op{.{ .delete = records.job_run_key("b").slice() }};
+    _ = try writers.txn(ctx.store, .job_controller, .{ .on_success = &no_run }, &fixture.diag);
+    try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
+    try fixture.expect_on("b-job", "n1");
+    try testing.expectEqual(@as(u32, 1), (try fixture.allocation("n1")).count);
+    // Only when the job itself is gone does the node come free.
+    const no_job = [_]store.Op{.{ .delete = records.job_key("b").slice() }};
+    _ = try writers.txn(ctx.store, .api, .{ .on_success = &no_job }, &fixture.diag);
+    try testing.expectEqual(@as(u32, 1), (try fixture.step()).acted);
+    try fixture.expect_on("b-job", null);
+    try testing.expectEqual(@as(u32, 0), (try fixture.allocation("n1")).count);
+    try testing.expectEqual(@as(usize, 2), try fixture.count("release_run"));
+    try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
+}
+
+test "a node takes at most jobs_per_node_max runs and the rest wait with a hold" {
+    // Goal: the per-node cap. Method: one roomy node, one run over the cap; the extra run is
+    // held once (`hold_pending` about the job) and placed after another ends.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    const total: u32 = constants.jobs_per_node_max + 1;
+    try fixture.node("n1", total * 10, total * gib, true);
+    var index: u32 = 0;
+    while (index < total) : (index += 1) {
+        var name: [8]u8 = undefined;
+        const text = try std.fmt.bufPrint(&name, "j{d}", .{index});
+        try fixture.job(text, 1, .pending);
+    }
+    try fixture.settle();
+    try testing.expectEqual(constants.jobs_per_node_max, (try fixture.allocation("n1")).count);
+    try testing.expectEqual(@as(usize, 1), try fixture.count("hold_pending"));
+    try fixture.job_state("j0", .exited);
+    try fixture.settle();
+    try testing.expectEqual(constants.jobs_per_node_max, (try fixture.allocation("n1")).count);
+    try testing.expectEqual(@as(usize, 1), try fixture.count("release_run"));
+}
+
+test "only a pending run is placed: a running job with no assignment is left alone" {
+    // Goal: RB-S12. Method: a job whose status says `running` (or `placed`) and whose assignment
+    // is gone is the job controller's to resolve; the scheduler must not give it a second node.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 4000, 8 * gib, true);
+    try fixture.job("ran", 500, .running);
+    try fixture.job("put", 500, .placed);
+    try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
+    try fixture.expect_on("ran-job", null);
+    try fixture.expect_on("put-job", null);
+}
+
+test "a run on a node with no record is released when its job is over" {
+    // Goal: RA-S2. Method: place a run, end its job, then delete the node's records; the
+    // assignment must go, not stay in `assigned_by` forever.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 4000, 8 * gib, true);
+    try fixture.job("a", 500, .pending);
+    try fixture.settle();
+    try fixture.expect_on("a-job", "n1");
+    try fixture.job_state("a", .failed);
+    const ctx = fixture.context();
+    const no_alloc = [_]store.Op{.{ .delete = records.allocation_key("n1").slice() }};
+    const no_status = [_]store.Op{.{ .delete = records.node_status_key("n1").slice() }};
+    _ = try writers.txn(ctx.store, .scheduler, .{ .on_success = &no_alloc }, &fixture.diag);
+    _ = try writers.txn(ctx.store, .node_controller, .{ .on_success = &no_status }, &fixture.diag);
+    const no_node = [_]store.Op{.{ .delete = records.node_key("n1").slice() }};
+    _ = try writers.txn(ctx.store, .{ .agent = "n1" }, .{ .on_success = &no_node }, &fixture.diag);
+    try testing.expectEqual(@as(u32, 1), (try fixture.step()).acted);
+    try fixture.expect_on("a-job", null);
+    try testing.expectEqual(@as(usize, 1), try fixture.count("release_run"));
+    try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
+}
+
+test "more than job_admitted_window_max ended statuses do not stop the scheduler" {
+    // Goal: RA-S4/RB-S6. Method: retention may lag, so ended statuses can outnumber the window;
+    // a pending job must still be placed, and the scan reads them in pages.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 4000, 8 * gib, true);
+    var index: u32 = 0;
+    while (index < constants.job_admitted_window_max + 10) : (index += 1) {
+        var name: [16]u8 = undefined;
+        const text = try std.fmt.bufPrint(&name, "e{d}", .{index});
+        try fixture.job_state(text, .exited);
+    }
+    try fixture.job("live", 500, .pending);
+    try testing.expectEqual(@as(u32, 1), (try fixture.step()).acted);
+    try fixture.expect_on("live-job", "n1");
+}
+
+/// `expect_on` without the printed diff: a teeth run fails on purpose and must stay quiet.
+fn lands(fixture: *Fixture, id: []const u8, want: ?[]const u8) !void {
+    const got = try fixture.assigned_to(id);
+    defer if (got) |g| testing.allocator.free(g);
+    const same = if (got) |g| (if (want) |w| std.mem.eql(u8, g, w) else false) else want == null;
+    if (!same) return error.WrongPlacement;
+}
+
+const acme: []const records.Pair = &.{.{ "tenant", "acme" }};
+
+/// Runs `body` with the filter intact, then again with `weakened`, expecting `body` to fail:
+/// the teeth of a placement test.
+fn with_teeth(weakened: scheduler.TestWeakened, body: *const fn () anyerror!void) !void {
+    try testing.expect(scheduler.test_weakened_none());
+    try body();
+    scheduler.weaken_for_test(weakened);
+    defer scheduler.weaken_for_test(.none);
+    if (body()) |_| return error.TeethMissed else |err| {
+        if (err != error.WrongPlacement) return err;
+    }
+}
+
+fn require_matches() !void {
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("a-plain", 4000, 8 * gib, true);
+    try fixture.node_labelled("z-acme", 4000, 8 * gib, true, &.{"tenant=acme"});
+    try fixture.job_requiring("train", 500, .pending, acme);
+    try fixture.settle();
+    try lands(&fixture, "train-job", "z-acme");
+}
+
+test "placement.require: a job lands on the node that carries every pair" {
+    try with_teeth(.no_filter, require_matches);
+}
+
+fn require_matches_none() !void {
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("plain", 4000, 8 * gib, true);
+    try fixture.node_labelled("other", 4000, 8 * gib, true, &.{"tenant=beta"});
+    try fixture.job_requiring("train", 500, .pending, acme);
+    try fixture.settle();
+    try lands(&fixture, "train-job", null);
+    const held = try fixture.decisions("hold_pending");
+    defer testing.allocator.free(held);
+    if (held.len != 1) return error.WrongPlacement;
+    const reason = held[0].reason;
+    if (std.mem.indexOf(u8, reason, "no ready node has tenant=acme") == null) {
+        return error.WrongPlacement;
+    }
+}
+
+test "placement.require: no node matches, so the job stays pending with the reason" {
+    try with_teeth(.no_filter, require_matches_none);
+}
+
+fn exclusive_own_tenant() !void {
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node_labelled("x1", 4000, 8 * gib, true, &.{ "tenant=acme", "exclusive=tenant" });
+    try fixture.job_requiring("train", 500, .pending, acme);
+    try fixture.settle();
+    try lands(&fixture, "train-job", "x1");
+}
+
+test "an exclusive node takes a job of its own tenant" {
+    // Its teeth are the three refusals below: a filter that refused everything would fail here.
+    try exclusive_own_tenant();
+}
+
+fn exclusive_no_require() !void {
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node_labelled("x1", 4000, 8 * gib, true, &.{ "tenant=acme", "exclusive=tenant" });
+    try fixture.job("train", 500, .pending);
+    try fixture.settle();
+    try lands(&fixture, "train-job", null);
+    const held = try fixture.decisions("hold_pending");
+    defer testing.allocator.free(held);
+    const reason = held[0].reason;
+    if (std.mem.indexOf(u8, reason, "x1 is exclusive to tenant=acme") == null) {
+        return error.WrongPlacement;
+    }
+}
+
+test "an exclusive node refuses a job with no require" {
+    try with_teeth(.no_exclusive, exclusive_no_require);
+}
+
+fn exclusive_other_tenant() !void {
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    const labels: []const []const u8 = &.{ "tenant=acme", "tier=gold", "exclusive=tenant" };
+    try fixture.node_labelled("x1", 4000, 8 * gib, true, labels);
+    try fixture.job_requiring("train", 500, .pending, &.{.{ "tier", "gold" }});
+    try fixture.settle();
+    try lands(&fixture, "train-job", null);
+}
+
+test "an exclusive node refuses a job whose require omits the exclusive key" {
+    try with_teeth(.no_exclusive, exclusive_other_tenant);
+}
+
+fn exclusive_foreign_tenant() !void {
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node_labelled("x1", 4000, 8 * gib, true, &.{ "tenant=acme", "exclusive=tenant" });
+    try fixture.job_requiring("train", 500, .pending, &.{.{ "tenant", "beta" }});
+    try fixture.settle();
+    try lands(&fixture, "train-job", null);
+    const held = try fixture.decisions("hold_pending");
+    defer testing.allocator.free(held);
+    // The require check comes first: the reason names the missing label, not the exclusivity.
+    if (std.mem.indexOf(u8, held[0].reason, "no ready node has tenant=beta") == null) {
+        return error.WrongPlacement;
+    }
+}
+
+test "an exclusive node refuses a job of another tenant" {
+    try with_teeth(.no_filter, exclusive_foreign_tenant);
+}
+
+fn service_avoids_exclusive() !void {
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node_labelled("x1", 4000, 8 * gib, true, &.{ "tenant=acme", "exclusive=tenant" });
+    try fixture.replica("web", "web-1", 100, gib);
+    try fixture.settle();
+    try lands(&fixture, "web-1", null);
+    try fixture.node("plain", 4000, 8 * gib, true);
+    try fixture.settle();
+    try lands(&fixture, "web-1", "plain");
+}
+
+test "a service never lands on an exclusive node" {
+    try with_teeth(.no_exclusive, service_avoids_exclusive);
+}
