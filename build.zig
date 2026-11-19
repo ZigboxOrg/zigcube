@@ -2722,6 +2722,20 @@ const c1_regressions = [_][]const []const u8{
         "--strong",      "--lease-ttl-ms=8221", "--replicas-pct=300",
         "--heal-at=129",
     },
+    // J12 on main 6f52fcb (an agent bug): an operator reinstall (the tenant world's relabel, a
+    // host crash that loses the disk) landed between node1's committed claim of jb-1 and its
+    // trust check, and the restarted agent ended the run `lost` (ZC-E0522) instead of `refused`.
+    // A guard: both lines fail without `refused_unstarted` (`agent_jobs.zig`); so does the unit
+    // test "a claim whose start record and container were lost is refused ..."
+    // (docs/decisions/2026-11-19-j12-refusal-after-a-lost-disk.md).
+    &.{
+        "7485507574660471565", "100",      "0",         "--c1",
+        "--strong",            "--signed", "--tenants", "--profile=mixed",
+    },
+    &.{
+        "7485507574660471565", "15",       "0",         "--c1",
+        "--strong",            "--signed", "--tenants", "--heal-at=84",
+    },
 };
 
 /// `zig build sim-c1-regressions`: replays `c1_regressions` with the shipped code (ReleaseSafe).
