@@ -198,6 +198,23 @@ kept short: what assumptions turned out to be off base, what each cost, and what
 of it. It goes in `docs/retros/<version>.md` (one file per release), and any rule it changes lands
 in this file or `docs/decisions/` in the same PR.
 
+## Version control with GitButler (owner, 2026-11-19)
+
+- Use GitButler's CLI, `but`, for status, diffs, branching, committing, pushing and history
+  edits; plain `git` stays fine for reading history (`log`, `blame`, `show`). Read the skill in
+  `.claude/skills/gitbutler/` before guessing a flag. If `but` is missing, install it with
+  `curl -fsSL https://gitbutler.com/install.sh | sh` (the installer checks the download's
+  signature) and refresh the skill with `but skill install --path .claude/skills/gitbutler`.
+- Several agents may work in one repository. Do not move, amend, squash, discard, commit or push
+  another agent's work unless the owner or supervisor asks.
+- Work on one GitButler branch per session, the branch you were given, and commit only that
+  session's changes to it.
+- Amend a small follow-up fix into the unpublished local commit it belongs to rather than adding
+  a fixup commit. Ask before rewriting history that was pushed or reviewed.
+- Split unrelated changes into separate commits, by hunk when they share a file; keep tests with
+  the behaviour they verify.
+- Pushing and pull requests follow "Git" below.
+
 ## Git
 
 - Develop on the branch you were given and commit in small, meaningful steps, signed off (`git commit -s`, DCO). Licence is Apache 2.0; there is no CLA.
