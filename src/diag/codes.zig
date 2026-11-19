@@ -2083,7 +2083,7 @@ pub const registry = [_]Entry{
         \\not something you did.
         \\
         \\A diagnostic bundle is saved for every bug. Review its manifest, then
-        \\attach it to a report at https://github.com/Zigbox/zigcube/issues/new.
+        \\attach it to a report at https://github.com/ZigboxOrg/zigcube/issues/new.
         ,
     },
     .{
@@ -2098,7 +2098,7 @@ pub const registry = [_]Entry{
         \\zcube get.
         \\
         \\A diagnostic bundle is saved for every bug. Review its manifest, then
-        \\attach it to a report at https://github.com/Zigbox/zigcube/issues/new.
+        \\attach it to a report at https://github.com/ZigboxOrg/zigcube/issues/new.
         ,
     },
     .{
@@ -2117,7 +2117,7 @@ pub const registry = [_]Entry{
         \\
         \\Run zcube check allocations to see both totals. If the rebuilt one is
         \\right, zcube repair allocations <node> --confirm writes it. Please
-        \\report it at https://github.com/Zigbox/zigcube/issues/new with the
+        \\report it at https://github.com/ZigboxOrg/zigcube/issues/new with the
         \\output of zcube why node <node>.
         ,
     },
@@ -2133,7 +2133,7 @@ pub const registry = [_]Entry{
         \\did.
         \\
         \\A diagnostic bundle is saved for every bug. Review its manifest, then
-        \\attach it to a report at https://github.com/Zigbox/zigcube/issues/new.
+        \\attach it to a report at https://github.com/ZigboxOrg/zigcube/issues/new.
         ,
     },
     .{
@@ -2149,7 +2149,7 @@ pub const registry = [_]Entry{
         \\not a memory limit: raising limits changes nothing. The job is not started.
         \\
         \\A diagnostic bundle is saved for every bug. Review its manifest, then
-        \\attach it to a report at https://github.com/Zigbox/zigcube/issues/new.
+        \\attach it to a report at https://github.com/ZigboxOrg/zigcube/issues/new.
         ,
     },
 };

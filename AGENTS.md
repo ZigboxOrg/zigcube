@@ -1,6 +1,6 @@
 # Zigcube: operating instructions
 
-Zigcube is the orchestrator for Zigbox workloads, written in Zig. The coding handoff for C0 and C1 is [HANDOFF.md](HANDOFF.md); the wider design is Part II of Zigbox's `docs/SPEC.md` (repo `Zigbox/zigbox`), a snapshot of the live design doc (https://claude.ai/artifact/6D9js8mxSLYmfuZe3rQ26w). If they disagree, the live doc wins: stop and report the conflict rather than picking one.
+Zigcube is the orchestrator for Zigbox workloads, written in Zig. The coding handoff for C0 and C1 is [HANDOFF.md](HANDOFF.md); the wider design is Part II of Zigbox's `docs/SPEC.md` (repo `ZigboxOrg/zigbox`), a snapshot of the live design doc (https://claude.ai/artifact/6D9js8mxSLYmfuZe3rQ26w). If they disagree, the live doc wins: stop and report the conflict rather than picking one.
 
 ## Rules
 
@@ -28,7 +28,7 @@ Zigcube is the orchestrator for Zigbox workloads, written in Zig. The coding han
 - Postgres 16 is installed without the OrioleDB extension, so the plain-heap schema path is what runs here. `initdb` refuses root: run it as `postgres` in a directory that user owns, e.g. `su postgres -c "initdb -D $DIR -A trust -U zcube"`.
 - SQLite 3 headers and the library are present.
 - Zig downloads from https://ziglang.org/download/ work through the proxy.
-- Zig's own package fetch does not work (`ConnectionResetByPeer`), and the proxy refuses `curl` of the pinned tarball (checked 2026-10-31). What works: `add_repo` for `Zigbox/zigbox` (read), `git clone --depth 1` it, `git fetch --depth=1 origin <commit from build.zig.zon>`, then `mkdir -p zig-pkg/<hash> && git archive <commit> | tar -x -C zig-pkg/<hash>`, with `<hash>` the `.hash` in `build.zig.zon`.
+- Zig's own package fetch does not work (`ConnectionResetByPeer`). What works (checked 2026-11-19): `curl -sSfL -o zb.tar.gz <the .url in build.zig.zon>`, then `zig fetch ./zb.tar.gz`, which prints the hash and fills `ZIG_GLOBAL_CACHE_DIR`. Without network to GitHub: `add_repo` for `ZigboxOrg/zigbox` (read), `git clone --depth 1` it, `git fetch --depth=1 origin <commit from build.zig.zon>`, then `mkdir -p zig-pkg/<hash> && git archive <commit> | tar -x -C zig-pkg/<hash>`, with `<hash>` the `.hash` in `build.zig.zon`.
 - A fresh container may lack Zig (run `.claude/hooks/session-start.sh` if `zig` is not on PATH) and has no `tester` user: `useradd -m tester` before `zig build check`.
 
 ## Commands

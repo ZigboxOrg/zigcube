@@ -35,7 +35,7 @@ pub const product: Product = .{
     .prefix = "ZC-",
     .command = "zcube",
     .bundle_hint = "zcube bundle --last",
-    .report_url = "https://github.com/Zigbox/zigcube/issues/new",
+    .report_url = "https://github.com/ZigboxOrg/zigcube/issues/new",
     .docs_url_base = "https://zigbox.github.io/zigcube/errors/",
 };
 

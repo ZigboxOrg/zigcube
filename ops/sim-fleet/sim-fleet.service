@@ -1,6 +1,6 @@
 [Unit]
 Description=Zigcube simulation fleet (sim-cluster, sim-c1 and sim-swarm on fresh seeds at the tip of main and soaked branches)
-Documentation=https://github.com/Zigbox/zigcube/blob/main/ops/sim-fleet/README.md
+Documentation=https://github.com/ZigboxOrg/zigcube/blob/main/ops/sim-fleet/README.md
 After=network-online.target
 Wants=network-online.target
 
