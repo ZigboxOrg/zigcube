@@ -7,6 +7,6 @@ bug[ZC-B0005]: a job's run record is larger than a run may be
          <state>/zcube/bundles/1970-01-01T00-00-00Z-last.tar.gz
   cause  the run train-7-job encodes as 20480 bytes, over the 16384 bytes a run
          may take
-  report https://github.com/Zigbox/zigcube/issues/new
+  report https://github.com/ZigboxOrg/zigcube/issues/new
   more   zcube explain B0005
   docs   https://zigbox.github.io/zigcube/errors/B0005.html

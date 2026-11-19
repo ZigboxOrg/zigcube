@@ -761,34 +761,34 @@ export const ZC_CODES = [
     "severity": "bug",
     "blame": "internal",
     "summary": "zcube hit an internal error",
-    "explanation": "An invariant that zcube relies on did not hold. This is a bug in zcube,\nnot something you did.\n\nA diagnostic bundle is saved for every bug. Review its manifest, then\nattach it to a report at https://github.com/Zigbox/zigcube/issues/new."
+    "explanation": "An invariant that zcube relies on did not hold. This is a bug in zcube,\nnot something you did.\n\nA diagnostic bundle is saved for every bug. Review its manifest, then\nattach it to a report at https://github.com/ZigboxOrg/zigcube/issues/new."
   },
   {
     "code": "ZC-B0002",
     "severity": "bug",
     "blame": "internal",
     "summary": "zcube failed in a way it should not",
-    "explanation": "A step of zcube stopped with an error that its own code is supposed to\nhandle before it reaches you. This is a bug in zcube, not something you\ndid, and the command may or may not have taken effect: check with\nzcube get.\n\nA diagnostic bundle is saved for every bug. Review its manifest, then\nattach it to a report at https://github.com/Zigbox/zigcube/issues/new."
+    "explanation": "A step of zcube stopped with an error that its own code is supposed to\nhandle before it reaches you. This is a bug in zcube, not something you\ndid, and the command may or may not have taken effect: check with\nzcube get.\n\nA diagnostic bundle is saved for every bug. Review its manifest, then\nattach it to a report at https://github.com/ZigboxOrg/zigcube/issues/new."
   },
   {
     "code": "ZC-B0003",
     "severity": "bug",
     "blame": "internal",
     "summary": "allocation accounting disagrees with assignments",
-    "explanation": "The allocation auditor rebuilt a node's allocation from its assignments\nand found a total that differs from the node's allocation record. Every\ntransaction that places or releases a replica updates that record, so a\ndifference can only come from a defect in zcube, never from the\nenvironment. The auditor records a finding and never repairs it: while\nthe finding is open the scheduler places nothing on the node, but it\nstill releases.\n\nRun zcube check allocations to see both totals. If the rebuilt one is\nright, zcube repair allocations <node> --confirm writes it. Please\nreport it at https://github.com/Zigbox/zigcube/issues/new with the\noutput of zcube why node <node>."
+    "explanation": "The allocation auditor rebuilt a node's allocation from its assignments\nand found a total that differs from the node's allocation record. Every\ntransaction that places or releases a replica updates that record, so a\ndifference can only come from a defect in zcube, never from the\nenvironment. The auditor records a finding and never repairs it: while\nthe finding is open the scheduler places nothing on the node, but it\nstill releases.\n\nRun zcube check allocations to see both totals. If the rebuilt one is\nright, zcube repair allocations <node> --confirm writes it. Please\nreport it at https://github.com/ZigboxOrg/zigcube/issues/new with the\noutput of zcube why node <node>."
   },
   {
     "code": "ZC-B0004",
     "severity": "bug",
     "blame": "internal",
     "summary": "zcube could not map how a job ended",
-    "explanation": "The job controller read an end of a run (an exit, a stop cause and what the\nagent reported) that none of its rules covers. The job is left as it was;\nnothing was ended or started. This is a bug in zcube, not something you\ndid.\n\nA diagnostic bundle is saved for every bug. Review its manifest, then\nattach it to a report at https://github.com/Zigbox/zigcube/issues/new."
+    "explanation": "The job controller read an end of a run (an exit, a stop cause and what the\nagent reported) that none of its rules covers. The job is left as it was;\nnothing was ended or started. This is a bug in zcube, not something you\ndid.\n\nA diagnostic bundle is saved for every bug. Review its manifest, then\nattach it to a report at https://github.com/ZigboxOrg/zigcube/issues/new."
   },
   {
     "code": "ZC-B0005",
     "severity": "bug",
     "blame": "internal",
     "summary": "a job's run record is larger than a run may be",
-    "explanation": "The record of a job's run, once encoded, is larger than the bound on one\nrun (16 KiB). The API checks a job's words against their bounds before it\naccepts the job, so a job that reaches this point got past a check it\nshould have failed. This is a bug in zcube, not something you did, and\nnot a memory limit: raising limits changes nothing. The job is not started.\n\nA diagnostic bundle is saved for every bug. Review its manifest, then\nattach it to a report at https://github.com/Zigbox/zigcube/issues/new."
+    "explanation": "The record of a job's run, once encoded, is larger than the bound on one\nrun (16 KiB). The API checks a job's words against their bounds before it\naccepts the job, so a job that reaches this point got past a check it\nshould have failed. This is a bug in zcube, not something you did, and\nnot a memory limit: raising limits changes nothing. The job is not started.\n\nA diagnostic bundle is saved for every bug. Review its manifest, then\nattach it to a report at https://github.com/ZigboxOrg/zigcube/issues/new."
   }
 ];

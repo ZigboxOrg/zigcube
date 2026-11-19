@@ -77,7 +77,7 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <dl class="facts"><div><dt>Kind</dt><dd>bug</dd></div><div><dt>Blame</dt><dd>internal</dd></div><div><dt>Exit code</dt><dd>70</dd></div></dl>
 <h2>What it means</h2>
 <p>The allocation auditor rebuilt a node's allocation from its assignments and found a total that differs from the node's allocation record. Every transaction that places or releases a replica updates that record, so a difference can only come from a defect in zcube, never from the environment. The auditor records a finding and never repairs it: while the finding is open the scheduler places nothing on the node, but it still releases.</p>
-<p>Run zcube check allocations to see both totals. If the rebuilt one is right, zcube repair allocations &lt;node&gt; --confirm writes it. Please report it at https://github.com/Zigbox/zigcube/issues/new with the output of zcube why node &lt;node&gt;.</p>
+<p>Run zcube check allocations to see both totals. If the rebuilt one is right, zcube repair allocations &lt;node&gt; --confirm writes it. Please report it at https://github.com/ZigboxOrg/zigcube/issues/new with the output of zcube why node &lt;node&gt;.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
 <pre class="term">zcube explain B0003</pre>

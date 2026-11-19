@@ -27,7 +27,7 @@ main() {
         : "${SIM_FLEET_REPO_DIR:=$SIM_FLEET_HOME/zigcube}"
         : "${SIM_FLEET_STATE_DIR:=$SIM_FLEET_HOME/state}"
     fi
-    : "${SIM_FLEET_REMOTE:=https://github.com/Zigbox/zigcube}"
+    : "${SIM_FLEET_REMOTE:=https://github.com/ZigboxOrg/zigcube}"
     : "${SIM_FLEET_GH_REPO:=Zigbox/zigcube}"
     : "${SIM_FLEET_BRANCH:=main}"
     # Branches soaked besides SIM_FLEET_BRANCH (a release branch before its tag), space-separated,

@@ -161,7 +161,7 @@ On a fresh host, as root (the exact steps for a fresh host are also in the C1-9 
 
 ```
 cd /root
-git clone https://github.com/Zigbox/zigcube
+git clone https://github.com/ZigboxOrg/zigcube
 sh zigcube/ops/sim-fleet/setup.sh --token-file /root/github/token
 grep SIM_FLEET_TRACKER /etc/sim-fleet/fleet.env      # SIM_FLEET_TRACKER=29
 journalctl -u sim-fleet -f

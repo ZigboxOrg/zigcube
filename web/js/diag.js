@@ -23,7 +23,7 @@ export function docsUrl(code) {
   return `${base}/errors/${shortCode(code)}.html`;
 }
 /** Where to report a bug: the tracker of the product whose registry the code belongs to. */
-export function reportUrl(code) { return code.startsWith("ZBX-") ? "https://github.com/Zigbox/zigbox/issues/new" : "https://github.com/Zigbox/zigcube/issues/new"; }
+export function reportUrl(code) { return code.startsWith("ZBX-") ? "https://github.com/ZigboxOrg/zigbox/issues/new" : "https://github.com/ZigboxOrg/zigcube/issues/new"; }
 export function explainCommand(code) { return `${product(code)} explain ${shortCode(code)}`; }
 
 /** Fills the optional fields so renderers need no guards. */

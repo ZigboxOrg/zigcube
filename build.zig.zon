@@ -9,8 +9,8 @@
         // plus `vm/` in the package's paths; the `zigbox_vm` module, which C2's real smoke uses):
         // lifecycle (list, adopt, stop), image runs, pull as a library call, limits and exit reasons.
         .zigbox = .{
-            .url = "https://github.com/Zigbox/zigbox/archive/82132cfd19838ffe6f2052be414d6a517f08d754.tar.gz",
-            .hash = "zigbox-0.5.2-RBMWEAW0ywAuRx3krVAbWARTYrh6GImYtGPKdg7_03bY",
+            .url = "https://github.com/ZigboxOrg/zigbox/archive/f33343404f5c3444ab47dca35710d1e68486a7d6.tar.gz",
+            .hash = "zigbox-0.5.3-RBMWEAR44gCFIpKaXkhpInlP-zhWPItAmtwDXZQHFsPl",
         },
     },
     .paths = .{

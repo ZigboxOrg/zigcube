@@ -17,7 +17,7 @@ cd /
 # Keep in step with build.zig.zon (minimum_zig_version), CI and .claude/hooks/session-start.sh.
 ZIG_VERSION=0.17.0
 ZIG_SHA256=1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
-REMOTE=${SIM_FLEET_REMOTE:-https://github.com/Zigbox/zigcube}
+REMOTE=${SIM_FLEET_REMOTE:-https://github.com/ZigboxOrg/zigcube}
 HOME_DIR=/var/lib/sim-fleet
 ZIG_DIR=/opt/zig-x86_64-linux-$ZIG_VERSION
 
