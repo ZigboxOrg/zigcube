@@ -623,9 +623,10 @@ fn desired_total(world: *World) ?u32 {
     var total: u32 = 0;
     for (list.items) |*service| {
         total += service.rec.replicas;
-        // A halted rollout keeps its surge (C3): the old replicas run beside the new.
-        const stopped_short = rollout_controller.halted(&ctx, service) catch return null;
-        if (stopped_short) total += service.rec.rollout_policy().max_surge;
+        // A rollout under way, or halted, keeps its surge (C3): the old replicas run beside the
+        // new for as long as it takes, and a rollout can take longer than `excess_ms_max`.
+        const surging = rollout_controller.surging(&ctx, service) catch return null;
+        if (surging) total += service.rec.rollout_policy().max_surge;
     }
     return total;
 }

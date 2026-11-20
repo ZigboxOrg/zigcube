@@ -961,6 +961,17 @@ pub fn halted(ctx: *const Context, service: *const Entry(records.Service)) Error
     return rollout.rec.phase == .failed or rollout.rec.phase == .paused;
 }
 
+/// Whether `service`'s rollout of its current generation has not completed: progressing, paused,
+/// rolling back or failed. Its replicas may then number up to `max_surge` more than it asks for
+/// (R1 bounds them), for as long as the rollout takes, which can be longer than any fixed time.
+pub fn surging(ctx: *const Context, service: *const Entry(records.Service)) Error!bool {
+    const key = records.rollout_key(service.rec.name);
+    const rollout = try get_entry(records.Rollout, ctx, key) orelse return false;
+    if (!records.rollout_of(&rollout.rec, service.kv.create_revision)) return false;
+    if (rollout.rec.to != service.rec.generation) return false;
+    return rollout.rec.phase != .complete;
+}
+
 // ---- Pause and resume (the API's handlers, C3 slice 11) --------------------------------------
 
 pub const Request = enum { pause, resume_rollout };
