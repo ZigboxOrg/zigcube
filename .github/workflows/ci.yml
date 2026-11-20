@@ -862,7 +862,13 @@ jobs:
           mkdir -p "${RUNNER_TEMP}/dist"
           tar -xzf zig-out/dist/*.tar.gz -C "${RUNNER_TEMP}/dist"
           top=$(echo "${RUNNER_TEMP}"/dist/zigcube-*)
-          for f in "${top}"/share/jepsen/*; do cmp "${f}" "ops/jepsen/$(basename "${f}")"; done
+          # fencing-bounds.edn is written by the build from src/constants.zig; every other file
+          # is a copy of ops/jepsen/.
+          for f in "${top}"/share/jepsen/*; do
+            [ "$(basename "${f}")" = fencing-bounds.edn ] && continue
+            cmp "${f}" "ops/jepsen/$(basename "${f}")"
+          done
+          grep -q ':clock-step-max-ms ' "${top}/share/jepsen/fencing-bounds.edn"
           echo "TOP=${top}" >> "${GITHUB_ENV}"
       - name: postgres.sh and the recipe on a Postgres pair (as root)
         run: |
