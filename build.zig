@@ -2325,12 +2325,14 @@ const c1_teeth_roots = [_]struct {
         // #243: retention deletes a job whose run is still assigned and the job controller
         // takes any incarnation's assignment; a job created again under the name meets it.
         // The reuse world holds the scheduler's releases around a jump (`reuse_runs_held`).
-        // Sparse: 7 of seeds 1..60 fail at 300 operations, `--c1` (2026-11-18), J2 at 33 36 39
-        // 44 57 59 and J4 at 40; CI runs 30..60 and stops at 33. The fleet's 180 fresh seeds at
-        // a rate of 0.117 miss a working check with probability 0.883^180 = 2e-10.
+        // Sparse: 28 of seeds 1..200 fail at 300 operations, `--c1` (2026-11-20, C3 merged),
+        // J2 but for J4 at 141 and 200; CI runs 30..60 and stops at 33, and runs seed 141 for
+        // J4 (40 until C3's merge shifted the world;
+        // docs/decisions/2026-11-20-c3-merge-tooth-seeds.md). The fleet's 180 fresh seeds at a
+        // rate of 0.14 miss a working check with probability 0.86^180 = 1.6e-12.
         .symptom = "J2|J4",
         .canary_seeds = 180,
-        .also_seeds = &.{40},
+        .also_seeds = &.{141},
         .first_seed = 30,
         .seeds = 60,
         .ops = 300,
@@ -2450,7 +2452,7 @@ const canary_symptom_swarm_teeth = "a chunk with wrong bytes was accepted";
 /// `zig build sim-c1 [-Dseed=N] [-Dops=N] [-Dnodes=N]`: the cluster simulation with the
 /// per-revision invariant checks (`Options.c1`), natively and as WebAssembly, the reports
 /// compared byte for byte. `sim-c1-exe` installs the native runner (`sim_cluster --c1`);
-/// `sim-c1-teeth` runs 34 negative tests (`sim-c3-teeth` the other 6), each of which passes only
+/// `sim-c1-teeth` runs 36 negative tests (`sim-c3-teeth` the other 6), each of which passes only
 /// if its check fires.
 fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     const exe = b.addExecutable(.{
