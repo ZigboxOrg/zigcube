@@ -1217,13 +1217,18 @@ test "stopping a replica mid-fetch leaves no process of the fetch running" {
     const handle = runtime.Handle.init("web-1");
     try testing.expect((try rt.inspect(handle, &diag)) == .starting);
     try rt.stop(handle, 0, &diag);
-    // Before the leader is reaped: a wait for it would also outwait the fetch's 30 s.
+    // Before the leader is reaped: a wait for it would also outwait the fetch's 30 s. SIGKILL is
+    // asynchronous (`kill_all` never waits), so the leader may still be exiting when the fetch is
+    // gone: wait for both under the one bound, then assert both.
+    const leader_pid: i32 = leader.id.?;
     var tries: u32 = 0;
-    while (process_session.alive(testing.io, fetch) and tries < 250) : (tries += 1) {
+    while ((process_session.alive(testing.io, fetch) or
+        process_session.alive(testing.io, leader_pid)) and tries < 250) : (tries += 1)
+    {
         testing.io.sleep(.fromMilliseconds(20), .awake) catch {}; // Cancelation: one try less.
     }
     try testing.expect(!process_session.alive(testing.io, fetch));
-    try testing.expect(!process_session.alive(testing.io, leader.id.?));
+    try testing.expect(!process_session.alive(testing.io, leader_pid));
 }
 
 test "stopping a start-window container with no supervisor file signals nothing" {
