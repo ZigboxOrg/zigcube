@@ -694,6 +694,12 @@ fn leave_claim(rig: *Rig, epoch: store.Revision, tenure: u64) !void {
     const record: agent_jobs.StartRecord = .{ .run = run_id, .epoch = epoch, .phase = .claiming };
     const bytes = try std.json.Stringify.valueAlloc(rig.world.fresh_arena(), record, .{});
     try rig.world.files.interface().put_atomic(name, bytes);
+    try leave_claimed_observation(rig, epoch, tenure);
+}
+
+/// The agent's `claimed` observation in the store, and nothing on the node: the state a node
+/// that lost its disk after its claim committed comes back to.
+fn leave_claimed_observation(rig: *Rig, epoch: store.Revision, tenure: u64) !void {
     const claimed: records.JobObserved = .{
         .run = run_id,
         .node = sim_world.node_name,
@@ -2435,6 +2441,34 @@ test "a claim the agent did not learn is judged before it is taken up" {
     for (0..3) |_| signed.rig.step();
     try testing.expectEqual(@as(u32, 1), starts_seen);
     try testing.expect(signed.rig.running());
+}
+
+test "a claim whose start record and container were lost is refused when the policy refuses it" {
+    // Goal: J12 after a reinstall (seed 7485507574660471565, `--c1 --signed --tenants`). The
+    // claim committed, then the node lost its disk, state directory and containers before it
+    // judged the run. The policy alone decides a refusal, and a run it refuses was never
+    // started, so it ends `refused`, not `lost` (ZC-E0522). Method: a `claimed` observation and
+    // nothing on the node; an unsigned run is refused, a trusted one still ends `lost`.
+    var unsigned: TrustCase = undefined;
+    try unsigned.start();
+    defer unsigned.stop();
+    const epoch = try unsigned.assign_unsigned(false);
+    try leave_claimed_observation(&unsigned.rig, epoch, unsigned.rig.world.agent.tenure);
+    for (0..3) |_| unsigned.rig.step();
+    try expect_refused(&unsigned);
+
+    var signed: TrustCase = undefined;
+    try signed.start();
+    defer signed.stop();
+    const line = try signed.sign(1);
+    defer testing.allocator.free(line);
+    const again = try signed.assign_signed(&.{line}, "");
+    try leave_claimed_observation(&signed.rig, again, signed.rig.world.agent.tenure);
+    for (0..3) |_| signed.rig.step();
+    try testing.expectEqual(@as(u32, 0), starts_seen);
+    const seen = (try signed.rig.observed()).?;
+    try testing.expectEqual(records.ExitKind.lost, seen.exit.?.kind);
+    try expect_code(seen, "ZC-E0522");
 }
 
 test "an agent with no trust policy checks nothing" {

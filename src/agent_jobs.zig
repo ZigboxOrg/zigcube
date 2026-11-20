@@ -533,8 +533,31 @@ const Work = struct {
                 .stopped => |reason| return work.exited_unrecorded(subject, reason, seen),
                 .starting, .running => unreachable, // `is_running` was false.
             }
+        } else if (try work.refused_unstarted(subject, seen)) {
+            return;
         }
         try work.lost(subject, null, seen, .missing);
+    }
+
+    /// A claim and nothing else: the node lost its disk, state directory and containers after
+    /// the claim committed (a reinstall) and before it reported more. `begin` judges the node's
+    /// policy before anything starts, so a run the policy refuses was never started here, and it
+    /// ends `refused`, not `lost` (J12; seed 7485507574660471565, docs/decisions/
+    /// 2026-11-19-j12-refusal-after-a-lost-disk.md). A `running` report proves a start, under a
+    /// policy that admitted it then: that run is `lost` whatever the policy says now.
+    fn refused_unstarted(
+        work: *Work,
+        subject: Subject,
+        seen: ?*const records.JobObserved,
+    ) Error!bool {
+        const held = seen orelse return false;
+        if (held.status != .claimed) return false;
+        const entry = work.run_of(subject.id) orelse return false;
+        const refusal = try work.trust_refusal(&entry.rec) orelse return false;
+        // Under the run's current assignment, like `lost`.
+        const epoch = report_epoch(subject, null) orelse return true;
+        try work.report_refused(subject.id, epoch, refusal);
+        return true;
     }
 
     /// A stopped container and no start record: its exit is the answer, with no stop cause.

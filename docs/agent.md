@@ -351,7 +351,11 @@ is one pass of `reconcile`, after the replicas. It wants a run when the node hol
    nothing. The server's `{applied:false}` is a result, not an error.
 2. **A run is started at most once.** A claim in the store without a start record, or a `claimed`
    record whose container is gone, ends the run `lost`; the agent never starts it again. A record
-   still `claiming` after a restart claims again (the compare says whether it won).
+   still `claiming` after a restart claims again (the compare says whether it won). The one
+   exception is a run the node's trust policy refuses: the policy is judged before anything
+   starts, so a claim with no record, no container and no `running` report (the disk lost after
+   the claim, as at a reinstall) ends `refused`, not `lost`
+   (decisions/2026-11-19-j12-refusal-after-a-lost-disk.md).
 3. **The deadline** is `deadline_mono_ms` on the boot clock, written before the start and compared
    only under the same `boot_id`; after a reboot the container is gone and the run ends `lost`, not
    `deadline`. The agent enforces it without the server: every step, before any call to
