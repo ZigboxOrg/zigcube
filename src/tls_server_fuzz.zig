@@ -131,6 +131,8 @@ pub fn mutate(random: std.Random, kind: Mutation, bytes: []const u8, out: []u8) 
             return bytes.len;
         },
         .truncate => {
+            // An empty input is legitimate (a client that omits its Finished sends nothing).
+            if (bytes.len == 0) return 0;
             const length = random.uintLessThan(usize, bytes.len);
             @memcpy(out[0..length], bytes[0..length]);
             return length;
@@ -604,6 +606,22 @@ test "fuzz: a damaged client flight never connects falsely and never crashes" {
     // knob; its hello (an eighth of the runs) or its flight (half) damaged in one of eleven ways
     // and fed in random pieces. A failure prints the seed.
     try seeds.run("tls server fuzz", iterations_default, fuzz_once);
+}
+
+test "fuzz: mutate takes empty input in every kind" {
+    // Goal: no kind of damage divides by the input's length. Method: an empty input, every kind,
+    // many draws; an insert kind adds a record, every other kind returns nothing.
+    var out: [1024]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0x4b1df6b8);
+    for (std.enums.values(Mutation)) |kind| {
+        for (0..64) |_| {
+            const length = mutate(prng.random(), kind, &.{}, &out);
+            switch (kind) {
+                .insert_alert, .insert_random_record, .insert_ccs => try testing.expect(length > 0),
+                else => try testing.expectEqual(@as(usize, 0), length),
+            }
+        }
+    }
 }
 
 test "fuzz: a change_cipher_spec fault the damage step undid connects" {
