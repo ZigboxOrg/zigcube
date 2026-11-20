@@ -37,8 +37,13 @@ runs:
         # Warm cache: install straight from the saved closure, no network.
         if [ "$CACHE_HIT" = "true" ] && ls "$debs"/*.deb >/dev/null 2>&1; then
           echo "install-apt: cache hit, installing from $debs"
-          sudo dpkg -i "$debs"/*.deb
-          exit 0
+          # The saved closure leaves out what the runner that saved it already
+          # had; a runner without one of those packages fails dpkg -i. Then
+          # fall through to the network install, which completes the closure.
+          if sudo dpkg -i "$debs"/*.deb; then
+            exit 0
+          fi
+          echo "install-apt: the cached .deb files are incomplete for this runner; installing from the archive"
         fi
 
         # Cold cache. Point every Ubuntu source at the public archive instead
@@ -66,7 +71,7 @@ runs:
         mkdir -p "$debs/partial"
         timeout 300 sudo apt-get "${opts[@]}" update
         # shellcheck disable=SC2086
-        timeout 600 sudo apt-get "${opts[@]}" install -y --no-install-recommends $PACKAGES
+        timeout 600 sudo apt-get "${opts[@]}" install -y --fix-broken --no-install-recommends $PACKAGES
         # Leave only readable .deb files for actions/cache to archive.
         sudo rm -rf "$debs/partial" "$debs/lock"
         sudo chmod -R a+rX "$debs"
