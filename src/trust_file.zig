@@ -204,7 +204,8 @@ fn walk_step(w: *Walk, path: []const u8, options: Options, diag: *Diag) Error!vo
 /// root or the process's own user: the rule of `fs.protected_symlinks`, which the walk's
 /// `readlinkat` is not subject to (PR #10's re-review). And it must not be a mount point, nor
 /// on another mount than its directory: a user may mount (FUSE) over a name they own, and the
-/// mounted root then reports whatever owner and mode its daemon chooses (PR #10's third review).
+/// mounted root then reports whatever owner and mode its daemon chooses (PR #10's third review;
+/// docs/decisions/2026-11-21-trust-policy-mounts-and-macos.md).
 fn check_entry(
     holder: Owner,
     entry: Owner,
