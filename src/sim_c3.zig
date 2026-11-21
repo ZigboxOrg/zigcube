@@ -140,6 +140,15 @@ fn on_lost_node(snap: *const Snapshot, replica: *const records.Replica) bool {
     return status.rec.state != .ready;
 }
 
+/// Whether the node `replica` is placed on is registered with an `exclusive` label, which takes
+/// no service replica (B6, P1): the replica controller removes it as dead, of either generation
+/// and whatever the rollout's phase, so its removal is not a retirement.
+fn on_exclusive_node(snap: *const Snapshot, replica: *const records.Replica) bool {
+    const node = snap.node_of(replica.id) orelse return false;
+    const entry = snap.node_entry(node) orelse return false;
+    return records.node_label_value(entry.rec.labels, records.exclusive_label) != null;
+}
+
 fn stopped(snap: *const Snapshot, replica: *const records.Replica) bool {
     const observed = snap.observed_of(replica) orelse return false;
     return observed.rec.status == .stopped;
@@ -182,7 +191,9 @@ fn step_of(
         .delete => |key| {
             const id = replica_id(key, service.rec.name) orelse continue;
             const replica = find_replica(snap, id) orelse continue;
-            if (stopped(snap, &replica.rec) or on_lost_node(snap, &replica.rec)) {
+            const forced = on_lost_node(snap, &replica.rec) or
+                on_exclusive_node(snap, &replica.rec);
+            if (stopped(snap, &replica.rec) or forced) {
                 step.dead += 1;
                 if (rollout_controller.is_new(&replica.rec, &service.rec)) step.dead_new += 1;
             } else if (!rollout_controller.is_new(&replica.rec, &service.rec)) {

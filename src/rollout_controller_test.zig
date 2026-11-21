@@ -314,6 +314,19 @@ const Fixture = struct {
         return found;
     }
 
+    /// How many assignments `node` holds.
+    fn held_by(self: *Fixture, node: []const u8) !u32 {
+        const ctx = self.context();
+        const list = try controller.list_all(
+            records.Assigned,
+            &ctx,
+            records.assigned_prefix(node).slice(),
+            null,
+            constants.replicas_max,
+        );
+        return @intCast(list.items.len);
+    }
+
     fn rollout(self: *Fixture) !records.Rollout {
         const ctx = self.context();
         const key = records.rollout_key(web.name);
@@ -1091,6 +1104,38 @@ test "an old replica that dies during a pause is replaced at its own generation"
     try testing.expect(found_old);
     try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
     try testing.expectEqual(@as(u32, 1), try fixture.count_of(2));
+    try testing.expectEqual(records.RolloutPhase.paused, (try fixture.rollout()).phase);
+}
+
+test "an old replica of a paused rollout on a node registered exclusive is moved off it (P1)" {
+    // Goal: a halted rollout keeps its stale replicas, but not on a node whose labels refuse a
+    // service replica (B6 P1; CI seed 44892876942, a failed rollout's stale replica kept on a
+    // node an operator reinstalled exclusive). Method: two nodes, pause after the first new
+    // replica starts, register node1 again as exclusive, and look at what node1 holds.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    const capacity: records.Requests = .{
+        .cpu_millis = 8000,
+        .memory_bytes = 16 * 1024 * 1024 * 1024,
+    };
+    const node2: records.Node = .{ .name = "node2", .capacity = capacity };
+    try fixture.put(.{ .agent = "node2" }, records.node_key("node2").slice(), node2);
+    try fixture.roll();
+    try testing.expectEqual(records.RolloutPhase.paused, (try fixture.request(.pause)).done);
+    const new_before = try fixture.count_of(2);
+    try testing.expect(try fixture.held_by("node1") > 0);
+    const exclusive: records.Node = .{
+        .name = "node1",
+        .capacity = capacity,
+        .labels = &.{ "tenant=a", "exclusive=tenant" },
+    };
+    try fixture.put(.{ .agent = "node1" }, records.node_key("node1").slice(), exclusive);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 0), try fixture.held_by("node1"));
+    // Removed while paused, and no replica of the new generation started in its place (R4).
+    try testing.expectEqual(@as(u32, 0), try fixture.count_of(1));
+    try testing.expectEqual(new_before, try fixture.count_of(2));
     try testing.expectEqual(records.RolloutPhase.paused, (try fixture.rollout()).phase);
 }
 

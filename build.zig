@@ -3150,6 +3150,15 @@ const c1_regressions = [_][]const []const u8{
         "7485507574660471565", "15",       "0",         "--c1",
         "--strong",            "--signed", "--tenants", "--heal-at=84",
     },
+    // P1 on C3's branch (6f53b36, CI's sim job): alpha's rollout to generation 3 failed and kept
+    // its stale replica alpha-4 (generation 2) on node2, which an operator reinstall made
+    // exclusive; the replica controller judged only live and held replicas against their node's
+    // labels, so the stale one stayed past P1's bound. A guard: it fails without the fix
+    // (`classify` in `replica_controller.zig`).
+    &.{
+        "44892876942", "150",       "0",        "--c1",
+        "--strong",    "--tenants", "--health", "--profile=mixed",
+    },
 };
 
 /// `zig build sim-c1-regressions`: replays `c1_regressions` with the shipped code (ReleaseSafe).

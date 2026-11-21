@@ -313,7 +313,9 @@ const Run = struct {
             };
             item.class = classify_one(&replica.rec, &service.rec, observed);
             item.live = rollout_controller.live_report(run.snap, &replica.rec);
-            if (item.class == .live or item.class == .held) {
+            // A stale replica is refused too: a halted rollout (failed or paused) keeps its stale
+            // replicas, and one on a node registered exclusive would stay there for good (P1).
+            if (item.class != .dead) {
                 item.refused = run.refused_placement(replica.rec.id);
                 if (item.refused != null) item.class = .dead;
             }

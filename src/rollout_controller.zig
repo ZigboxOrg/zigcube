@@ -81,7 +81,9 @@ const Track = struct {
     /// timeout runs from here, not from placement (PR #6 review), so one `unknown` report of a
     /// ready replica in a rollout older than `ready_timeout_ms` does not fail it. Cleared while
     /// it is ready. In memory: a restarted server starts the replica at `assigned_since_ms`,
-    /// which is the restart's pass, so a restart can only delay the timeout.
+    /// which is the restart's pass. That mostly delays the timeout, but a replica that was ready
+    /// is not `ready_seen` again until it has been ready for `min_ready_ms`; an `unknown` inside
+    /// that window times it from the restart, so the failure can come up to `min_ready_ms` early.
     unready_since_ms: ?u64 = null,
     /// Since when the controller has seen it running (C3 slice 10: and healthy).
     running_since_ms: ?u64 = null,

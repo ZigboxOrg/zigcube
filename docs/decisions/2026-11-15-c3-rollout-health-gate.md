@@ -37,7 +37,13 @@ says nothing about `unknown` after `healthy`.
   has seen it ready; after that it runs from when the controller first saw it not ready again
   (`Track.unready_since_ms`), so one `unknown` report of a ready replica in a rollout older than
   `ready_timeout_ms` delays the rollout and does not fail it (PR #6 review, MUST). The time is in
-  memory: a restarted server starts it at its first pass, which can only delay the failure.
+  memory: a restarted server starts it at its first pass. That mostly delays the failure, but
+  after a restart a replica that was ready is not marked seen ready until it has been ready for
+  `min_ready_ms` again; an `unknown` inside that window runs its timeout from the restart, so the
+  failure, and the automatic rollback, can come up to `min_ready_ms` (5 s by default) early
+  (PR #6 re-review, NIT; behaviour kept).
+- A release whose checks fail for less than `ready_timeout_ms` (120 s by default) at a time is
+  caught only by the progress deadline (600 s by default, ZC-E0306).
 
 ## Consequences
 
