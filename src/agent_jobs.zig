@@ -715,7 +715,7 @@ const Work = struct {
                     // Test-only: start a run whose container already exited (J2, J7).
                     if (run) |entry| return work.start(subject, record, &entry.rec, null);
                 }
-                try work.stopped(subject, record, reason, seen);
+                try work.stopped(subject, record, reason, seen, run);
             },
         }
     }
@@ -809,6 +809,7 @@ const Work = struct {
         record: StartRecord,
         reason: runtime.ExitReason,
         seen: ?*const records.JobObserved,
+        run: ?*const Entry(records.JobRun),
     ) Error!void {
         // The container has ended: a run with no assignment here is over on this node.
         const epoch = report_epoch(subject, record) orelse
@@ -820,7 +821,7 @@ const Work = struct {
             .run = subject.id,
             .status = .stopped,
             .epoch = epoch,
-            .stop_cause = record.stop_cause,
+            .stop_cause = reported_cause(record.stop_cause, run),
             .started_at_ms = record.started_at_ms,
         };
         try work.apply_exit(&wanted, reason);
@@ -835,6 +836,24 @@ const Work = struct {
             wanted.diagnostic = try records.diagnostic_raw(ctx.arena, &finished, ctx.diag);
         }
         try work.report(wanted);
+    }
+
+    /// The cause a stopped run's report names. `unreachable` that this node recorded (the job
+    /// fence) stands for a stop it may have missed; once a runs read shows that the server
+    /// committed a cancel, the cancel is what the node missed, so it is reported instead: a
+    /// cancelled job ends `cancelled`, not `failed` (0.5.2 review 5927352205, item 4). Every
+    /// other recorded cause is what this node did, and the server's other stops (`unreachable`,
+    /// `not_started`) say no more than `unreachable` does, so those stand.
+    fn reported_cause(
+        recorded: ?records.StopCause,
+        run: ?*const Entry(records.JobRun),
+    ) ?records.StopCause {
+        if (recorded != .@"unreachable") return recorded;
+        const entry = run orelse return recorded;
+        const asked = entry.rec.stop orelse return recorded;
+        if (asked.cause != .cancel) return recorded;
+        assert(entry.rec.stop != null);
+        return .cancel;
     }
 
     fn stop(work: *Work, listing: *const runtime.Listing, grace_ms: u32) Error!void {

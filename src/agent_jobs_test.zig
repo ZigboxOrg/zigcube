@@ -547,6 +547,43 @@ test "a stop the agent cannot read is enforced by the job fence while keepalives
     try testing.expectEqual(records.JobObservedStatus.stopped, seen.status);
 }
 
+/// Runs a run, optionally cancels it, then fails every read of the runs until the job fence has
+/// stopped it, and heals: the observation the node reports once it can read the runs again.
+fn fenced_ending(cancel: bool) !Seen {
+    var rig = try Rig.start();
+    defer rig.stop();
+    const world = rig.world;
+    _ = try rig.assign(600_000);
+    rig.step();
+    try testing.expect(rig.running());
+    if (cancel) try rig.ask_stop(.cancel, 600_000);
+    world.switched.down_list_prefix = records.prefix_job_runs;
+    const fence_at = world.agent.job_fence_at_ms().?;
+    world.advance(fence_at - world.now_ms() + constants.fence_stop_ms + 1_000);
+    try testing.expect(!rig.running());
+    try testing.expect(!world.agent.fence.active);
+    const kept = (try rig.start_record()).?;
+    try testing.expectEqual(@as(?records.StopCause, .@"unreachable"), kept.stop_cause);
+    world.switched.down_list_prefix = null;
+    world.advance(2_000);
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(records.JobObservedStatus.stopped, seen.status);
+    return seen;
+}
+
+test "a cancelled run the job fence stopped is reported cancelled, not unreachable" {
+    // Goal: the 0.5.2 review 5927352205, item 4: a cancel committed while the node could not read
+    // its runs was missed, the job fence stopped the run as `unreachable`, and that cause was
+    // reported though the node stayed ready, so the job ended `failed`, not `cancelled`.
+    // Method: the fence stops the run with `unreachable` recorded in both worlds; after the heal
+    // the cancelled run reports `cancel`, and the run with no stop asked still reports
+    // `unreachable` (the fence's cause stands when the server committed no cancel).
+    const cancelled = try fenced_ending(true);
+    try testing.expectEqual(@as(?records.StopCause, .cancel), cancelled.stop_cause);
+    const unasked = try fenced_ending(false);
+    try testing.expectEqual(@as(?records.StopCause, .@"unreachable"), unasked.stop_cause);
+}
+
 test "an agent restart does not move the job fence later (#143)" {
     // Goal: the job fence counts from the last runs read that succeeded, so a restart in the same
     // boot must not count it from the restart. Method: as above, but the agent restarts halfway
