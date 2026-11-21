@@ -1160,3 +1160,356 @@ fn trust_body(arena: std.mem.Allocator, io: std.Io, signatures: []const []const 
         \\"submit_by_ms":{d},"signatures":[{s}]}}
     , .{ image, source, now + 30_000, list.written() });
 }
+
+test "sealed records: the key is made at start, no API reply holds it, E0824, --discard-sealed" {
+    // Goal: C5 slice 2's lifecycle through the real server, and its redaction test. Method: a
+    // SQLite server makes `seal-<hash>.key`; a record sealed with the server's key (a known
+    // plaintext) is written; /v1/list of every key, a watch from revision 1 and /v1/status must
+    // hold the envelope but neither the key nor the plaintext in any form. Then the key file is
+    // removed: the next start is ZC-E0824 and writes no key. `--discard-sealed` starts, deletes
+    // the record and writes a new key, and the next plain start opens.
+    const seal = @import("seal.zig");
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var path_buffer: [128]u8 = undefined;
+    const path = try tmp_file(&path_buffer, tmp, "data.db");
+    const plain = "-----planted P-256 key for the redaction test, never to be served-----";
+
+    const first = try start_server(io, config_for(.{ .sqlite = path }, true));
+    var first_open = true;
+    defer if (first_open) first.stop();
+    const key = first.seal_key;
+    var key_name_buffer: [64]u8 = undefined;
+    const key_name = try seal_key_file(io, tmp, &key_name_buffer);
+    const nonce: [seal.nonce_bytes]u8 = @splat(7);
+    var envelope_buffer: [seal.envelope_bytes_max]u8 = undefined;
+    const envelope = seal.seal(&key, "/edge-certs/a.example", plain, nonce, &envelope_buffer);
+    var value_buffer: [seal.envelope_bytes_max + 32]u8 = undefined;
+    const value = try std.fmt.bufPrint(&value_buffer, "{{\"v\":1,\"key\":\"{s}\"}}", .{envelope});
+    var diag: Diag = undefined;
+    diag.reset();
+    const ops = [_]@import("store.zig").Op{.{ .put = .{
+        .key = "/edge-certs/a.example",
+        .value = value,
+    } }};
+    _ = try first.verified.interface().txn(.{ .on_success = &ops }, &diag);
+    try expect_sealed_redacted(io, first, &key.bytes, plain, envelope[0..seal.header_bytes]);
+    first.stop();
+    first_open = false;
+
+    try tmp.dir.deleteFile(io, key_name);
+    try expect_seal_refused(io, tmp, path, key_name, &key.bytes, plain);
+
+    var discard_config = config_for(.{ .sqlite = path }, false);
+    discard_config.discard_sealed = true;
+    const second = try start_server(io, discard_config);
+    const fresh = second.seal_key;
+    try testing.expect(!std.mem.eql(u8, &fresh.bytes, &key.bytes));
+    const gone = try get(io, second.address(), "/v1/list?prefix=%2Fedge-certs%2F");
+    defer gone.free();
+    try testing.expect(std.mem.indexOf(u8, gone.raw, seal.magic) == null);
+    second.stop();
+    const third = try start_server(io, config_for(.{ .sqlite = path }, false));
+    try testing.expectEqualSlices(u8, &fresh.bytes, &third.seal_key.bytes);
+    third.stop();
+    // The flag again, with a key that opens every record: nothing to discard, the key is kept.
+    const fourth = try start_server(io, discard_config);
+    try testing.expectEqualSlices(u8, &fresh.bytes, &fourth.seal_key.bytes);
+    fourth.stop();
+}
+
+/// Every API reply that serves records or state holds neither the key nor the plaintext in any
+/// form, while the sealed record itself is served (the test has teeth).
+fn expect_sealed_redacted(
+    io: std.Io,
+    server: *server_mod.Server,
+    key: []const u8,
+    plain: []const u8,
+    header: []const u8,
+) !void {
+    const redaction = @import("testing/redaction.zig");
+    const paths = [_][]const u8{
+        "/v1/list?prefix=%2F",
+        "/v1/watch?from=1&timeout=0",
+        "/v1/status",
+    };
+    for (paths) |api_path| {
+        const reply = try get(io, server.address(), api_path);
+        defer reply.free();
+        try testing.expectEqual(@as(u16, 200), reply.status);
+        try redaction.expect_absent(reply.raw, key, api_path);
+        try redaction.expect_absent(reply.raw, plain, api_path);
+    }
+    const listed = try get(io, server.address(), "/v1/list?prefix=%2Fedge-certs%2F");
+    defer listed.free();
+    try testing.expect(std.mem.indexOf(u8, listed.raw, header) != null);
+    // Last: the watch from revision 1 replays the canary's write from now on.
+    try expect_canary_found(io, server, plain);
+}
+
+/// The negative control: the plaintext, written as a careless path would (base64 in a record of
+/// its own), is found by the harness in the same replies; the record is deleted again.
+fn expect_canary_found(io: std.Io, server: *server_mod.Server, plain: []const u8) !void {
+    const redaction = @import("testing/redaction.zig");
+    const Op = @import("store.zig").Op;
+    var encoded: [256]u8 = undefined;
+    const text = std.base64.standard.Encoder.encode(&encoded, plain);
+    var value_buffer: [320]u8 = undefined;
+    const value = try std.fmt.bufPrint(&value_buffer, "{{\"v\":1,\"leak\":\"{s}\"}}", .{text});
+    var diag: Diag = undefined;
+    diag.reset();
+    const put = [_]Op{.{ .put = .{ .key = "/canary/leak", .value = value } }};
+    _ = try server.verified.interface().txn(.{ .on_success = &put }, &diag);
+    for ([_][]const u8{ "/v1/list?prefix=%2F", "/v1/watch?from=1&timeout=0" }) |api_path| {
+        const reply = try get(io, server.address(), api_path);
+        defer reply.free();
+        try testing.expect(redaction.find(reply.raw, plain) != null);
+    }
+    const delete = [_]Op{.{ .delete = "/canary/leak" }};
+    _ = try server.verified.interface().txn(.{ .on_success = &delete }, &diag);
+}
+
+/// A start over the sealed record without its key is ZC-E0824, names the key file, writes no
+/// key, and its text holds neither the old key nor the plaintext.
+fn expect_seal_refused(
+    io: std.Io,
+    tmp: testing.TmpDir,
+    path: []const u8,
+    key_name: []const u8,
+    key: []const u8,
+    plain: []const u8,
+) !void {
+    const redaction = @import("testing/redaction.zig");
+    const codes = @import("diag/codes.zig");
+    var diag: Diag = undefined;
+    diag.reset();
+    const options: server_mod.Options = .{ .version = "0.0.0-test", .report_failures = false };
+    const refused = server_mod.Server.start(
+        testing.allocator,
+        io,
+        config_for(.{ .sqlite = path }, false),
+        options,
+        &diag,
+    );
+    try testing.expectError(error.StartFailed, refused);
+    try testing.expectEqual(@as(?codes.Code, .E0824), diag.code);
+    try testing.expectError(error.FileNotFound, tmp.dir.access(io, key_name, .{}));
+    var diagnostic: diag_mod.Diagnostic = undefined;
+    diag_mod.to_diagnostic(&diagnostic, &diag);
+    var text_buffer: [constants.diag_output_bytes_max]u8 = undefined;
+    const text = diag_mod.render(&diagnostic, .text, false, &text_buffer);
+    try testing.expect(std.mem.indexOf(u8, text, key_name) != null);
+    try redaction.expect_absent(text, key, "ZC-E0824");
+    try redaction.expect_absent(text, plain, "ZC-E0824");
+}
+
+/// The name of the one `seal-*.key` file in `tmp`, in `buffer`.
+fn seal_key_file(io: std.Io, tmp: testing.TmpDir, buffer: *[64]u8) ![]const u8 {
+    var iterator = tmp.dir.iterate();
+    var found: ?[]const u8 = null;
+    while (try iterator.next(io)) |entry| {
+        if (!std.mem.startsWith(u8, entry.name, "seal-")) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".key")) continue;
+        try testing.expect(found == null);
+        @memcpy(buffer[0..entry.name.len], entry.name);
+        found = buffer[0..entry.name.len];
+    }
+    return found orelse error.NoSealKey;
+}
+
+test "a sealing key file that is loose or the wrong length refuses the start (ZC-E0806)" {
+    // Goal: review of PR #8 (SHOULD): the key file's own refusals, through the real server.
+    // Method: a SQLite server makes its key; the file is made 0644, then 0600 with 31 bytes
+    // (62 hex digits); each start is ZC-E0806 naming the file, holds no key, and leaves the file
+    // as it was. The whole key, 0600 again, starts with it.
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var path_buffer: [128]u8 = undefined;
+    const path = try tmp_file(&path_buffer, tmp, "data.db");
+    const first = try start_server(io, config_for(.{ .sqlite = path }, true));
+    var key = first.seal_key;
+    defer key.wipe();
+    first.stop();
+    var key_name_buffer: [64]u8 = undefined;
+    const key_name = try seal_key_file(io, tmp, &key_name_buffer);
+
+    const file = try tmp.dir.openFile(io, key_name, .{});
+    defer file.close(io);
+    try file.setPermissions(io, .fromMode(0o644));
+    try expect_key_file_refused(io, path, key_name, &key.bytes, "other users can read it");
+    const hex = std.fmt.bytesToHex(key.bytes, .lower);
+    try tmp.dir.writeFile(io, .{ .sub_path = key_name, .data = hex[0..62] ++ "\n" });
+    try file.setPermissions(io, .fromMode(0o600));
+    try expect_key_file_refused(io, path, key_name, &key.bytes, "64 hex digits");
+    var short_buffer: [64]u8 = undefined;
+    const kept = try tmp.dir.readFile(io, key_name, &short_buffer);
+    try testing.expectEqualStrings(hex[0..62] ++ "\n", kept);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = key_name, .data = &hex });
+    try file.setPermissions(io, .fromMode(0o600));
+    const again = try start_server(io, config_for(.{ .sqlite = path }, false));
+    try testing.expectEqualSlices(u8, &key.bytes, &again.seal_key.bytes);
+    again.stop();
+}
+
+/// A start refused with ZC-E0806 naming `key_name` and `why`, its text without the key.
+fn expect_key_file_refused(
+    io: std.Io,
+    path: []const u8,
+    key_name: []const u8,
+    key: []const u8,
+    why: []const u8,
+) !void {
+    const redaction = @import("testing/redaction.zig");
+    const codes = @import("diag/codes.zig");
+    var diag: Diag = undefined;
+    diag.reset();
+    const options: server_mod.Options = .{ .version = "0.0.0-test", .report_failures = false };
+    const refused = server_mod.Server.start(
+        testing.allocator,
+        io,
+        config_for(.{ .sqlite = path }, false),
+        options,
+        &diag,
+    );
+    try testing.expectError(error.StartFailed, refused);
+    try testing.expectEqual(@as(?codes.Code, .E0806), diag.code);
+    var diagnostic: diag_mod.Diagnostic = undefined;
+    diag_mod.to_diagnostic(&diagnostic, &diag);
+    var text_buffer: [constants.diag_output_bytes_max]u8 = undefined;
+    const text = diag_mod.render(&diagnostic, .text, false, &text_buffer);
+    try testing.expect(std.mem.indexOf(u8, text, key_name) != null);
+    try testing.expect(std.mem.indexOf(u8, text, why) != null);
+    try redaction.expect_absent(text, key, "ZC-E0806");
+}
+
+test "the server's stderr holds neither a sealing key nor a sealed plaintext" {
+    // Goal: review of PR #8 (SHOULD): the redaction test covered replies and diagnostics, not
+    // logs. Method: fd 2 goes to a file while a verbose, logging server seals a record, a
+    // `--discard-sealed` start warns (ZC-W0808) and seals another, and a plain start opens that
+    // record (its start check holds the plaintext in memory) and serves it; the file must hold
+    // the warning and every request line (the capture works), and neither key nor the
+    // plaintext in any form the harness knows.
+    const seal = @import("seal.zig");
+    const redaction = @import("testing/redaction.zig");
+    const Op = @import("store.zig").Op;
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var path_buffer: [128]u8 = undefined;
+    const path = try tmp_file(&path_buffer, tmp, "data.db");
+    const plain = "-----planted P-256 key for the stderr redaction test, never logged-----";
+    var capture: StderrCapture = undefined;
+    try capture.start(io, tmp);
+    defer capture.stop(io);
+
+    var config = config_for(.{ .sqlite = path }, true);
+    config.quiet = false;
+    config.verbose = true;
+    var keys: [3]@import("seal.zig").Key = undefined;
+    defer for (&keys) |*key| key.wipe();
+    for (&keys, 0..) |*key, round| {
+        config.discard_sealed = round == 1;
+        const server = try start_logging(io, config);
+        defer server.stop();
+        key.* = server.seal_key;
+        if (round == 2) try expect_opened(server, &keys[1]);
+        var key_name_buffer: [64]u8 = undefined;
+        // Round 0 seals a record; round 1 starts without its key, so the discard has work, and
+        // seals the record round 2's plain start opens with key 1.
+        const nonce: [seal.nonce_bytes]u8 = @splat(@intCast(round + 1));
+        var envelope_buffer: [seal.envelope_bytes_max]u8 = undefined;
+        const envelope = seal.seal(key, "/edge-certs/a.example", plain, nonce, &envelope_buffer);
+        var value_buffer: [seal.envelope_bytes_max + 32]u8 = undefined;
+        const format = "{{\"v\":1,\"key\":\"{s}\"}}";
+        const value = try std.fmt.bufPrint(&value_buffer, format, .{envelope});
+        var diag: Diag = undefined;
+        diag.reset();
+        const put = [_]Op{.{ .put = .{ .key = "/edge-certs/a.example", .value = value } }};
+        _ = try server.verified.interface().txn(.{ .on_success = &put }, &diag);
+        const paths = [_][]const u8{
+            "/v1/list?prefix=%2F",
+            "/v1/watch?from=1&timeout=0",
+            "/v1/status",
+        };
+        for (paths) |api_path| {
+            const reply = try get(io, server.address(), api_path);
+            reply.free();
+        }
+        if (round == 0) try tmp.dir.deleteFile(io, try seal_key_file(io, tmp, &key_name_buffer));
+        config.create_store = false;
+    }
+    const logged = try capture.read(io, tmp);
+    defer testing.allocator.free(logged);
+    try testing.expect(std.mem.indexOf(u8, logged, "ZC-W0808") != null);
+    try testing.expect(std.mem.indexOf(u8, logged, "/v1/watch") != null);
+    for (&keys) |*key| try redaction.expect_absent(logged, &key.bytes, "the server's stderr");
+    try redaction.expect_absent(logged, plain, "the server's stderr");
+}
+
+/// The plain start opened the sealed record: it kept the key the record was sealed with (no
+/// discard, no new key), and the record, sealed under that key's id, is there, so the start
+/// check opened it (a record it does not open refuses the start, ZC-E0824).
+fn expect_opened(server: *server_mod.Server, sealed_with: *const @import("seal.zig").Key) !void {
+    try testing.expectEqualSlices(u8, &sealed_with.bytes, &server.seal_key.bytes);
+    try testing.expect(!server.seal_discard);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    const got = try server.verified.interface().get(
+        arena.allocator(),
+        "/edge-certs/a.example",
+        null,
+        &diag,
+    );
+    const seal = @import("seal.zig");
+    const envelope = seal.sealed_of(got.kv.?.value).envelope;
+    try testing.expectEqualSlices(u8, &sealed_with.id(), &seal.key_id_of(envelope).?);
+}
+
+/// `start_server` with request logging on.
+fn start_logging(io: std.Io, config: config_mod.Config) !*server_mod.Server {
+    try private_dir.state_dir(io, config);
+    var diag: Diag = undefined;
+    diag.reset();
+    return server_mod.Server.start(testing.allocator, io, config, .{
+        .version = "0.0.0-test",
+        .report_failures = true,
+        .log_requests = true,
+    }, &diag);
+}
+
+/// File descriptor 2 sent to `stderr.log` in a test directory, and put back.
+const StderrCapture = struct {
+    saved: std.os.linux.fd_t,
+    file: std.Io.File,
+
+    fn start(capture: *StderrCapture, io: std.Io, tmp: testing.TmpDir) !void {
+        const linux = std.os.linux;
+        capture.file = try tmp.dir.createFile(io, "stderr.log", .{ .read = true });
+        const saved = linux.dup(2);
+        if (linux.errno(saved) != .SUCCESS) return error.Dup;
+        capture.saved = @intCast(saved);
+        if (linux.errno(linux.dup3(capture.file.handle, 2, 0)) != .SUCCESS) return error.Dup;
+    }
+
+    fn stop(capture: *StderrCapture, io: std.Io) void {
+        const linux = std.os.linux;
+        _ = linux.dup3(capture.saved, 2, 0);
+        _ = linux.close(capture.saved);
+        capture.file.close(io);
+    }
+
+    fn read(_: *StderrCapture, io: std.Io, tmp: testing.TmpDir) ![]u8 {
+        return tmp.dir.readFileAlloc(io, "stderr.log", testing.allocator, .limited(1 << 20));
+    }
+};
