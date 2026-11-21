@@ -234,16 +234,6 @@ test "need_of: the agent API by node, the jobs API, and everything else is admin
             .path = "/v1/agent/nodes/node1/runs/a/b/certificate",
             .need = .{ .node = "node1" },
         },
-        .{
-            .method = "POST",
-            .path = "/v1/agent/nodes/node1/replicas/web-1/certificate",
-            .need = .{ .node_only = "node1" },
-        },
-        .{
-            .method = "POST",
-            .path = "/v1/agent/nodes/node1/replicas//certificate",
-            .need = .{ .node = "node1" },
-        },
         .{ .method = "GET", .path = "/v1/agent/nodes/node1/runs", .need = .{ .node = "node1" } },
         .{
             .method = "GET",
@@ -397,4 +387,13 @@ test "teeth: without the prefix check a node reads the services' specs" {
 
 comptime {
     assert(std.enums.values(Scope).len == 2);
+}
+
+test "need_of: a replica's certificate is the node's own, like a run's (C4)" {
+    const own = need_of("POST", "/v1/agent/nodes/node1/replicas/web-1/certificate", "");
+    try testing.expectEqualStrings("node1", own.node_only);
+    const empty = need_of("POST", "/v1/agent/nodes/node1/replicas//certificate", "");
+    try testing.expectEqualStrings("node1", empty.node);
+    const nested = need_of("POST", "/v1/agent/nodes/node1/replicas/a/b/certificate", "");
+    try testing.expectEqualStrings("node1", nested.node);
 }
