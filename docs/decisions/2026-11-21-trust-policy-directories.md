@@ -40,6 +40,14 @@ policy others can replace gates no more than one they can rewrite.
   own filesystem, say): whoever could mount there could rewrite the policy anyway.
   The flag is read as the kernel's bit 0x2000, not through the pinned std's `STATX_ATTR`,
   whose packed struct puts `MOUNT_ROOT` (and its other flags) at the wrong bits.
+- The same rules hold on macOS, where `zcube` is built and tested (`zig build test-cli` reaches
+  `trust_file.zig` through `server_config.zig`; a raw Linux system call there was killed by
+  SIGSYS). `src/trust_sys.zig` makes the calls: raw on Linux, through libSystem on macOS
+  (`fstatat`, `fstat`, `readlinkat`, `getcwd`, `geteuid`; the opened file's path from
+  `fcntl(F_GETPATH)` through `std.Io.File.realPath`). macOS reports no mount id and no mount-root
+  flag, so there an entry in a directory others may write is judged by its device (`st_dev`)
+  alone; a FUSE or other mount over it has a device of its own. The bind-mount test runs on Linux
+  only; the table test of `entry_problem` runs on both.
 - A cause says why before it names a path, and names the policy's path last: a cause is cut at
   `diag_field_bytes_max` (200 bytes), and with the paths first an ordinary path cut the reason
   away (the same review). A lookup that fails says which name and why (`statx` ENOENT is "no

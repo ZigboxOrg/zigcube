@@ -90,18 +90,9 @@ pub fn read(
 
 /// Who owns a file on the policy's path, its mode bits, and where it lives: an entry in a
 /// directory others may write must live on that directory's own mount (`entry_problem`).
-pub const Owner = struct {
-    uid: u32,
-    mode: u32,
-    /// `stx_dev`, major and minor.
-    device: u64 = 0,
-    /// `stx_mnt_id`; null when the kernel did not report it (before Linux 5.8).
-    mount: ?u64 = null,
-    /// `STATX_ATTR_MOUNT_ROOT`: something is mounted here.
-    mount_root: bool = false,
-};
+pub const Owner = sys.Owner;
 
-const linux = std.os.linux;
+const sys = @import("trust_sys.zig");
 const path_max = std.fs.max_path_bytes;
 comptime {
     assert(path_max <= std.math.maxInt(u16));
@@ -141,14 +132,10 @@ fn walk(w: *Walk, path: []const u8, options: Options, diag: *Diag) Error!Owner {
     // A relative path is walked from the working directory, whose directories are judged too.
     var prefix_len: usize = 0;
     if (!std.fs.path.isAbsolute(path)) {
-        const result = linux.getcwd(&w.pending, w.pending.len);
-        const found = if (linux.errno(result) == .SUCCESS)
-            std.mem.indexOfScalar(u8, &w.pending, 0)
-        else
-            null;
-        prefix_len = found orelse return bad(diag, options, "can't read the working " ++
-            "directory, from which the trust policy is a relative path: {s}", .{path}, //
+        const cwd = sys.getcwd(&w.pending) orelse return bad(diag, options, "can't read the " ++
+            "working directory, from which the trust policy is a relative path: {s}", .{path}, //
             "name the policy by an absolute path");
+        prefix_len = cwd.len;
         w.pending[prefix_len] = '/';
         prefix_len += 1;
     }
@@ -165,7 +152,7 @@ fn walk(w: *Walk, path: []const u8, options: Options, diag: *Diag) Error!Owner {
     }
     var buffer: [path_max:0]u8 = undefined;
     const reached = try look_up(terminated(&buffer, w.real()), path, options, diag);
-    assert(reached.mode & linux.S.IFMT != linux.S.IFLNK);
+    assert(reached.mode & sys.S.IFMT != sys.S.IFLNK);
     return reached;
 }
 
@@ -198,14 +185,14 @@ fn walk_step(w: *Walk, path: []const u8, options: Options, diag: *Diag) Error!vo
     const candidate = terminated(&buffer, w.real());
     const owner = try look_up(candidate, path, options, diag);
     try check_entry(holder, owner, candidate, path, options, diag);
-    const kind = owner.mode & linux.S.IFMT;
-    if (kind == linux.S.IFLNK) {
+    const kind = owner.mode & sys.S.IFMT;
+    if (kind == sys.S.IFLNK) {
         w.resolved_len = parent_len;
         return walk_link(w, candidate, separated, path, options, diag);
     }
     // The kernel refuses a file followed by a separator (ENOTDIR), so `trust.zon/` and
     // `trust.zon/../trust.zon` are refused here too, not read by a textual `..`.
-    if (separated and kind != linux.S.IFDIR) {
+    if (separated and kind != sys.S.IFDIR) {
         const tail = on_the_way(candidate, path);
         return bad(diag, options, "the trust policy's path goes on past a file that is not a " ++
             "directory: {s}{s}{s}", .{ candidate, tail.join, tail.path }, options.fix);
@@ -226,10 +213,10 @@ fn check_entry(
     options: Options,
     diag: *Diag,
 ) Error!void {
-    const problem = entry_problem(holder, entry, linux.geteuid()) orelse return;
-    const what = switch (entry.mode & linux.S.IFMT) {
-        linux.S.IFLNK => "a symbolic link",
-        linux.S.IFDIR => "a directory",
+    const problem = entry_problem(holder, entry, sys.geteuid()) orelse return;
+    const what = switch (entry.mode & sys.S.IFMT) {
+        sys.S.IFLNK => "a symbolic link",
+        sys.S.IFDIR => "a directory",
         else => "a file",
     };
     // The reason comes before the paths: a cause is cut at `diag_field_bytes_max`.
@@ -269,7 +256,7 @@ pub const EntryProblem = enum {
 /// a btrfs subvolume can report another device for a file on the directory's own mount.
 pub fn entry_problem(holder: Owner, entry: Owner, euid: u32) ?EntryProblem {
     if (holder.mode & 0o022 == 0) return null;
-    assert(holder.mode & linux.S.ISVTX != 0);
+    assert(holder.mode & sys.S.ISVTX != 0);
     if (entry.uid != 0 and entry.uid != euid) return .foreign_owner;
     if (entry.mount_root) return .mount_root;
     if (holder.mount) |holder_mount| {
@@ -308,17 +295,17 @@ fn walk_link(
             "symbolic links: {s}", .{ constants.trust_policy_links_max, path }, options.fix);
     }
     var target: [path_max]u8 = undefined;
-    const result = linux.readlinkat(linux.AT.FDCWD, link, &target, target.len);
-    const errno = linux.errno(result);
-    if (errno != .SUCCESS) {
-        return bad(diag, options, "can't read a symbolic link on the trust policy's path " ++
-            "(readlinkat E{t}): {s}, on the way to {s}", .{ errno, link, path }, options.fix);
-    }
-    if (result == 0) {
+    const length = switch (sys.readlink(link, &target)) {
+        .target => |text| text.len,
+        .failed => |errno| return bad(diag, options, "can't read a symbolic link on the " ++
+            "trust policy's path (readlinkat E{t}): {s}, on the way to {s}", .{
+            errno, link, path,
+        }, options.fix),
+    };
+    if (length == 0) {
         return bad(diag, options, "a symbolic link on the trust policy's path is empty: {s}, " ++
             "on the way to {s}", .{ link, path }, options.fix);
     }
-    const length: usize = result;
     if (length == target.len) return too_long(path, options, diag);
     // The separator that followed the link, if one did, follows its target.
     const rest = w.pending[w.pending_start..w.pending_len];
@@ -347,7 +334,7 @@ fn check_directory(
     assert(directory[0] == '/');
     var buffer: [path_max:0]u8 = undefined;
     const owner = try look_up(terminated(&buffer, directory), path, options, diag);
-    const problem = directory_problem(owner, linux.geteuid()) orelse return owner;
+    const problem = directory_problem(owner, sys.geteuid()) orelse return owner;
     // The reason comes before the paths: a cause is cut at `diag_field_bytes_max`.
     return bad(diag, options, "a directory on the trust policy's path {s}{s} (owner uid {d}, " ++
         "mode {o:0>4}): {s}, on the way to {s}", .{
@@ -371,15 +358,18 @@ fn check_same(
 ) Error!void {
     var buffer: [path_max]u8 = undefined;
     const length = file.realPath(io, &buffer) catch return bad(diag, options, "can't confirm " ++
-        "which file was opened as the trust policy (is /proc mounted?): {s}", .{path}, //
-        "mount /proc where the process runs");
+        "which file was opened as the trust policy" ++ realpath_hint ++ ": {s}", .{path}, //
+        if (sys.is_linux) "mount /proc where the process runs" else options.fix);
     if (std.mem.eql(u8, buffer[0..length], real)) return;
     return bad(diag, options, "the trust policy changed while it was read: {s} was judged, " ++
         "{s} was opened, for {s}", .{ real, buffer[0..length], path }, options.fix);
 }
 
+/// Linux names the opened file through /proc; macOS through `fcntl(F_GETPATH)`.
+const realpath_hint = if (sys.is_linux) " (is /proc mounted?)" else "";
+
 fn too_long(path: []const u8, options: Options, diag: *Diag) Error {
-    return bad(diag, options, "the trust policy's path is longer than Linux's path limit " ++
+    return bad(diag, options, "the trust policy's path is longer than the system's path limit " ++
         "once made absolute and its links followed: {s}", .{path}, options.fix);
 }
 
@@ -403,12 +393,12 @@ const mount_fix = "keep the policy out of directories others may write, such as 
 /// file they do not own.
 pub fn directory_problem(owner: Owner, euid: u32) ?OwnerProblem {
     if (owner.uid != 0 and owner.uid != euid) return .foreign_owner;
-    if (owner.mode & 0o022 != 0 and owner.mode & linux.S.ISVTX == 0) return .writable;
+    if (owner.mode & 0o022 != 0 and owner.mode & sys.S.ISVTX == 0) return .writable;
     return null;
 }
 
 fn check_owner(owner: Owner, path: []const u8, options: Options, diag: *Diag) Error!void {
-    const problem = owner_problem(owner, linux.geteuid()) orelse return;
+    const problem = owner_problem(owner, sys.geteuid()) orelse return;
     return bad(diag, options, "the trust policy {s}{s} (owner uid {d}, mode {o:0>4}): {s}", .{
         problem.text(),
         if (problem == .foreign_owner) options.user else "",
@@ -420,7 +410,7 @@ fn check_owner(owner: Owner, path: []const u8, options: Options, diag: *Diag) Er
 
 /// The opened policy's owner and mode, from its descriptor.
 fn owner_of(file: std.Io.File, path: []const u8, options: Options, diag: *Diag) Error!Owner {
-    return switch (owner_stat(file.handle, "", linux.AT.EMPTY_PATH)) {
+    return switch (sys.look_up_open(file.handle)) {
         .found => |owner| owner,
         .failed => |errno| bad(diag, options, "can't stat the opened trust policy (fstat " ++
             "E{t}): {s}", .{ errno, path }, options.fix),
@@ -434,7 +424,7 @@ fn look_up(name: [:0]const u8, path: []const u8, options: Options, diag: *Diag) 
     assert(name.len > 0);
     assert(name[0] == '/');
     const tail = on_the_way(name, path);
-    return switch (owner_stat(linux.AT.FDCWD, name, linux.AT.SYMLINK_NOFOLLOW)) {
+    return switch (sys.look_up(name)) {
         .found => |owner| owner,
         .failed => |errno| bad(diag, options, "can't look up the trust policy: {s} (statx " ++
             "E{t}): {s}{s}{s}", .{
@@ -447,7 +437,7 @@ fn look_up(name: [:0]const u8, path: []const u8, options: Options, diag: *Diag) 
 }
 
 /// Why a lookup failed, in words; the errno follows them in the cause.
-fn look_up_text(errno: linux.E) []const u8 {
+fn look_up_text(errno: sys.E) []const u8 {
     assert(errno != .SUCCESS);
     return switch (errno) {
         .NOENT => "no such file or directory",
@@ -481,41 +471,6 @@ fn read_text(err: ?std.Io.File.Reader.Error) []const u8 {
     };
 }
 
-const Looked = union(enum) {
-    found: Owner,
-    failed: linux.E,
-    /// The kernel answered without the mode or the owner.
-    incomplete,
-};
-
-fn owner_stat(dir: linux.fd_t, path: [*:0]const u8, flags: u32) Looked {
-    var stat = std.mem.zeroes(linux.Statx);
-    const mask: linux.STATX = .{ .TYPE = true, .MODE = true, .UID = true, .MNT_ID = true };
-    const result = linux.statx(dir, path, flags, mask, &stat);
-    const errno = linux.errno(result);
-    if (errno != .SUCCESS) return .{ .failed = errno };
-    if (!stat.mask.MODE or !stat.mask.UID) return .incomplete;
-    return .{ .found = .{
-        .uid = stat.uid,
-        .mode = stat.mode,
-        .device = (@as(u64, stat.dev_major) << 32) | stat.dev_minor,
-        .mount = if (stat.mask.MNT_ID) stat.mnt_id else null,
-        .mount_root = attribute(stat.attributes_mask, stat.attributes, statx_attr_mount_root),
-    } };
-}
-
-/// `STATX_ATTR_MOUNT_ROOT` from linux/stat.h. Not the pinned std's `STATX_ATTR.MOUNT_ROOT`: that
-/// packed struct puts it at bit 10, where the kernel's 0x2000 is bit 13 (its other fields are
-/// off as well), so it never reads the kernel's flag.
-const statx_attr_mount_root: u64 = 0x2000;
-
-/// Whether the kernel reported `flag` (in `mask`) and set it (in `attributes`).
-fn attribute(mask: linux.STATX_ATTR, attributes: linux.STATX_ATTR, flag: u64) bool {
-    assert(@popCount(flag) == 1);
-    const reported = @as(u64, @bitCast(mask)) & flag != 0;
-    return reported and @as(u64, @bitCast(attributes)) & flag != 0;
-}
-
 /// What makes a policy file unusable.
 pub const OwnerProblem = enum {
     not_regular,
@@ -534,7 +489,7 @@ pub const OwnerProblem = enum {
 
 /// Null when a file of this owner and mode may be used; otherwise what is wrong.
 pub fn owner_problem(owner: Owner, euid: u32) ?OwnerProblem {
-    if (owner.mode & linux.S.IFMT != linux.S.IFREG) return .not_regular;
+    if (owner.mode & sys.S.IFMT != sys.S.IFREG) return .not_regular;
     if (owner.uid != 0 and owner.uid != euid) return .foreign_owner;
     if (owner.mode & 0o022 != 0) return .writable;
     return null;
@@ -593,7 +548,7 @@ const test_options: Options = .{
 test "a policy file is used only when root or the process's own user alone can write it" {
     // Goal: Zigbox's rule for its system policy, for both callers. Method: each owner and mode.
     const euid: u32 = 1000;
-    const regular: u32 = linux.S.IFREG;
+    const regular: u32 = sys.S.IFREG;
     try testing.expect(owner_problem(.{ .uid = 0, .mode = regular | 0o644 }, euid) == null);
     try testing.expect(owner_problem(.{ .uid = euid, .mode = regular | 0o600 }, euid) == null);
     try testing.expect(owner_problem(.{ .uid = 0, .mode = regular | 0o4755 }, euid) == null);
@@ -601,7 +556,7 @@ test "a policy file is used only when root or the process's own user alone can w
         .{ .{ .uid = 1001, .mode = regular | 0o644 }, .foreign_owner },
         .{ .{ .uid = 0, .mode = regular | 0o664 }, .writable },
         .{ .{ .uid = euid, .mode = regular | 0o646 }, .writable },
-        .{ .{ .uid = 0, .mode = linux.S.IFDIR | 0o755 }, .not_regular },
+        .{ .{ .uid = 0, .mode = sys.S.IFDIR | 0o755 }, .not_regular },
     };
     for (refused) |case| try testing.expectEqual(case[1], owner_problem(case[0], euid).?);
 }
@@ -624,8 +579,7 @@ test "a refusal raises the caller's code and names its setting" {
     const base = try test_directory(arena);
     defer std.Io.Dir.cwd().deleteTree(testing.io, base) catch {}; // Best effort: it is in /tmp.
     const fifo = try std.fmt.allocPrintSentinel(arena, "{s}/trust.zon", .{base}, 0);
-    const made = linux.mknodat(linux.AT.FDCWD, fifo, linux.S.IFIFO | 0o600, 0);
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(made));
+    try sys.test_mkfifo(fifo);
     try testing.expectError(error.BadConfig, read(arena, testing.io, fifo, test_options, &diag));
     const fifo_cause = diag.causes.slice()[0].slice();
     try testing.expect(std.mem.indexOf(u8, fifo_cause, "is not a regular file") != null);
@@ -641,7 +595,7 @@ test "a policy file's directories must be ones only root or the process's own us
     // Method: the rule on owners and modes; then a real policy read in its directory at 0755,
     // refused at 0775 and 0757 (the cause names the directory and its mode), and read at 1777.
     const euid: u32 = 1000;
-    const directory: u32 = linux.S.IFDIR;
+    const directory: u32 = sys.S.IFDIR;
     try testing.expect(directory_problem(.{ .uid = 0, .mode = directory | 0o755 }, euid) == null);
     const own: Owner = .{ .uid = euid, .mode = directory | 0o700 };
     try testing.expect(directory_problem(own, euid) == null);
@@ -704,7 +658,7 @@ test "a symbolic link to a policy is judged in its own directory and along its t
         .{ "../good", directory },
     };
     for (pairs) |pair| {
-        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.symlink(pair[0], pair[1])));
+        try sys.test_symlink(pair[0], pair[1]);
     }
     const through_directory = try std.fmt.allocPrint(arena, "{s}/trust.zon", .{directory});
     const paths = [_][]const u8{ absolute, relative, through_directory };
@@ -749,14 +703,13 @@ test "in a directory others may write, every entry the walk passes must be root'
     const shared = try test_subdirectory(arena, base, "shared");
     try chmod_directory(shared, 0o1777);
     const link = try std.fmt.allocPrintSentinel(arena, "{s}/trust.zon", .{shared}, 0);
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.symlink(target, link)));
+    try sys.test_symlink(target, link);
     var diag: Diag = undefined;
     diag.reset();
     _ = try read(arena, io, link, test_options, &diag);
-    if (linux.geteuid() != 0) return error.SkipZigTest;
+    if (sys.geteuid() != 0) return error.SkipZigTest;
     const nobody: u32 = 65534;
-    const chowned = linux.fchownat(linux.AT.FDCWD, link, nobody, nobody, linux.AT.SYMLINK_NOFOLLOW);
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(chowned));
+    try sys.test_chown(link, nobody);
     diag.reset();
     try testing.expectError(error.BadConfig, read(arena, io, link, test_options, &diag));
     try testing.expectEqual(@as(?codes.Code, .E0505), diag.code);
@@ -775,12 +728,8 @@ test "in a directory others may write, every entry the walk passes must be root'
     // A file planted there by another uid is refused the same way.
     const planted = try write_test_policy(arena, try test_subdirectory(arena, shared, "own"));
     const file = try std.fmt.allocPrintSentinel(arena, "{s}/file.zon", .{shared}, 0);
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.rename(
-        try arena.dupeSentinel(u8, planted, 0),
-        file,
-    )));
-    const file_chowned = linux.fchownat(linux.AT.FDCWD, file, nobody, nobody, 0);
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(file_chowned));
+    try sys.test_rename(try arena.dupeSentinel(u8, planted, 0), file);
+    try sys.test_chown(file, nobody);
     diag.reset();
     try testing.expectError(error.BadConfig, read(arena, io, file, test_options, &diag));
     const file_cause = diag.causes.slice()[0].slice();
@@ -800,7 +749,7 @@ test "a path that goes on past a file is refused, as the kernel refuses it" {
     const good = try test_subdirectory(arena, base, "good");
     const path = try write_test_policy(arena, good);
     const link = try std.fmt.allocPrintSentinel(arena, "{s}/link.zon", .{good}, 0);
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.symlink("trust.zon", link)));
+    try sys.test_symlink("trust.zon", link);
     var diag: Diag = undefined;
     diag.reset();
     _ = try read(arena, io, path, test_options, &diag);
@@ -829,9 +778,9 @@ test "in a directory others may write, an entry must live on the directory's own
     // refused there; the same entries pass in a directory only root can write; the mount id,
     // where both have one, decides over the device (an overlay's files can report another).
     const euid: u32 = 1000;
-    const shared: Owner = .{ .uid = 0, .mode = linux.S.IFDIR | 0o1777, .device = 7, .mount = 3 };
-    const closed: Owner = .{ .uid = 0, .mode = linux.S.IFDIR | 0o755, .device = 7, .mount = 3 };
-    const file = linux.S.IFREG | 0o644;
+    const shared: Owner = .{ .uid = 0, .mode = sys.S.IFDIR | 0o1777, .device = 7, .mount = 3 };
+    const closed: Owner = .{ .uid = 0, .mode = sys.S.IFDIR | 0o755, .device = 7, .mount = 3 };
+    const file = sys.S.IFREG | 0o644;
     const same: Owner = .{ .uid = 0, .mode = file, .device = 7, .mount = 3 };
     try testing.expect(entry_problem(shared, same, euid) == null);
     const own: Owner = .{ .uid = euid, .mode = file, .device = 9, .mount = 3 };
@@ -850,8 +799,11 @@ test "in a directory others may write, an entry must live on the directory's own
         try testing.expectEqual(case[2], entry_problem(case[0], case[1], euid).?);
         try testing.expect(entry_problem(closed, case[1], euid) == null);
     }
-    // A real mount: as root, bind a directory over a name in a 1777 directory; refused.
-    if (linux.geteuid() != 0) return error.SkipZigTest;
+    // A real mount: as root, bind a directory over a name in a 1777 directory; refused. Linux
+    // alone: macOS has no bind mount (there the device check is all, and the table covers it).
+    if (!sys.is_linux) return error.SkipZigTest;
+    if (sys.geteuid() != 0) return error.SkipZigTest;
+    const linux = std.os.linux;
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -935,12 +887,10 @@ fn expect_cause(expected: []const u8, cause: []const u8) !void {
 /// its own owner and mode, never by the checkout's. The caller deletes it.
 pub fn test_directory(arena: Allocator) ![:0]const u8 {
     var random: [8]u8 = undefined;
-    const got = linux.getrandom(&random, random.len, 0);
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(got));
-    try testing.expectEqual(random.len, got);
+    try sys.test_random(&random);
     const name = std.mem.readInt(u64, &random, .little);
     const path = try std.fmt.allocPrintSentinel(arena, "/tmp/zcube-trust-{x:0>16}", .{name}, 0);
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mkdir(path, 0o700)));
+    try sys.test_mkdir(path, 0o700);
     try chmod_directory(path, 0o700);
     return path;
 }
@@ -948,7 +898,7 @@ pub fn test_directory(arena: Allocator) ![:0]const u8 {
 /// `parent/name`, made a directory of mode 0755 whatever the umask.
 fn test_subdirectory(arena: Allocator, parent: []const u8, name: []const u8) ![:0]const u8 {
     const path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ parent, name }, 0);
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mkdir(path, 0o755)));
+    try sys.test_mkdir(path, 0o755);
     try chmod_directory(path, 0o755);
     return path;
 }
@@ -968,5 +918,5 @@ fn write_test_policy(arena: Allocator, directory: []const u8) ![]const u8 {
 }
 
 fn chmod_directory(path: [:0]const u8, mode: u32) !void {
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.chmod(path, mode)));
+    try sys.test_chmod(path, mode);
 }
