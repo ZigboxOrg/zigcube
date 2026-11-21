@@ -9,7 +9,7 @@
 # Commands:  guest.sh setup-root | pull <reference> | key-new <name> | sign <key> <tree>
 #            guest.sh export <tree> | policy <public key> | kept <container> <tree>
 #            guest.sh images <tree> <reference> ...
-#            guest.sh agent <node> <server host:port> | containers | logs
+#            guest.sh agent <node> <server host:port> <tls dir> | containers | logs
 #
 # Every command prints `ok: ...` for what it did, or `FAIL: ...` and exits 1.
 
@@ -154,13 +154,20 @@ cmd_images() {
     ok "$IMAGES:$entries"
 }
 
+# The agent talks to the server's TLS listener with the CA, node certificate and key the demo put
+# in <tls dir> (ca.crt, node.crt, node.key): the server is not on this guest's loopback, and an
+# agent refuses plain HTTP to such a server (ZC-E0505).
 cmd_agent() {
-    [ $# -eq 2 ] || fail "usage: guest.sh agent <node> <server>"
+    [ $# -eq 3 ] || fail "usage: guest.sh agent <node> <server> <tls dir>"
     [ -f "$IMAGES" ] || fail "no $IMAGES: run guest.sh images first"
     [ -f "$POLICY" ] || fail "no $POLICY: run guest.sh policy first"
+    for file in ca.crt node.crt node.key; do
+        [ -f "$3/$file" ] || fail "no $3/$file"
+    done
     mkdir -p "$STATE" "$LOG"
     echo "--runtime zigbox --node $1 --server $2 --state-dir $STATE --cpu-millis 2000" \
-        "--memory-bytes 1073741824 --images $IMAGES --trust-policy $POLICY --verbose" >"$ARGS"
+        "--memory-bytes 1073741824 --images $IMAGES --trust-policy $POLICY --verbose" \
+        "--ca $3/ca.crt --cert $3/node.crt --key $3/node.key" >"$ARGS"
     # The arguments hold no space; word splitting is wanted.
     # shellcheck disable=SC2046
     setsid "$BIN/zcube-agent" $(cat "$ARGS") >>"$LOG/agent.log" 2>&1 </dev/null &
