@@ -2984,12 +2984,13 @@ fn add_offline_step(b: *std.Build, sim: SimStepOptions) void {
     add_seed_ranges(b, step, exe, seeds, &.{ b.fmt("{d}", .{c1_teeth_operations}), "--c1" });
 }
 
-/// Seeds of `sim-c1-runs-unread`: each failed J6 in this world before the job fence (2026-11-15,
-/// seeds 1 to 40 at 100 operations with `--c1`: J6 first at 12 seeds) and passes every check with
-/// it. The world is not healthy: the server fails a node's whole runs read while any of its runs
-/// has a stop asked, so the node can never report that run's end, and other seeds fail J8 or see
-/// a container no replica assigns (as they did before the fence); none fails J6 any more.
-const runs_unread_seeds = [_][]const u8{ "2..2", "18..18", "30..30", "32..32" };
+/// Seeds of `sim-c1-runs-unread`: each fails J6 in this world with the job fence switched off and
+/// passes every check with it (re-picked after C3's merge, seeds 1 to 120 at 100 operations with
+/// `--c1`: docs/decisions/2026-11-21-c3-merge-runs-unread-seeds.md). The world is not healthy:
+/// the server fails a node's whole runs read while any of its runs has a stop asked, so the node
+/// can never report that run's end, and other seeds fail J8, a convergence check or see a
+/// container no replica assigns (as they did before the fence); none fails J6 any more.
+const runs_unread_seeds = [_][]const u8{ "32..32", "34..34", "43..43", "56..56" };
 
 /// `zig build sim-c1-runs-unread`: the world that showed the J6 gap (the server fails a node's
 /// runs read while a stop is asked and answers its keepalives;
