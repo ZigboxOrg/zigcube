@@ -118,6 +118,9 @@ comptime {
     _ = @import("probe_worker.zig");
     _ = @import("zigbox_probes.zig");
     _ = @import("fetch_worker.zig");
+    _ = @import("seal.zig");
+    _ = @import("server_seal.zig");
+    _ = @import("testing/redaction.zig");
     _ = @import("server_ca.zig");
     _ = @import("server_revoked.zig");
     _ = @import("server_tls.zig");

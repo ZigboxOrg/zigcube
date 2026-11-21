@@ -233,6 +233,70 @@ pub fn sync_dir(io: std.Io, dir: Dir, where: []const u8, name: []const u8, diag:
     handle.sync(io) catch |err| return unusable(diag, where, name, "write", @errorName(err));
 }
 
+/// Writes a secret seed as `name` unless `name` exists: true if this call made it, false if a
+/// file of that name was there first (nothing is written; the caller reads that one). Two
+/// starts racing on one state directory so agree on one seed.
+pub fn write_seed_new(
+    io: std.Io,
+    dir: Dir,
+    where: []const u8,
+    name: []const u8,
+    seed: [32]u8,
+    diag: *Diag,
+) Error!bool {
+    var line: [65]u8 = undefined;
+    defer std.crypto.secureZero(u8, &line);
+    const text = std.fmt.bufPrint(&line, "{x}\n", .{&seed}) catch
+        unreachable; // 64 digits and "\n".
+    var temp: [temp_bytes_max]u8 = undefined;
+    const temp_name = try stage(io, dir, where, name, text, 0o600, &temp, diag);
+    defer dir.deleteFile(io, temp_name) catch {}; // Gone already when renamed.
+    const made = try rename_new(io, dir, where, temp_name, name, diag);
+    if (made) try sync_dir(io, dir, where, name, diag);
+    return made;
+}
+
+/// Renames `from` to `to` in `dir` unless `to` exists: true if renamed, false if `to` was there
+/// (nothing changed). Where the file system has no such rename, a hard link and an unlink do
+/// the same, never replacing `to`.
+pub fn rename_new(
+    io: std.Io,
+    dir: Dir,
+    where: []const u8,
+    from: []const u8,
+    to: []const u8,
+    diag: *Diag,
+) Error!bool {
+    assert(!std.mem.eql(u8, from, to));
+    dir.renamePreserve(from, dir, to, io) catch |err| switch (err) {
+        error.PathAlreadyExists => return false,
+        error.OperationUnsupported => return link_new(io, dir, where, from, to, diag),
+        else => return unusable(diag, where, to, "write", @errorName(err)),
+    };
+    return true;
+}
+
+/// `rename_new` where the file system has no such rename: a hard link, never over `to`, then
+/// an unlink of `from`. Apart so that a test reaches it on any file system.
+fn link_new(
+    io: std.Io,
+    dir: Dir,
+    where: []const u8,
+    from: []const u8,
+    to: []const u8,
+    diag: *Diag,
+) Error!bool {
+    assert(!std.mem.eql(u8, from, to));
+    dir.hardLink(from, dir, to, io, .{}) catch |err| switch (err) {
+        error.PathAlreadyExists => return false,
+        else => return unusable(diag, where, to, "write", @errorName(err)),
+    };
+    dir.deleteFile(io, from) catch |err| {
+        return unusable(diag, where, from, "remove", @errorName(err));
+    };
+    return true;
+}
+
 /// Writes a secret seed as `name`.
 pub fn write_seed(
     io: std.Io,
@@ -376,5 +440,32 @@ test "write takes the mode of the file" {
         const stat = try file.stat(io);
         const mode: std.posix.mode_t = case[1];
         try std.testing.expectEqual(mode, stat.permissions.toMode() & 0o777);
+    }
+}
+
+test "rename_new and its hard-link fallback never replace a file and move the old one" {
+    // Goal: review of PR #8 (SHOULD): the fallback for a file system without a no-replace
+    // rename was never run. Method: run `rename_new` and `link_new` alike: each moves `a` to a
+    // free name (the old name gone, the bytes kept) and returns false, changing nothing, when
+    // the new name exists.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var diag: Diag = undefined;
+    diag.reset();
+    inline for (.{ rename_new, link_new }) |move| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "a", .data = "old\n" });
+        try tmp.dir.writeFile(io, .{ .sub_path = "taken", .data = "kept\n" });
+        try std.testing.expect(!try move(io, tmp.dir, "tmp", "a", "taken", &diag));
+        var buffer: [16]u8 = undefined;
+        try std.testing.expectEqualStrings("kept\n", try tmp.dir.readFile(io, "taken", &buffer));
+        try std.testing.expectEqualStrings("old\n", try tmp.dir.readFile(io, "a", &buffer));
+
+        try std.testing.expect(try move(io, tmp.dir, "tmp", "a", "free", &diag));
+        try std.testing.expectEqualStrings("old\n", try tmp.dir.readFile(io, "free", &buffer));
+        try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "a", .{}));
+        try std.testing.expect(diag.code == null);
+        try tmp.dir.deleteFile(io, "free");
+        try tmp.dir.deleteFile(io, "taken");
     }
 }

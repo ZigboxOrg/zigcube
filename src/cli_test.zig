@@ -623,6 +623,48 @@ fn check_unredacted_bundle(world: *World) !void {
     try expect_contains(raw.find("/MANIFEST.txt").?, "redaction: OFF");
 }
 
+test "a bundle, redacted or not, holds neither the sealing key nor a sealed plaintext" {
+    // Goal: review of PR #8 (SHOULD): the redaction test covered the API and diagnostics, not
+    // the bundle. Method: a record sealed with the server's key (a known plaintext) under
+    // /edge-certs/ and a service; fail a command and bundle it, with redaction and without, and
+    // bundle the service; no file of any bundle holds the key or the plaintext in any form. The
+    // key is sealed away, so `--no-redact` has nothing of it to keep.
+    const redaction = @import("testing/redaction.zig");
+    const seal = @import("seal.zig");
+    var world: World = undefined;
+    try world.start();
+    defer world.stop();
+    const plain = "-----planted P-256 key for the bundle redaction test, never bundled-----";
+    var key = world.server.seal_key;
+    defer key.wipe();
+    const nonce: [seal.nonce_bytes]u8 = @splat(9);
+    var envelope_buffer: [seal.envelope_bytes_max]u8 = undefined;
+    const envelope = seal.seal(&key, "/edge-certs/a.example", plain, nonce, &envelope_buffer);
+    var value_buffer: [seal.envelope_bytes_max + 32]u8 = undefined;
+    const value = try std.fmt.bufPrint(&value_buffer, "{{\"v\":1,\"key\":\"{s}\"}}", .{envelope});
+    var diag: Diag = undefined;
+    diag.reset();
+    const put = [_]store_mod.Op{.{ .put = .{ .key = "/edge-certs/a.example", .value = value } }};
+    _ = try world.server.verified.interface().txn(.{ .on_success = &put }, &diag);
+    try plant_secrets(&world);
+    try testing.expectEqual(@as(u8, 1), world.run(&.{ "why", "service", "nosuch" }));
+
+    const runs = [_][]const []const u8{
+        &.{ "bundle", "--last" },
+        &.{ "bundle", "--last", "--no-redact" },
+        &.{ "bundle", "service", "hello", "--no-redact" },
+    };
+    for (runs) |args| {
+        try testing.expectEqual(@as(u8, 0), world.run(args));
+        const unpacked = try unpack(&world, try bundle_path(&world));
+        try testing.expect(unpacked.find("/MANIFEST.txt") != null);
+        for (unpacked.names.items, unpacked.contents.items) |name, content| {
+            try redaction.expect_absent(content, &key.bytes, name);
+            try redaction.expect_absent(content, plain, name);
+        }
+    }
+}
+
 test "bundle --last without a record says so, and with a dead server still works" {
     // Goal: ZC-E0117, and that the evidence is best effort. Method: bundle --last in a fresh
     // state directory; then fail against a dead address and bundle it: the notes name what could
