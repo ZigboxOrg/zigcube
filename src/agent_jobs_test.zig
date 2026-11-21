@@ -548,8 +548,9 @@ test "a stop the agent cannot read is enforced by the job fence while keepalives
 }
 
 /// Runs a run, optionally cancels it, then fails every read of the runs until the job fence has
-/// stopped it, and heals: the observation the node reports once it can read the runs again.
-fn fenced_ending(cancel: bool) !Seen {
+/// stopped it, optionally removes its stopped container (the runtime no longer lists it), and
+/// heals: the observation the node reports once it can read the runs again.
+fn fenced_ending(cancel: bool, vanish: bool) !Seen {
     var rig = try Rig.start();
     defer rig.stop();
     const world = rig.world;
@@ -564,10 +565,13 @@ fn fenced_ending(cancel: bool) !Seen {
     try testing.expect(!world.agent.fence.active);
     const kept = (try rig.start_record()).?;
     try testing.expectEqual(@as(?records.StopCause, .@"unreachable"), kept.stop_cause);
+    if (vanish) world.sim.evict(run_id);
     world.switched.down_list_prefix = null;
     world.advance(2_000);
     const seen = (try rig.observed()).?;
     try testing.expectEqual(records.JobObservedStatus.stopped, seen.status);
+    const lost = seen.exit.?.kind == .lost;
+    try testing.expectEqual(vanish, lost);
     return seen;
 }
 
@@ -577,11 +581,15 @@ test "a cancelled run the job fence stopped is reported cancelled, not unreachab
     // reported though the node stayed ready, so the job ended `failed`, not `cancelled`.
     // Method: the fence stops the run with `unreachable` recorded in both worlds; after the heal
     // the cancelled run reports `cancel`, and the run with no stop asked still reports
-    // `unreachable` (the fence's cause stands when the server committed no cancel).
-    const cancelled = try fenced_ending(true);
-    try testing.expectEqual(@as(?records.StopCause, .cancel), cancelled.stop_cause);
-    const unasked = try fenced_ending(false);
-    try testing.expectEqual(@as(?records.StopCause, .@"unreachable"), unasked.stop_cause);
+    // `unreachable` (the fence's cause stands when the server committed no cancel). Each also
+    // with the stopped container gone before the heal (PR #10's review): the run ends `lost`,
+    // and the same rule names its cause.
+    for ([_]bool{ false, true }) |vanish| {
+        const cancelled = try fenced_ending(true, vanish);
+        try testing.expectEqual(@as(?records.StopCause, .cancel), cancelled.stop_cause);
+        const unasked = try fenced_ending(false, vanish);
+        try testing.expectEqual(@as(?records.StopCause, .@"unreachable"), unasked.stop_cause);
+    }
 }
 
 test "the job fence counts from when the runs read was sent, not when it was answered" {

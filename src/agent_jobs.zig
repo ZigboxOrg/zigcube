@@ -190,7 +190,9 @@ pub fn enforce_deadlines(
 /// A running run container with no start record to say when, or a damaged one. `pass` stops it
 /// as `unknown`, with the server's word; while no read of the runs succeeds there is no pass, so
 /// the job fence stops it as it stops a recorded run (0.5.2 review 5927352205, item 7). No cause
-/// can be recorded without a record: once the server answers, `pass` reports what it finds.
+/// can be recorded without a record: once the server answers, `pass` reports what it finds, the
+/// container's plain exit with no stop cause (`exited_unrecorded`), as for `pass`'s own stop of
+/// it. A job that traps SIGTERM and exits 0 can so end `succeeded` though it was fenced.
 fn enforce_unrecorded(agent: *Agent, ctx: *const Context, listing: *const runtime.Listing) void {
     assert(is_running(listing));
     const fence_at = agent.job_fence_at_ms() orelse return;
@@ -487,7 +489,7 @@ const Work = struct {
                     }
                 }
                 if (listing == null and seen == null and subject.assigned) {
-                    if (found == .damaged) return work.lost(subject, null, seen, .damaged);
+                    if (found == .damaged) return work.lost(subject, null, seen, run, .damaged);
                     if (run) |entry| return work.claim(subject, entry);
                     return;
                 }
@@ -560,7 +562,7 @@ const Work = struct {
         } else if (try work.refused_unstarted(subject, seen)) {
             return;
         }
-        try work.lost(subject, null, seen, .missing);
+        try work.lost(subject, null, seen, work.run_of(subject.id), .missing);
     }
 
     /// A claim and nothing else: the node lost its disk, state directory and containers after
@@ -604,12 +606,13 @@ const Work = struct {
 
     const Why = enum { missing, damaged, vanished };
 
-    /// Reports the run stopped, `lost`, once.
+    /// Reports the run stopped, `lost`, once, its recorded cause named as `stopped` names it.
     fn lost(
         work: *Work,
         subject: Subject,
         record: ?StartRecord,
         seen: ?*const records.JobObserved,
+        run: ?*const Entry(records.JobRun),
         why: Why,
     ) Error!void {
         // A run with no assignment here has nothing to report under: it ends on this node.
@@ -626,7 +629,7 @@ const Work = struct {
             .status = .stopped,
             .epoch = epoch,
             .exit = .{ .kind = .lost },
-            .stop_cause = if (record) |held| held.stop_cause else null,
+            .stop_cause = if (record) |held| reported_cause(held.stop_cause, run) else null,
             .diagnostic = raw,
             .started_at_ms = if (record) |held| held.started_at_ms else null,
         });
@@ -645,7 +648,7 @@ const Work = struct {
             const held = seen.?;
             if (held.status == .claimed) return work.claimed_unstarted(subject, record, held, run);
         }
-        try work.lost(subject, record, seen, .vanished);
+        try work.lost(subject, record, seen, run, .vanished);
         // No container: a run with no assignment here is over on this node (`report_epoch`).
         if (!subject.assigned) try remove_record(work.ctx, work.state, subject.id);
     }
@@ -863,9 +866,11 @@ const Work = struct {
     }
 
     /// The cause a stopped run's report names. `unreachable` that this node recorded (the job
-    /// fence) stands for a stop it may have missed; once a runs read shows that the server
-    /// committed a cancel, the cancel is what the node missed, so it is reported instead: a
-    /// cancelled job ends `cancelled`, not `failed` (0.5.2 review 5927352205, item 4). Every
+    /// fence) stands for a stop it may have missed; once the runs read this report follows shows
+    /// that the server committed a cancel, it is reported instead, whenever the cancel was
+    /// committed (after the fence's kill too: the user asked for the stop, and the run is
+    /// stopped), so a cancelled job ends `cancelled`, not `failed` (0.5.2 review 5927352205,
+    /// item 4; docs/decisions/2026-11-21-fenced-cancel-reported-cancel.md). Every
     /// other recorded cause is what this node did, and the server's other stops (`unreachable`,
     /// `not_started`) say no more than `unreachable` does, so those stand.
     fn reported_cause(

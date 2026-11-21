@@ -376,8 +376,11 @@ is one pass of `reconcile`, after the replicas. It wants a run when the node hol
    on the boot clock; 0 in a file written before 0.5.2), and stops every running job with
    `stop_cause` `unreachable` at `runs_read_ms + ttl − fence_margin`, as the lease fence stops
    everything at the keepalive's. Services are not touched; the run ends `failed unreachable`,
-   unless the last runs read the agent did get already carried the server's stop with cause
-   `cancel`: then the agent reports `cancel` and the job ends `cancelled`, as asked
+   unless the server has committed a cancel of the run by the time the agent reports its ending
+   (judged from the runs read after the heal): then the agent reports `cancel` and the job ends
+   `cancelled`. That holds for a cancel committed after the fence had already killed the run too:
+   the user asked for the stop, and the run is stopped. The same rule names the cause when the
+   stopped container is gone by then and the run is reported `lost`
    (decisions/2026-11-21-fenced-cancel-reported-cancel.md). A running job container whose start
    record is missing or damaged is stopped at the same moment, since nothing else would stop it.
 
