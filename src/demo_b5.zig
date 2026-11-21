@@ -113,6 +113,9 @@ fn prepare(host: *Host, init: std.process.Init, options: Options) !void {
             .images = "",
             .store = "",
             .transcript_path = options.transcript,
+            // The server serves TLS only, and the guest's agent has a node certificate: an agent
+            // refuses plain HTTP to a server that is not on loopback (ZC-E0505, 0.6.0).
+            .tls_only = true,
         },
         .work = "",
         .state = "",

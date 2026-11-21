@@ -1162,8 +1162,13 @@ pub const registry = [_]Entry{
         \\be owned by root or the agent's user and writable by neither group nor
         \\others (a directory with the sticky bit, as /tmp, may be, and then
         \\every entry the path passes in it, a link included, must be owned by
-        \\root or the agent's user). The cause line names the setting and why.
-        \\The agent did not start and changed nothing.
+        \\root or the agent's user). Without --ca (or .ca in the file) the agent
+        \\speaks plain HTTP, so --server must then be a loopback address
+        \\(127.0.0.0/8 or [::1]): the server serves plain HTTP on loopback only,
+        \\and a node must not take its work unauthenticated over a network; give
+        \\--ca, --cert and --key to reach any other address over TLS. The cause
+        \\line names the setting and why. The agent did not start and changed
+        \\nothing.
         \\
         \\Run zcube-agent --help for the flags and the file's fields.
         ,

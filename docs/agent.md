@@ -50,7 +50,11 @@ unless `--registry` gives it a registry to fetch from (below).
 Capacity is declared, as HANDOFF's provisional answer says.
 With `--ca FILE` (and `--tls-name`) the agent speaks TLS to the server's `--listen`, presenting
 its own `node.crt` once it has joined, else `--cert` and `--key`
-([mtls.md](mtls.md), "The API over TLS"); without it, plain HTTP to `--insecure-listen`.
+([mtls.md](mtls.md), "The API over TLS"); without it, plain HTTP to `--insecure-listen`, and
+then `--server` must be a loopback address (127.0.0.0/8 or `[::1]`): the agent refuses any other
+at start-up (`ZC-E0505`), since the server serves plain HTTP on loopback only and a node would
+otherwise take its assignments unauthenticated
+([decision](decisions/2026-11-21-agent-plain-http-loopback-only.md)).
 
 **Node labels** (B6) are given by `--label KEY=VALUE`, once per label, or by `.labels` in the ZON
 file (`.labels = .{ "tenant=a", "exclusive=tenant" }`); at most `node_labels_max` (8), each at most
