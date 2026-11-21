@@ -244,10 +244,15 @@ pub const guest_tls_dir = "/root/tls";
 /// guest (mode 0600): the agent talks to the server's TLS listener (demo-b3 since B7 slice 6,
 /// demo-c2's four guests since slice 7).
 pub fn put_tls(demo: *Demo, index: u32) !void {
-    const host = demo.host;
+    return put_guest_tls(demo.host, demo.guests, index);
+}
+
+/// `put_tls` for a demo on the same rig that does not run demo-c2's steps (demo-c3, whose agents
+/// refuse plain HTTP to the host's 10.0.2.2 since 0.6.0, ZC-E0505).
+pub fn put_guest_tls(host: *Host, guests: *Guests, index: u32) !void {
     const flags = try host.agent_tls(vms.names[index]);
     assert(flags.len == 6);
-    const session = &demo.guests.sessions[index];
+    const session = &guests.sessions[index];
     const timeout_s: u32 = 60;
     // `chmod` too: demo-b3's guest made the directory already (`guest.sh put`), and `mkdir -p`
     // leaves an existing directory's mode as it is.

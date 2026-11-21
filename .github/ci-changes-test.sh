@@ -108,7 +108,7 @@ check $PR x "" "demo/up.sh" TTTTTTTTTTTTTTTTT
 # B5 slice 3: the trust world and its tooth are simulator files.
 check $PR x "" "src/sim_trust.zig src/sim_c1_teeth_job_untrusted_main.zig" TFFFFFFFFFFFFFFFF
 # demo-c2: its own files, its docs (off), an unknown path (on), the label and a release branch (on).
-check $PR x "" "src/demo_c2_steps.zig ops/demo-c2/run.sh" TFFFFFTFTFFFTFTFF
+check $PR x "" "src/demo_c2_steps.zig ops/demo-c2/run.sh" TFFFFFTFTFTFTFTFF
 check $PR x "" "docs/demos/c2.md" FFFFFFFFFFFFFFFFF
 check $PR x "" "src/never_heard_of_it.zig" TTTTTTTTTTTTTTTTT
 check $PR x "full-ci" "src/demo_c2.zig" TTTTTTTTTTTTTTTTT
@@ -123,7 +123,7 @@ check $PR x "" "docs/demos/b3.md" FFFFFFFFFFFFFFFFF
 # demo-b5: its own files, and the rig and state it shares with demo-b3; its docs (off).
 check $PR x "" "src/demo_b5.zig src/demo_b5_script.zig ops/demo-b5/guest.sh" TFFFFFFFFFFFTFFFF
 check $PR x "" "docs/demos/b5.md" FFFFFFFFFFFFFFFFF
-check $PR x "" "src/demo_c2_check.zig" TFFFFFTFTFFFTFTFF
+check $PR x "" "src/demo_c2_check.zig" TFFFFFTFTFTFTFTFF
 # A narrow path next to an unknown one runs everything; two narrow paths run the union.
 check $PR x "" "src/scheduler_test.zig src/server.zig" TTTTTTTTTTTTTTTTT
 check $PR x "" "src/zigbox_map.zig src/demo_c1_steps.zig" TFFTFTTFTFTFTFTFF
@@ -154,7 +154,7 @@ check $PR x "" "src/c3_smoke_steps.zig src/c3_witness.zig docs/demos/c3.md" TFFF
 check $PR x "" "src/demo_c3.zig ops/demo-c3/guest.sh" TFFFFFFFFFTFFFFFF
 check $PR x "" "src/c3_smoke.zig" TFFFFFFFFTFFFFFFF
 check $PR x "" "src/c3_smoke_steps.zig" TFFFFFFFFTTFFFFFF
-check $PR x "" "src/demo_c2_steps.zig" TFFFFFTFTFFFTFTFF
+check $PR x "" "src/demo_c2_steps.zig" TFFFFFTFTFTFTFTFF
 check $PR x "" "src/c3_smoke.zig src/demo_c1_state.zig" TFFTTFFFTTFTTTTFF
 check $PR x "" "docs/demos/c3.md" FFFFFFFFFFFFFFFFF
 
