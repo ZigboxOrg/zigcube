@@ -240,8 +240,10 @@ pub const registry = [_]Entry{
         \\cannot be read, is not a policy zbx reads (the cause names its line,
         \\column and what is wrong), or could be rewritten by someone other than
         \\root or the server's user (it must be a regular file owned by one of
-        \\them, writable by neither group nor others). The cause line names the
-        \\setting.
+        \\them, writable by neither group nor others, and so must every
+        \\directory on its path, a symbolic link's own directory and those of
+        \\its target included, unless the directory has the sticky bit, as /tmp
+        \\does). The cause line names the setting.
         \\
         \\Nothing was started. Correct the setting and start the server again.
         ,
@@ -1151,8 +1153,11 @@ pub const registry = [_]Entry{
         \\file's .labels differently, the labels differ from those the node
         \\registered with while its lease in --state-dir is live, or a file it
         \\names (the image fixtures, the --trust-policy file) cannot be read or
-        \\used. The cause line names the setting. The agent did not start and
-        \\changed nothing.
+        \\used. The --trust-policy file, and every directory on its path (a
+        \\symbolic link's own directory and those of its target included), must
+        \\be owned by root or the agent's user and writable by neither group nor
+        \\others (a directory with the sticky bit, as /tmp, may be). The cause
+        \\line names the setting. The agent did not start and changed nothing.
         \\
         \\Run zcube-agent --help for the flags and the file's fields.
         ,

@@ -375,7 +375,14 @@ is one pass of `reconcile`, after the replicas. It wants a run when the node hol
    agent keeps `runs_read_ms`, the send time of its last successful runs read (in `lease.json`,
    on the boot clock; 0 in a file written before 0.5.2), and stops every running job with
    `stop_cause` `unreachable` at `runs_read_ms + ttl − fence_margin`, as the lease fence stops
-   everything at the keepalive's. Services are not touched; the run ends `failed unreachable`.
+   everything at the keepalive's. Services are not touched; the run ends `failed unreachable`,
+   unless the server has committed a cancel of the run by the time the agent reports its ending
+   (judged from the runs read after the heal): then the agent reports `cancel` and the job ends
+   `cancelled`. That holds for a cancel committed after the fence had already killed the run too:
+   the user asked for the stop, and the run is stopped. The same rule names the cause when the
+   stopped container is gone by then and the run is reported `lost`
+   (decisions/2026-11-21-fenced-cancel-reported-cancel.md). A running job container whose start
+   record is missing or damaged is stopped at the same moment, since nothing else would stop it.
 
 ### A run's relay (B3 slice 2)
 
@@ -392,7 +399,8 @@ ZC-E0701, E0704, E0705, W0701 and W0702.
 
 The listener belongs to the supervisor, which outlives the agent, so an agent restart changes
 nothing and the adopting agent finds the relay as it was. The supervisor closes it, and every
-connection, when the command ends, however it ends (a stop, the deadline, a cancel); `kill -9` of
+connection, when the command ends, however it ends (a stop, the deadline, a cancel, either fence);
+`kill -9` of
 the supervisor kills the process and the kernel closes the listener. A stop does not wait for the
 command's end: before either runtime signals a running container (`stop`, or `signal` TERM or
 KILL) it writes an empty `relay.stop` into the container's directory, and the relay, which looks
@@ -460,7 +468,9 @@ on a real guest.
 `zcube-agent --trust-policy FILE` (ZON key `trust_policy`) names the node's own Zigbox trust policy
 (`docs/api.md`, "Signatures"). The agent reads it once at start through `src/trust_file.zig`, the
 reader the server uses too: a regular file, owned by root or by the agent's own user, writable by
-neither group nor others, and a policy Zigbox parses. Anything else is ZC-E0505 and the agent does
+neither group nor others, in directories each owned by root or that user and writable by neither
+group nor others unless sticky (`docs/decisions/2026-11-21-trust-policy-directories.md`), and a
+policy Zigbox parses. Anything else is ZC-E0505 and the agent does
 not start. No API call names, changes or switches the node's policy off; the node record carries its
 path (`trust_policy`) so `zcube why node` can say which file the agent registered with. An agent
 without the flag checks nothing, and neither does one whose policy asks for no signature and no

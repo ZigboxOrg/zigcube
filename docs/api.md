@@ -569,8 +569,9 @@ The server checks them only when its configuration has `trust = .{ .policy = "<p
 policy file (the format of `/etc/zbx/policy.zon`) read once at start; a file that cannot be read or
 parsed stops the server with ZC-E0106, and so does one that anyone but root or the server's own
 user could rewrite: the file must be a regular file owned by root or by that user, with neither
-group nor others allowed to write it (Zigbox's rule for its system policy; a policy others can
-rewrite gates nothing). With no `trust` entry, or a policy that asks for nothing,
+group nor others allowed to write it, in directories that are each owned by root or that user and
+writable by neither group nor others unless sticky, as `/tmp` is (Zigbox's rule for its system
+policy; a policy others can rewrite or replace gates nothing). With no `trust` entry, or a policy that asks for nothing,
 nothing is checked. Under a policy that asks for a signature, a new job (not a retry of a stored one)
 is judged with Zigbox's `verdict.judge` before anything is written. The subject is the job's `image`,
 which must then be a tree (`b3:` and 64 hex digits), and, when the job has a `source`, the manifest
