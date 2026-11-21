@@ -1332,16 +1332,7 @@ pub const Cluster = struct {
         node.sim.init(c.gpa, node.nclock.clock(), c.seed +% index, held);
         node.sim.containers.on_start = job_started;
         node.sim.containers.on_start_context = node;
-        node.mesh_view = null;
-        const host = sim_mesh_conns.host_of(index, &node.mesh_host_buf);
-        node.mesh_host_len = @intCast(host.len);
-        if (c.mesh_on) {
-            node.sim.containers.on_mesh = Node.mesh_delivered;
-            node.sim.containers.on_mesh_context = node;
-            // Replicas report `starting`, with their endpoint, for 1 to 4 s (drawn from the seed,
-            // not the cluster's stream): views then hold endpoints that are not ready (M4).
-            node.sim.warmup_ms = 1000 + (c.seed *% 0x9e3779b97f4a7c15 +% index) % 3000;
-        }
+        c.init_node_mesh(node, index);
         node.agent.init(node.config());
         // Its own generator: the store's contents must not move the cluster's stream.
         var store_prng = std.Random.DefaultPrng.init(c.seed ^ (0x5f5f0000 + index));
@@ -1379,6 +1370,21 @@ pub const Cluster = struct {
         node.all_up_ms = 0;
         c.net.set_faults(index, c.swarm.net);
         return node;
+    }
+
+    /// The node's mesh fields: its host name always, and with the mesh on, the runtime's hook
+    /// and a warm-up. Draws nothing from the cluster's stream.
+    fn init_node_mesh(c: *Cluster, node: *Node, index: u32) void {
+        node.mesh_view = null;
+        const host = sim_mesh_conns.host_of(index, &node.mesh_host_buf);
+        node.mesh_host_len = @intCast(host.len);
+        if (c.mesh_on) {
+            node.sim.containers.on_mesh = Node.mesh_delivered;
+            node.sim.containers.on_mesh_context = node;
+            // Replicas report `starting`, with their endpoint, for 1 to 4 s (drawn from the seed,
+            // not the cluster's stream): views then hold endpoints that are not ready (M4).
+            node.sim.warmup_ms = 1000 + (c.seed *% 0x9e3779b97f4a7c15 +% index) % 3000;
+        }
     }
 
     /// Moves the run to `step` and tells the runner's hook, if any.

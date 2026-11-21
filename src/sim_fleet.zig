@@ -64,7 +64,8 @@ const coverage = @import("sim_fleet_coverage.zig");
 const usage_text =
     "usage: sim_fleet ingest --repo OWNER/NAME --commit SHA --state FILE [--token-file FILE]\n" ++
     "                        [--tracker N]\n" ++
-    "                        [--kind sim-cluster|sim-c1|sim-c4|sim-swarm|sim-soak|store-faults]\n" ++
+    "                        [--kind sim-cluster|sim-c1|sim-c4|sim-swarm|sim-soak|\n" ++
+    "                                store-faults]\n" ++
     "                        [--dry-run] [--canary RUNNER --canary-seeds A..B\n" ++
     "                         [--expect-symptom TEXT[|TEXT]]]\n" ++
     "reads one kind's output of a round on stdin: `sim_cluster --seeds A..B <ops> --shrink`\n" ++
