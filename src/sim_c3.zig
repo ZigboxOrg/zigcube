@@ -191,6 +191,10 @@ fn step_of(
         .delete => |key| {
             const id = replica_id(key, service.rec.name) orelse continue;
             const replica = find_replica(snap, id) orelse continue;
+            // The exclusive-node exemption rests on the replica controller's ordering: its
+            // `classify` makes a replica on a node that refuses it dead before any other path
+            // (`roll_out`, `scale_down`) runs, so only `replace` deletes one. A change that lets
+            // another path retire such a replica must narrow this to `replace`'s removals.
             const forced = on_lost_node(snap, &replica.rec) or
                 on_exclusive_node(snap, &replica.rec);
             if (stopped(snap, &replica.rec) or forced) {

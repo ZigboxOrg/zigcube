@@ -24,6 +24,46 @@ Every replica that is not already dead is judged against its node's labels; a re
 dead, removed and replaced. While the rollout starts nothing, the replacement runs the removed
 replica's generation (`replace`'s templates, R4). No P1 bound changed.
 
+## Replacing a forced removal while halted is repair (supervisor, 2026-11-21)
+
+The first version of the fix left a gap the PR #6 review found: a halted rollout that removed
+two or more replicas it was forced to remove (on lost nodes, or on nodes that now refuse them) in
+one pass replaced none of them. Exactly 2 is enough: `replace` capped its creations at
+`batch_replicas_max - removed`, which is 0 once two are removed, and the next pass went to
+`scale_up`, which a pause stops; the service ran short until the resume. When the rollout had
+failed instead (its rollback refused, ZC-E0128), `scale_up` was not stopped and created replicas
+at the service's generation, the failed one.
+
+The rule now:
+
+- Replacing a forced-removed replica is repair, not rollout progress. While a service has stale
+  replicas or its rollout is halted (paused or failed), each removal the service's count needs
+  back is replaced in the same transaction, one for one, at the removed replica's generation.
+  A transaction removes only as many dead replicas as it can also replace (`removals_max`: one,
+  with `batch_replicas_max` at 2), so no replacement is ever owed to a later pass. The
+  replacements are not limited by the rollout's budget or step; `batch_replicas_max` still
+  bounds the rollout's own steps (new-generation creations and voluntary retirements) and the
+  size of one transaction, so a node that loses many replicas is repaired over several passes.
+- While a rollout has failed, nothing creates a replica of the failed generation. A removed
+  replica of it is not replaced by `replace`; `scale_up` fills the service's count from the
+  newest older generation a stale replica runs (its spec copied, as a replacement's is), and
+  falls back to the failed generation only when no older replica is left to copy. No record
+  keeps an older generation's spec (`Rollout` holds only `from`), so a failed first generation
+  (`from` 0), or a failed rollout whose old replicas were all lost, can return to its count only
+  at the failed generation. The two requirements conflict there, and the count wins: the halted
+  convergence checks (sim_c0's `halted_converged`, sim_cluster's convergence step) require it,
+  and creating nothing failed sim_c0's fuzz seed 1003 (a failed first generation) and
+  `--c1 --strong --tenants --health` seeds 28 and 33. The supervisor may choose otherwise; the
+  fallback is `newest_older`'s null in `scale_up`. A paused rollout's `scale_up` still creates
+  nothing (R4); its count comes back through the one-for-one replacements.
+- The surge bound (R2, `room`) applies to every replacement as before.
+
+Unit tests (`rollout_controller_test.zig`): the paused relabel test now asserts that the count is
+restored at both generations; a paused service with every replica on the relabelled node is
+repaired one per pass; a failed rollout's replicas moved off a node come back at generation 1,
+none at generation 2; and a failed rollout's service scaled from 3 to 5 gets one more generation
+1 replica and no generation 2 one.
+
 ## The C3 checker (`sim_c3.zig`)
 
 R1 and R4 count a removed old replica as a retirement unless it stopped or its node is lost. The
@@ -44,7 +84,6 @@ weaken R1 or R4 for any replica on a node that takes it.
 
 - `--c3 --tenants` (with or without `--health`), an ungated combination, fails R2 on seeds 4, 8
   and 33 at 150 operations, the same on 6f53b36 without this fix; with `--health` seed 38 too.
-  `--c3 --health` fails R1 on seed 4, also on 6f53b36.
-- A paused service that loses more than `batch_replicas_max` (2) replicas in one pass (lost or
-  refused) removes them all but replaces none past the batch: the next pass goes to `scale_up`,
-  which a pause stops, so the service runs short until the resume.
+  `--c3 --health` fails R1 on seed 4, also on 6f53b36. With the one-for-one replacements,
+  `--c3 --tenants` fails R2 on seeds 8, 33 and 38 and passes seed 4; with `--health`, R2 on
+  8, 33 and 38; `--c3 --health` still fails R1 on seed 4.

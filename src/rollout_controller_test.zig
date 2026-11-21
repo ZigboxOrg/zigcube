@@ -89,6 +89,21 @@ const checked_health: records.Health = .{
     .success_threshold = 1,
 };
 
+const test_capacity: records.Requests = .{
+    .cpu_millis = 8000,
+    .memory_bytes = 16 * 1024 * 1024 * 1024,
+};
+
+/// A second node for the tests that move replicas off node1.
+const node2: records.Node = .{ .name = "node2", .capacity = test_capacity };
+
+/// node1 registered again as `exclusive`: it takes no service replica (B6, P1).
+const exclusive_node1: records.Node = .{
+    .name = "node1",
+    .capacity = test_capacity,
+    .labels = &.{ "tenant=a", "exclusive=tenant" },
+};
+
 const Fixture = struct {
     manual: ManualClock,
     memory: *MemoryStore,
@@ -1110,33 +1125,96 @@ test "an old replica that dies during a pause is replaced at its own generation"
 test "an old replica of a paused rollout on a node registered exclusive is moved off it (P1)" {
     // Goal: a halted rollout keeps its stale replicas, but not on a node whose labels refuse a
     // service replica (B6 P1; CI seed 44892876942, a failed rollout's stale replica kept on a
-    // node an operator reinstalled exclusive). Method: two nodes, pause after the first new
-    // replica starts, register node1 again as exclusive, and look at what node1 holds.
+    // node an operator reinstalled exclusive), and each one moved is replaced at its own
+    // generation, so the service keeps its count while paused (PR #6 review: two refused in one
+    // pass were removed and none replaced). Method: two nodes, pause after the first new
+    // replica starts, register node1 again as exclusive, and count what each generation has.
     var fixture: Fixture = undefined;
     try fixture.start();
     defer fixture.stop();
-    const capacity: records.Requests = .{
-        .cpu_millis = 8000,
-        .memory_bytes = 16 * 1024 * 1024 * 1024,
-    };
-    const node2: records.Node = .{ .name = "node2", .capacity = capacity };
     try fixture.put(.{ .agent = "node2" }, records.node_key("node2").slice(), node2);
     try fixture.roll();
     try testing.expectEqual(records.RolloutPhase.paused, (try fixture.request(.pause)).done);
+    const old_before = try fixture.count_of(1);
     const new_before = try fixture.count_of(2);
     try testing.expect(try fixture.held_by("node1") > 0);
-    const exclusive: records.Node = .{
-        .name = "node1",
-        .capacity = capacity,
-        .labels = &.{ "tenant=a", "exclusive=tenant" },
-    };
-    try fixture.put(.{ .agent = "node1" }, records.node_key("node1").slice(), exclusive);
+    const on_node1 = try fixture.held_by("node1");
+    try fixture.put(.{ .agent = "node1" }, records.node_key("node1").slice(), exclusive_node1);
     try fixture.settle();
     try testing.expectEqual(@as(u32, 0), try fixture.held_by("node1"));
-    // Removed while paused, and no replica of the new generation started in its place (R4).
-    try testing.expectEqual(@as(u32, 0), try fixture.count_of(1));
+    try testing.expectEqual(old_before + new_before, try fixture.held_by("node2"));
+    // Each removal replaced at its own generation, and nothing of the new one started (R4).
+    try testing.expectEqual(old_before, try fixture.count_of(1));
     try testing.expectEqual(new_before, try fixture.count_of(2));
+    const total: u32 = @intCast((try fixture.replicas()).len);
+    try testing.expectEqual(old_before + new_before, total);
     try testing.expectEqual(records.RolloutPhase.paused, (try fixture.rollout()).phase);
+    // The review's case: more than one replica was moved off node1 in the same pass.
+    try testing.expect(on_node1 >= 2);
+}
+
+test "every old replica of a paused rollout moved off one node is replaced, one per pass" {
+    // Goal: the halted repair rule with more forced removals than a batch holds: a paused
+    // service whose every replica sits on a node registered exclusive comes back to its count at
+    // the same generations. Method: one node during the rollout, pause, add node2, then
+    // register node1 exclusive, so all four replicas are refused in the same pass.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.roll();
+    try testing.expectEqual(records.RolloutPhase.paused, (try fixture.request(.pause)).done);
+    const old_before = try fixture.count_of(1);
+    const new_before = try fixture.count_of(2);
+    try testing.expectEqual(old_before + new_before, try fixture.held_by("node1"));
+    try testing.expect(old_before >= 2);
+    try fixture.put(.{ .agent = "node2" }, records.node_key("node2").slice(), node2);
+    try fixture.put(.{ .agent = "node1" }, records.node_key("node1").slice(), exclusive_node1);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 0), try fixture.held_by("node1"));
+    try testing.expectEqual(old_before, try fixture.count_of(1));
+    try testing.expectEqual(new_before, try fixture.count_of(2));
+    try testing.expectEqual(old_before + new_before, try fixture.held_by("node2"));
+    try testing.expectEqual(records.RolloutPhase.paused, (try fixture.rollout()).phase);
+}
+
+test "a failed rollout's replicas moved off a node come back old, never at the failed generation" {
+    // Goal: while a rollout has failed and its rollback is refused (ZC-E0128), nothing creates a
+    // replica of the failed generation, and the service still returns to its count. Method: the
+    // failed rollout's three old replicas and its held new one all on node1; add node2 and
+    // register node1 exclusive; the old ones are replaced at generation 1 one for one, the held
+    // new one is removed and not replaced.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.fail(.refuse);
+    try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
+    try testing.expectEqual(@as(u32, 1), try fixture.count_of(2));
+    try testing.expectEqual(@as(u32, 4), try fixture.held_by("node1"));
+    try fixture.put(.{ .agent = "node2" }, records.node_key("node2").slice(), node2);
+    try fixture.put(.{ .agent = "node1" }, records.node_key("node1").slice(), exclusive_node1);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 0), try fixture.held_by("node1"));
+    try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
+    try testing.expectEqual(@as(u32, 0), try fixture.count_of(2));
+    try testing.expectEqual(@as(u32, 3), try fixture.held_by("node2"));
+    const failed = try fixture.rollout();
+    try testing.expectEqual(records.RolloutPhase.failed, failed.phase);
+    try testing.expectEqual(@as(u64, 2), (try fixture.service()).generation);
+}
+
+test "a failed rollout's service scaled up runs the older generation, never the failed one" {
+    // Goal: `scale_up` while a rollout has failed (rollback refused, ZC-E0128) creates no
+    // replica of the failed generation. Method: fail generation 2 with its rollback refused,
+    // scale the service from 3 to 5 replicas, and count each generation.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.fail(.refuse);
+    try rescale(&fixture, 5);
+    try fixture.settle();
+    try testing.expectEqual(records.RolloutPhase.failed, (try fixture.rollout()).phase);
+    try testing.expectEqual(@as(u32, 1), try fixture.count_of(2));
+    try testing.expectEqual(@as(u32, 4), try fixture.count_of(1));
 }
 
 test "a held new replica fails the rollout with ZC-E0304 and nothing more starts" {
