@@ -603,7 +603,9 @@ ended and `lost_grace_ms` has passed, the run ends `failed unreachable`; if the 
 reports it stopped the run, `failed fenced`; a run that was never claimed ends `failed not_started`.
 `failed unreachable` is also what the agent reports when its job fence stopped the run: the node
 kept its lease but could not read its runs for `ttl − fence_margin` (#143,
-decisions/2026-11-15-j6-143-job-fence.md), so it can end a run whose node was never lost.
+decisions/2026-11-15-j6-143-job-fence.md), so it can end a run whose node was never lost. A run
+whose cancel the agent had already read before the fence stopped it is reported `cancel` and ends
+`cancelled` (decisions/2026-11-21-fenced-cancel-reported-cancel.md).
 An ending written for a lost node rests on the agent having fenced itself first (the bound of I1b),
 and a wedged node breaks it, as for services.
 
