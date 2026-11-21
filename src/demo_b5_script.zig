@@ -145,6 +145,9 @@ fn write_server_policy(demo: *Demo, public: []const u8) !void {
         \\    .require_signature = true }}
         \\
     , .{public}) });
+    // The server refuses a policy its group or others could write (ZC-E0106): mode 0644
+    // whatever the umask, in the work directory `demo_b5.zig` made 0755.
+    try cwd.setFilePermissions(host.io, policy_path, .fromMode(0o644), .{});
     const config_path = try host.path_in_work("server.zon");
     try cwd.writeFile(host.io, .{ .sub_path = config_path, .data = try std.fmt.allocPrint(arena,
         \\.{{ .trust = .{{ .policy = "{s}" }} }}

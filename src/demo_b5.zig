@@ -133,6 +133,9 @@ fn prepare(host: *Host, init: std.process.Init, options: Options) !void {
     host.state = try std.fmt.allocPrint(arena, "{s}/state", .{host.work});
     errdefer cwd.deleteTree(init.io, host.work) catch {}; // Best effort: it is in /tmp.
     try cwd.createDirPath(init.io, host.state);
+    // The server's trust policy lives here, and a directory its group or others could write is
+    // refused (ZC-E0106): 0755 whatever the umask.
+    try cwd.setFilePermissions(init.io, host.work, .fromMode(0o755), .{});
     try cwd.createDirPath(init.io, try host.path_in_work("home"));
     try host.cli_environ.put("PATH", init.environ_map.get("PATH") orelse "/usr/bin:/bin");
     try host.cli_environ.put("HOME", try host.path_in_work("home"));

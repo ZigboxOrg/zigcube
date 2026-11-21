@@ -624,7 +624,10 @@ The server's cluster CA signs a relayed run's key through
 with the image digest, placement epoch and labels, valid until the run's last legitimate moment
 (`job_cert.zig`). The relay presents it to the upstream and checks the upstream with the `foreign`
 server profile against the relay entry's `server_ca` and `server_name`
-(docs/decisions/2026-11-13-b4-relay-tls.md).
+(docs/decisions/2026-11-13-b4-relay-tls.md). That window is an upper bound, not the run's life:
+a run stopped sooner (a cancel, the lease fence, or the job fence when the agent cannot read its
+runs, docs/agent.md) takes its relay and every connection down with it, and the certificate is
+not revoked.
 
 Threats this does not answer yet:
 
