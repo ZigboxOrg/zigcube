@@ -2098,6 +2098,12 @@ pub const registry = [_]Entry{
         \\record is deleted, a new key is made, and every public host is ordered
         \\again (ZC-W0808); the old key file is kept, renamed aside.
         \\
+        \\A record that no key can open (not one JSON object, or a sealed key
+        \\that is not an envelope this server reads) is damaged, not sealed with
+        \\another key: the diagnostic names it and says so, and the fix is to
+        \\delete that one record from the store and start again. The key file is
+        \\not at fault; --discard-sealed also clears it, with every other record.
+        \\
         \\The start-up check reads at most 2,048,000 records under each prefix
         \\(4096 pages of 500). Past that the server refuses to start rather than
         \\check part of them: delete the records no public host uses any more.

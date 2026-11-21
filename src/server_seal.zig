@@ -52,17 +52,18 @@ fn records_max(pages_max: u32) u64 {
 
 /// The discard's rounds of `store_txn_ops_max` deletes under one prefix: enough for every record
 /// a scan of `pages_max` pages admits, plus one failed compare (a record rewritten meanwhile)
-/// per page.
+/// per page, plus the last round, whose listing finds the prefix empty: with exactly that many
+/// records and failed compares, the discard still sees that it finished.
 fn rounds_max(pages_max: u32) u64 {
     const rounds = std.math.divCeil(u64, records_max(pages_max), constants.store_txn_ops_max) catch
         unreachable; // The divisor is a positive constant.
     assert(rounds * constants.store_txn_ops_max >= records_max(pages_max));
-    return rounds + pages_max;
+    return rounds + pages_max + 1;
 }
 
 comptime {
     assert(scan_records_max == 2_048_000);
-    assert(rounds_max(constants.seal_scan_pages_max) == 128_000 + 4096);
+    assert(rounds_max(constants.seal_scan_pages_max) == 128_000 + 4096 + 1);
 }
 
 pub const Options = struct {
@@ -108,6 +109,9 @@ const Scan = struct {
         key_length: u32 = 0,
         expected: ?seal.KeyId,
         why: []const u8,
+        /// The record cannot be read under any key (not one JSON object, a sealed member that
+        /// is not one envelope of this version): the record is at fault, not the key file.
+        damaged: bool,
 
         fn key(refused: *const Refused) []const u8 {
             return refused.key_buffer[0..refused.key_length];
@@ -151,6 +155,7 @@ pub fn open(
             .why = refused.why,
             .expected = refused.expected,
             .found = found_id,
+            .damaged = refused.damaged,
         });
         return error.Failed;
     }
@@ -313,30 +318,40 @@ fn check_one(kv: store.KeyValue, key: ?*const seal.Key, result: *Scan) void {
     if (sealed == .none) return;
     result.records += 1;
     var expected: ?seal.KeyId = null;
-    const why = switch (sealed) {
+    const why: Why = switch (sealed) {
         .none => unreachable, // Returned above.
-        .unreadable => |why| why,
+        .unreadable => |text| .{ .text = text, .damaged = true },
         .envelope => |envelope| why: {
             expected = seal.key_id_of(envelope);
             break :why refusal_of(envelope, kv.key, key) orelse return;
         },
     };
-    result.refused = .{ .expected = expected, .why = why };
+    result.refused = .{ .expected = expected, .why = why.text, .damaged = why.damaged };
     const refused = &result.refused.?;
     assert(kv.key.len <= refused.key_buffer.len);
     @memcpy(refused.key_buffer[0..kv.key.len], kv.key);
     refused.key_length = @intCast(kv.key.len);
 }
 
-/// Why `envelope` at `path` does not open with `key`, or null if it opens.
-fn refusal_of(envelope: []const u8, path: []const u8, key: ?*const seal.Key) ?[]const u8 {
-    const k = key orelse return "there is no key file";
+/// Why a record did not open, and whether the record itself is at fault.
+const Why = struct { text: []const u8, damaged: bool };
+
+/// Why `envelope` at `path` does not open with `key`, or null if it opens. A malformed envelope
+/// is damaged: no key opens it, so the key file is not the cause.
+fn refusal_of(envelope: []const u8, path: []const u8, key: ?*const seal.Key) ?Why {
+    const k = key orelse return .{ .text = "there is no key file", .damaged = false };
     var plain: [constants.seal_plaintext_bytes_max]u8 = undefined;
     defer std.crypto.secureZero(u8, &plain);
     _ = seal.open(k, path, envelope, &plain) catch |err| return switch (err) {
-        error.Malformed => "it is not a sealed envelope this server can read",
-        error.WrongKey => "it was sealed with another key",
-        error.Forged => "it does not open with this key (changed, or moved from another key)",
+        error.Malformed => .{
+            .text = "it is not a sealed envelope this server can read",
+            .damaged = true,
+        },
+        error.WrongKey => .{ .text = "it was sealed with another key", .damaged = false },
+        error.Forged => .{
+            .text = "it does not open with this key (changed, or moved from another key)",
+            .damaged = false,
+        },
     };
     return null;
 }
@@ -354,11 +369,14 @@ pub const Refusal = struct {
     expected: ?seal.KeyId,
     /// The id of the key file's key, or null if there is no file.
     found: ?seal.KeyId,
+    /// The record cannot be read under any key: it is named, and deleting it is the fix.
+    damaged: bool = false,
 };
 
 /// ZC-E0824. Public for the CLI golden test.
 pub fn raise_refused(diag: *Diag, refusal: Refusal) void {
     assert(diag.code == null);
+    if (refusal.damaged) return raise_damaged(diag, refusal);
     diag.raise(.E0824);
     // Without --verbose only the last cause is shown: it names what the operator acts on, the
     // key id the records expect and the key file; the ones before say which record and why.
@@ -377,6 +395,23 @@ pub fn raise_refused(diag: *Diag, refusal: Refusal) void {
         });
     }
     diag.fix(.{ .sentence = "restore the key file from a backup, mode 0600, and start again" });
+    diag.fix(.{
+        .sentence = "or start once with --discard-sealed: every sealed record is deleted and " ++
+            "every public host is ordered again",
+        .command = "zcube-server --discard-sealed",
+    });
+}
+
+/// ZC-E0824 for a record no key can open: the record is named in the cause shown by default,
+/// with no key id (the key file is not at fault), and the first fix deletes that one record;
+/// `--discard-sealed`, which deletes every sealed record, is the fallback.
+fn raise_damaged(diag: *Diag, refusal: Refusal) void {
+    assert(refusal.damaged);
+    diag.raise(.E0824);
+    diag.cause("{d} sealed record(s) checked; the rest were not read", .{refusal.records});
+    diag.cause("{s} cannot be read under any key: {s}", .{ refusal.record, refusal.why });
+    diag.fix(.{ .sentence = "delete that record from the store (it is not a sealed record " ++
+        "this server can read), then start again" });
     diag.fix(.{
         .sentence = "or start once with --discard-sealed: every sealed record is deleted and " ++
             "every public host is ordered again",
@@ -934,9 +969,83 @@ test "only the sealed member is opened: clear members shaped like envelopes star
     rig.diag.reset();
     try rig.put(host, "not json");
     try testing.expectError(error.Failed, rig.open_key(false));
-    try testing.expect(cause_holds(&rig.diag, "does not open: it is not one JSON object"));
+    try testing.expect(cause_holds(&rig.diag, "cannot be read under any key: it is not one JSON"));
     rig.diag.reset();
 }
+
+test "a record no key can open is named, with the fix to delete it, not the key-id message" {
+    // Goal: review of PR #8 (SHOULD): a damaged record under the right key was told "restore
+    // the key file", a key that is not wrong. Method: with the right key file in place, each
+    // damaged record (not JSON, an empty sealed member, a key cut short under the right key id,
+    // another version's header) refuses the start; the default output names the record and
+    // the delete fix, and never a key id or the restore fix. A `"key":null` entry starts. A
+    // record sealed with another key still gets the key-id message.
+    var rig: TestRig = undefined;
+    try rig.init(testing.io);
+    defer rig.deinit();
+    var key = try rig.open_key(false);
+    defer key.wipe();
+    try rig.put_sealed(&key, "/edge-certs/a.example", plain_key);
+    try rig.put("/edge-certs/pending.example", "{\"state\":\"pending\",\"key\":null}");
+    var ok = try rig.open_key(false);
+    ok.wipe();
+
+    const id = key.id();
+    const short = "{\"key\":\"zcseal1." ++ id ++ ".AAAA\"}";
+    const damaged = [_][]const u8{
+        "not json",
+        "{\"state\":\"pending\",\"key\":\"\"}",
+        short,
+        "{\"key\":\"zcseal2." ++ id ++ ".AAAA\"}",
+    };
+    const host = "/edge-certs/b.example";
+    for (damaged) |value| {
+        rig.diag.reset();
+        try rig.put(host, value);
+        try testing.expectError(error.Failed, rig.open_key(false));
+        try testing.expectEqual(codes.Code.E0824, rig.diag.code.?);
+        try testing.expect(rendered_holds(&rig.diag, .text, host ++ " cannot be read under any"));
+        try testing.expect(rendered_holds(&rig.diag, .text, "delete that record from the store"));
+        try testing.expect(rendered_holds(&rig.diag, .text, "--discard-sealed"));
+        try testing.expect(!rendered_holds(&rig.diag, .verbose, "key id"));
+        try testing.expect(!rendered_holds(&rig.diag, .verbose, "restore the key file"));
+    }
+
+    rig.diag.reset();
+    try rig.put(host, "{}");
+    const other: seal.Key = .{ .bytes = @splat(0x42) };
+    try rig.put_sealed(&other, host, plain_key);
+    try testing.expectError(error.Failed, rig.open_key(false));
+    try testing.expect(rendered_holds(&rig.diag, .text, "restore the key file"));
+    try testing.expect(rendered_holds(&rig.diag, .text, "holds key id " ++ id));
+    try testing.expect(!rendered_holds(&rig.diag, .verbose, "delete that record"));
+    rig.diag.reset();
+}
+
+test "the damaged-record refusal's default output, pinned" {
+    // Goal: the wording of ZC-E0824 for a record no key opens (DIAGNOSTICS.md: golden tests):
+    // the record and the delete fix, no key id, no restore fix.
+    var diag: Diag = undefined;
+    diag.reset();
+    raise_refused(&diag, .{
+        .state_dir = "/var/lib/zcube-server",
+        .key_name = "seal-0123456789abcdef.key",
+        .records = 3,
+        .record = "/edge-certs/shop.example.com",
+        .why = "it is not one JSON object",
+        .expected = null,
+        .found = "5a1d0c4e9b2f7a68".*,
+        .damaged = true,
+    });
+    var diagnostic: diag_mod.Diagnostic = undefined;
+    diag_mod.to_diagnostic(&diagnostic, &diag);
+    var buffer: [constants.diag_output_bytes_max]u8 = undefined;
+    const text = diag_mod.render(&diagnostic, .text, false, &buffer);
+    try testing.expectEqualStrings(damaged_golden, text);
+}
+
+/// Captured from this test's own output (a real render), beside the CLI goldens.
+const damaged_golden = @embedFile("testdata/cli/E0824.damaged.txt");
 
 test "the scan's bound is one cause naming the bound, the count and a remedy without the flag" {
     var diag: Diag = undefined;
@@ -984,13 +1093,18 @@ fn expect_redacted_all(diag: *Diag, key: []const u8, plain: []const u8) !void {
     }
 }
 
-/// Whether the rendered diagnostic holds `needle`, the lines it wraps joined again: every run
-/// of white space is read as one space.
+/// Whether the full cause chain (--verbose) holds `needle`; see `rendered_holds`.
 fn cause_holds(diag: *Diag, needle: []const u8) bool {
+    return rendered_holds(diag, .verbose, needle);
+}
+
+/// Whether the diagnostic rendered in `mode` holds `needle`, the lines it wraps joined again:
+/// every run of white space is read as one space.
+fn rendered_holds(diag: *Diag, mode: @import("zigbox").render.Mode, needle: []const u8) bool {
     var diagnostic: diag_mod.Diagnostic = undefined;
     diag_mod.to_diagnostic(&diagnostic, diag);
     var buffer: [constants.diag_output_bytes_max]u8 = undefined;
-    const text = diag_mod.render(&diagnostic, .verbose, false, &buffer);
+    const text = diag_mod.render(&diagnostic, mode, false, &buffer);
     var joined: [constants.diag_output_bytes_max]u8 = undefined;
     var length: usize = 0;
     var spaced = false;
@@ -1016,6 +1130,8 @@ fn cause_holds(diag: *Diag, needle: []const u8) bool {
 const FaultyStore = struct {
     inner: store.Store,
     compares_fail: bool = false,
+    /// The next this many compared transactions fail, then they pass.
+    compares_fail_next: u32 = 0,
     txns_left: ?u32 = null,
 
     const vtable: store.Store.VTable = .{
@@ -1106,9 +1222,11 @@ const FaultyStore = struct {
             left.* -= 1;
         }
         const inner = faulty.inner;
-        if (!faulty.compares_fail or request.compares.len == 0) {
+        const fail_next = faulty.compares_fail_next > 0;
+        if (!(faulty.compares_fail or fail_next) or request.compares.len == 0) {
             return inner.vtable.txn(inner.context, request, diag);
         }
+        if (fail_next) faulty.compares_fail_next -= 1;
         const instead: store.TxnRequest = .{ .on_success = request.on_failure };
         var failed = try inner.vtable.txn(inner.context, instead, diag);
         failed.succeeded = false;
@@ -1170,6 +1288,26 @@ test "a discard whose compares keep failing is ZC-E0824 unfinished, and keeps th
     try testing.expectEqualSlices(u8, &other, &(try rig.key_file()).?);
     var aside: [aside_name_bytes_max]u8 = undefined;
     try testing.expectEqual(@as(usize, 0), try rig.asides(&aside));
+}
+
+test "a discard with every record the scan admits and a failed compare per page finishes" {
+    // Goal: review of PR #8 (NIT): `rounds_max` had no round left to list the emptied prefix.
+    // Method: one page bounds the scan, `records_max(1)` records under /edge-certs/ and
+    // `pages_max` (1) failed compares: every round is used, the last one finds the prefix
+    // empty, and the discard finishes rather than reporting itself unfinished.
+    var rig: TestRig = undefined;
+    try rig.init(testing.io);
+    defer rig.deinit();
+    const records: u32 = @intCast(records_max(1));
+    _ = try plant_unopenable(&rig, records, 0, 0);
+    var faulty: FaultyStore = .{ .inner = rig.memory.interface(), .compares_fail_next = 1 };
+    var key = try discard_over(&rig, faulty.interface(), 1);
+    key.wipe();
+    try testing.expectEqual(@as(u32, 0), faulty.compares_fail_next);
+    try testing.expectEqual(@as(usize, 0), try rig.count("/edge-certs/"));
+    const deletes = std.math.divCeil(u64, records, constants.store_txn_ops_max) catch
+        unreachable; // The divisor is a positive constant.
+    try testing.expectEqual(rounds_max(1), deletes + 1 + 1);
 }
 
 test "a discard cut after one prefix leaves the old key; the next start with the flag ends it" {

@@ -1392,9 +1392,10 @@ fn expect_key_file_refused(
 test "the server's stderr holds neither a sealing key nor a sealed plaintext" {
     // Goal: review of PR #8 (SHOULD): the redaction test covered replies and diagnostics, not
     // logs. Method: fd 2 goes to a file while a verbose, logging server seals a record, a
-    // `--discard-sealed` start warns (ZC-W0808) and a plain start serves the record; the file
-    // must hold the warning and every request line (the capture works), and neither key nor
-    // the plaintext in any form the harness knows.
+    // `--discard-sealed` start warns (ZC-W0808) and seals another, and a plain start opens that
+    // record (its start check holds the plaintext in memory) and serves it; the file must hold
+    // the warning and every request line (the capture works), and neither key nor the
+    // plaintext in any form the harness knows.
     const seal = @import("seal.zig");
     const redaction = @import("testing/redaction.zig");
     const Op = @import("store.zig").Op;
@@ -1413,15 +1414,17 @@ test "the server's stderr holds neither a sealing key nor a sealed plaintext" {
     var config = config_for(.{ .sqlite = path }, true);
     config.quiet = false;
     config.verbose = true;
-    var keys: [2]@import("seal.zig").Key = undefined;
+    var keys: [3]@import("seal.zig").Key = undefined;
     defer for (&keys) |*key| key.wipe();
     for (&keys, 0..) |*key, round| {
         config.discard_sealed = round == 1;
         const server = try start_logging(io, config);
         defer server.stop();
         key.* = server.seal_key;
+        if (round == 2) try expect_opened(server, &keys[1]);
         var key_name_buffer: [64]u8 = undefined;
-        // Round 0 seals a record; round 1 starts without its key, so the discard has work.
+        // Round 0 seals a record; round 1 starts without its key, so the discard has work, and
+        // seals the record round 2's plain start opens with key 1.
         const nonce: [seal.nonce_bytes]u8 = @splat(@intCast(round + 1));
         var envelope_buffer: [seal.envelope_bytes_max]u8 = undefined;
         const envelope = seal.seal(key, "/edge-certs/a.example", plain, nonce, &envelope_buffer);
@@ -1450,6 +1453,27 @@ test "the server's stderr holds neither a sealing key nor a sealed plaintext" {
     try testing.expect(std.mem.indexOf(u8, logged, "/v1/watch") != null);
     for (&keys) |*key| try redaction.expect_absent(logged, &key.bytes, "the server's stderr");
     try redaction.expect_absent(logged, plain, "the server's stderr");
+}
+
+/// The plain start opened the sealed record: it kept the key the record was sealed with (no
+/// discard, no new key), and the record, sealed under that key's id, is there, so the start
+/// check opened it (a record it does not open refuses the start, ZC-E0824).
+fn expect_opened(server: *server_mod.Server, sealed_with: *const @import("seal.zig").Key) !void {
+    try testing.expectEqualSlices(u8, &sealed_with.bytes, &server.seal_key.bytes);
+    try testing.expect(!server.seal_discard);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    const got = try server.verified.interface().get(
+        arena.allocator(),
+        "/edge-certs/a.example",
+        null,
+        &diag,
+    );
+    const seal = @import("seal.zig");
+    const envelope = seal.sealed_of(got.kv.?.value).envelope;
+    try testing.expectEqualSlices(u8, &sealed_with.id(), &seal.key_id_of(envelope).?);
 }
 
 /// `start_server` with request logging on.

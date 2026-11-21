@@ -50,15 +50,28 @@ After the store's first check and before the CA is loaded, the server reads ever
   the records expect and the key file; `--verbose` also names the first record that did not open
   and why. No key is written. Fixes: restore the key file from a backup, or start once with
   `--discard-sealed`.
+- **A record no key can open** (not one JSON object, an empty `key`, a `key` that is not an
+  envelope of this version): the start is refused with **ZC-E0824**, naming that record ("<record>
+  cannot be read under any key: <why>") and no key id, since the key file is not at fault. Fixes:
+  delete that record from the store and start again, or start once with `--discard-sealed`.
 
 The sealed member is found by the record's schema, never by the shape of its text. A sealed
 record is one JSON object whose secret is the top-level member `key`, a string holding exactly one
 envelope; every other member is clear and is never opened, whatever it holds (a host named
-`zcseal1.0123456789abcdef.example.com`, say). A record with no `key` member is skipped: an entry
-not yet given a key holds nothing sealed. A `key` member that is not one envelope of this version
-(another version's header, a damaged key id, a clear key) is refused, never skipped, and so is a
-value that is not one JSON object, names `key` twice, or nests more than 64 levels deep
-(docs/decisions/2026-11-21-c5-seal-find-by-schema.md).
+`zcseal1.0123456789abcdef.example.com`, say). A record with no `key` member, or with `"key":null`,
+is skipped: an entry not yet given a key holds nothing sealed. A `key` member that is not one
+envelope of this version (another version's header, a damaged key id, a clear key, the empty
+string) is refused, never skipped, and so is a value that is not one JSON object, names `key`
+twice, or nests more than 64 levels deep (docs/decisions/2026-11-21-c5-seal-find-by-schema.md).
+
+### Writers
+
+A writer under `/edge-certs/` or `/acme-account/` (slice 3b's ACME shell) names its record's
+sealed field `seal.sealed_member` (`key`), at the top level, and checks its record type at
+comptime with `seal.sealed_record(T)`: a type whose secret field is named otherwise, or nested,
+fails the build, rather than leaving every record unchecked at start. A pending entry leaves
+`key` out or writes `null` (what `std.json.Stringify` writes for a null optional by default),
+never `""`, which is refused.
 
 When there is no key and no sealed record, the key is written before the CA and the listeners are
 opened, so a start that one of them refuses leaves the new key file behind. That is harmless: no
