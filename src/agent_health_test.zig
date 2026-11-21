@@ -233,6 +233,33 @@ test "agent health: a restarted agent reports unknown until the checks run again
     try testing.expectEqual(records.HealthState.healthy, (try rig.seen()).health.?);
 }
 
+test "agent health: a failed read of the replicas keeps every check's verdict" {
+    // Goal: PR #6 review SHOULD. A step whose loading fails has no replicas to give the health
+    // stage; run anyway, its sweep forgot every check on the node, and the next good step
+    // re-tracked each replica fresh, so a healthy replica reported `unknown` until
+    // `success_threshold` checks passed again (and, mid-rollout, the rollout saw it not ready).
+    // Method: a healthy replica with a success threshold of 3; one step whose list of
+    // `/assigned/<node>/` fails; its check is still tracked and it never reports `unknown`.
+    const rig = try Rig.start(check(1, 3, 0));
+    defer rig.stop();
+    const world = rig.world;
+    world.advance(5_000);
+    try testing.expectEqual(records.HealthState.healthy, (try rig.seen()).health.?);
+    try testing.expectEqual(@as(u32, 1), world.agent.probes.count);
+    const prefix = records.assigned_prefix(sim_world.node_name);
+    world.switched.down_list_prefix = prefix.slice();
+    _ = world.agent_step();
+    world.switched.down_list_prefix = null;
+    try testing.expectEqual(@as(?codes.Code, .E0201), world.last_failure);
+    world.last_failure = null;
+    try testing.expectEqual(@as(u32, 1), world.agent.probes.count);
+    var step: u32 = 0;
+    while (step < 40) : (step += 1) {
+        world.advance(sim_world.tick_ms);
+        try testing.expectEqual(records.HealthState.healthy, (try rig.seen()).health.?);
+    }
+}
+
 test "agent health: a replica without a check is written at version 2, with no health" {
     const rig = try Rig.start(null);
     defer rig.stop();

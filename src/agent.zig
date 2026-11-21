@@ -554,8 +554,12 @@ pub const Agent = struct {
     ) u32 {
         var acted: u32 = 0;
         // A failed health stage stops the replica stages (`replicas` checks `stopped`), not the
-        // job pass below (#247).
-        kept.stage(agent, ctx, "run the health checks", pass.health_checks());
+        // job pass below (#247). A step stopped before here loaded no replicas: the health stage
+        // is skipped, as its sweep would forget every check on the node for one failed read, and
+        // each replica would report `unknown` until its checks passed again (PR #6 review).
+        if (!kept.stopped) {
+            kept.stage(agent, ctx, "run the health checks", pass.health_checks());
+        }
         pass.replicas(kept);
         // The job pass runs even after a failure that is not the runtime's, in a replica stage
         // (#247), in the loading or in the image summary (#142): it then makes one read (the
