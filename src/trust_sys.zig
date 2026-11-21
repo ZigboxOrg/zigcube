@@ -1,9 +1,10 @@
 //! The system calls `trust_file.zig` makes, on Linux (raw, as the rest of the shell) and on
-//! macOS (through libSystem, which every Darwin build links): `zcube` is built and tested on
-//! macOS too, and it reaches `trust_file.zig` through `server_config.zig`. A raw Linux system
-//! call there is killed by SIGSYS. The rules are the same on both: owner, mode, sticky bit and
-//! mount. macOS has no mount id, so an entry there is judged by its device alone, and a mount
-//! root is seen as a device that differs from its directory's.
+//! macOS (through libSystem, which every Darwin build links): `zcube` may be built and run on a
+//! Mac, and it reaches `trust_file.zig` through `server_config.zig`. A raw Linux system call
+//! there is killed by SIGSYS. `zig build trust-macos` (in `check`) compiles the macOS half; no
+//! gate runs it on a Mac. The rules are the same on both: owner, mode, sticky bit, mount and
+//! link count. macOS has no mount id, so an entry there is judged by its device alone, and a
+//! mount root is seen as a device that differs from its directory's.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -39,7 +40,15 @@ pub const Owner = struct {
     mount: ?u64 = null,
     /// `STATX_ATTR_MOUNT_ROOT`: something is mounted here (Linux 5.8 and later only).
     mount_root: bool = false,
+    /// The number of names the file has (`stx_nlink`, `st_nlink`); 0 when the kernel did not
+    /// report it.
+    links: u32 = 1,
 };
+
+/// The system call `look_up` makes, as a refusal names it.
+pub const look_up_call = if (is_linux) "statx" else "fstatat";
+/// The system call `look_up_open` makes, as a refusal names it.
+pub const look_up_open_call = if (is_linux) "statx" else "fstat";
 
 pub const Looked = union(enum) {
     found: Owner,
@@ -109,13 +118,20 @@ fn from_stat(stat: *const c.Stat) Owner {
         .uid = stat.uid,
         .mode = stat.mode,
         .device = @as(u32, @bitCast(stat.dev)),
+        .links = stat.nlink,
     };
 }
 
 fn statx(dir: linux.fd_t, path: [*:0]const u8, flags: u32) Looked {
     comptime assert(is_linux);
     var stat = std.mem.zeroes(linux.Statx);
-    const mask: linux.STATX = .{ .TYPE = true, .MODE = true, .UID = true, .MNT_ID = true };
+    const mask: linux.STATX = .{
+        .TYPE = true,
+        .MODE = true,
+        .NLINK = true,
+        .UID = true,
+        .MNT_ID = true,
+    };
     const result = linux.statx(dir, path, flags, mask, &stat);
     const errno = linux.errno(result);
     if (errno != .SUCCESS) return .{ .failed = errno };
@@ -126,6 +142,7 @@ fn statx(dir: linux.fd_t, path: [*:0]const u8, flags: u32) Looked {
         .device = (@as(u64, stat.dev_major) << 32) | stat.dev_minor,
         .mount = if (stat.mask.MNT_ID) stat.mnt_id else null,
         .mount_root = attribute(stat.attributes_mask, stat.attributes, statx_attr_mount_root),
+        .links = if (stat.mask.NLINK) stat.nlink else 0,
     } };
 }
 
@@ -172,6 +189,11 @@ pub fn test_chmod(path: [*:0]const u8, mode: u32) !void {
 pub fn test_symlink(target: [*:0]const u8, link: [*:0]const u8) !void {
     if (is_linux) return expect_done(linux.symlink(target, link));
     return expect_done(c.symlink(target, link));
+}
+
+pub fn test_link(old: [*:0]const u8, new: [*:0]const u8) !void {
+    if (is_linux) return expect_done(linux.link(old, new));
+    return expect_done(c.link(old, new));
 }
 
 pub fn test_rename(old: [*:0]const u8, new: [*:0]const u8) !void {

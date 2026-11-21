@@ -205,7 +205,9 @@ fn walk_step(w: *Walk, path: []const u8, options: Options, diag: *Diag) Error!vo
 /// `readlinkat` is not subject to (PR #10's re-review). And it must not be a mount point, nor
 /// on another mount than its directory: a user may mount (FUSE) over a name they own, and the
 /// mounted root then reports whatever owner and mode its daemon chooses (PR #10's third review;
-/// docs/decisions/2026-11-21-trust-policy-mounts-and-macos.md).
+/// docs/decisions/2026-11-21-trust-policy-mounts-and-macos.md). Nor may anything but a directory
+/// have another name: a user may hard-link a root-owned file (another policy) to a name they
+/// made, where `fs.protected_hardlinks` is off (PR #13's review).
 fn check_entry(
     holder: Owner,
     entry: Owner,
@@ -232,6 +234,10 @@ fn check_entry(
             "may write (mode {o:0>4}), is on the trust policy's path: {s}{s}{s}", .{
             what, problem.text(), mode, name, tail.join, tail.path,
         }, mount_fix),
+        .hard_link => bad(diag, options, "{s} with {d} hard links, in a directory others may " ++
+            "write (mode {o:0>4}), is on the trust policy's path: {s}{s}{s}", .{
+            what, entry.links, mode, name, tail.join, tail.path,
+        }, hard_link_fix),
     };
 }
 
@@ -240,13 +246,16 @@ pub const EntryProblem = enum {
     foreign_owner,
     mount_root,
     other_mount,
+    hard_link,
 
-    /// The cause's words, after what the entry is (`foreign_owner` names the uid itself).
+    /// The cause's words, after what the entry is (`foreign_owner` and `hard_link` name their
+    /// number themselves).
     pub fn text(problem: EntryProblem) []const u8 {
         return switch (problem) {
             .foreign_owner => "owned by another user",
             .mount_root => "that is a mount point",
             .other_mount => "on another mount than its directory",
+            .hard_link => "with more than one name",
         };
     }
 };
@@ -254,11 +263,18 @@ pub const EntryProblem = enum {
 /// Null when `entry`, in the directory `holder`, may be passed; otherwise what is wrong. Only a
 /// directory others may write (sticky, as `directory_problem` allows) constrains its entries.
 /// The mount is compared by mount id where the kernel gives both, else by device: an overlay or
-/// a btrfs subvolume can report another device for a file on the directory's own mount.
+/// a btrfs subvolume can report another device for a file on the directory's own mount. Anything
+/// but a directory must have exactly one name (a link count the kernel did not report, 0, too).
 pub fn entry_problem(holder: Owner, entry: Owner, euid: u32) ?EntryProblem {
     if (holder.mode & 0o022 == 0) return null;
     assert(holder.mode & sys.S.ISVTX != 0);
     if (entry.uid != 0 and entry.uid != euid) return .foreign_owner;
+    if (mount_problem(holder, entry)) |problem| return problem;
+    if (entry.mode & sys.S.IFMT != sys.S.IFDIR and entry.links != 1) return .hard_link;
+    return null;
+}
+
+fn mount_problem(holder: Owner, entry: Owner) ?EntryProblem {
     if (entry.mount_root) return .mount_root;
     if (holder.mount) |holder_mount| {
         if (entry.mount) |entry_mount| {
@@ -388,6 +404,9 @@ const directory_fix = "keep the policy in a directory that only root or the proc
 const mount_fix = "keep the policy out of directories others may write, such as /tmp, where " ++
     "anyone may mount over a name they made; /etc/zcube is the place for it";
 
+const hard_link_fix = "keep the policy out of directories others may write, such as /tmp, " ++
+    "where anyone may hard-link another file to a name they made; /etc/zcube is the place for it";
+
 /// Null when a directory of this owner and mode keeps a policy file in it from being swapped by
 /// anyone but root and `euid`; otherwise what is wrong (never `not_regular`). A directory others
 /// may write is allowed only with the sticky bit (`/tmp`): there no one may rename or remove a
@@ -413,8 +432,8 @@ fn check_owner(owner: Owner, path: []const u8, options: Options, diag: *Diag) Er
 fn owner_of(file: std.Io.File, path: []const u8, options: Options, diag: *Diag) Error!Owner {
     return switch (sys.look_up_open(file.handle)) {
         .found => |owner| owner,
-        .failed => |errno| bad(diag, options, "can't stat the opened trust policy (fstat " ++
-            "E{t}): {s}", .{ errno, path }, options.fix),
+        .failed => |errno| bad(diag, options, "can't stat the opened trust policy ({s} " ++
+            "E{t}): {s}", .{ sys.look_up_open_call, errno, path }, options.fix),
         .incomplete => bad(diag, options, "the file system did not report the opened trust " ++
             "policy's owner and mode: {s}", .{path}, options.fix),
     };
@@ -427,9 +446,9 @@ fn look_up(name: [:0]const u8, path: []const u8, options: Options, diag: *Diag) 
     const tail = on_the_way(name, path);
     return switch (sys.look_up(name)) {
         .found => |owner| owner,
-        .failed => |errno| bad(diag, options, "can't look up the trust policy: {s} (statx " ++
+        .failed => |errno| bad(diag, options, "can't look up the trust policy: {s} ({s} " ++
             "E{t}): {s}{s}{s}", .{
-            look_up_text(errno), errno, name, tail.join, tail.path,
+            look_up_text(errno), sys.look_up_call, errno, name, tail.join, tail.path,
         }, options.fix),
         .incomplete => bad(diag, options, "can't look up the trust policy: the file system " ++
             "did not report an owner and mode: {s}{s}{s}", .{ name, tail.join, tail.path }, //
@@ -827,9 +846,10 @@ test "in a directory others may write, an entry must live on the directory's own
     diag.reset();
     try testing.expectError(error.BadConfig, read(arena, io, path, test_options, &diag));
     // The kernel sets `STATX_ATTR_MOUNT_ROOT` on a bind mount's root from Linux 5.8; before
-    // it, the mount id (or the device) differs instead.
-    const cause = diag.causes.slice()[0].slice();
-    const words = if (std.mem.startsWith(u8, cause, "a directory that is a mount point"))
+    // it, the mount id (or the device) differs instead. Where the kernel reports the flag (read
+    // here as linux/stat.h's 0x2000, apart from `trust_sys`), the cause must name it, so a
+    // `trust_sys` that read the wrong bit (the pinned std's) fails here (PR #13's review).
+    const words = if (test_reports_mount_root(try arena.dupeSentinel(u8, over, 0)))
         "that is a mount point"
     else
         "on another mount than its directory";
@@ -838,6 +858,69 @@ test "in a directory others may write, an entry must live on the directory's own
         words, over, path,
     });
     try expect_cause(expected, diag.causes.slice()[0].slice());
+}
+
+/// Whether the kernel reports `STATX_ATTR_MOUNT_ROOT` (0x2000 in linux/stat.h) for `path`.
+fn test_reports_mount_root(path: [*:0]const u8) bool {
+    const linux = std.os.linux;
+    var stat = std.mem.zeroes(linux.Statx);
+    const flags = linux.AT.SYMLINK_NOFOLLOW;
+    const result = linux.statx(linux.AT.FDCWD, path, flags, .{ .TYPE = true }, &stat);
+    assert(linux.errno(result) == .SUCCESS);
+    return @as(u64, @bitCast(stat.attributes_mask)) & 0x2000 != 0;
+}
+
+test "in a directory others may write, nothing but a directory may have another name" {
+    // Goal: PR #13's review (SHOULD): with `fs.protected_hardlinks` off (the kernel's default),
+    // anyone may `ln /etc/zigbox/policy.zon /tmp/zcube-trust.zon` before the operator makes it:
+    // a root-owned, 0644 file on the directory's own mount, which the server would then read.
+    // Method: the rule on stat results (a file or link of 2 names, or of an unreported count,
+    // refused there and passed in a closed directory; a directory of many passed); then a real
+    // policy hard-linked into a 1777 directory, refused, and read under its first name.
+    const euid: u32 = 1000;
+    const shared: Owner = .{ .uid = 0, .mode = sys.S.IFDIR | 0o1777, .device = 7, .mount = 3 };
+    const closed: Owner = .{ .uid = 0, .mode = sys.S.IFDIR | 0o755, .device = 7, .mount = 3 };
+    const file: Owner = .{ .uid = 0, .mode = sys.S.IFREG | 0o644, .device = 7, .mount = 3 };
+    try testing.expect(entry_problem(shared, file, euid) == null);
+    var directory = file;
+    directory.mode = sys.S.IFDIR | 0o755;
+    directory.links = 5;
+    try testing.expect(entry_problem(shared, directory, euid) == null);
+    var linked = file;
+    linked.links = 2;
+    var unreported = file;
+    unreported.links = 0;
+    var link = linked;
+    link.mode = sys.S.IFLNK | 0o777;
+    for ([_]Owner{ linked, unreported, link }) |entry| {
+        try testing.expectEqual(EntryProblem.hard_link, entry_problem(shared, entry, euid).?);
+        try testing.expect(entry_problem(closed, entry, euid) == null);
+    }
+
+    const io = testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const base = try test_directory(arena);
+    defer std.Io.Dir.cwd().deleteTree(io, base) catch {}; // Best effort: it is in /tmp.
+    const good = try test_subdirectory(arena, base, "good");
+    const target = try arena.dupeSentinel(u8, try write_test_policy(arena, good), 0);
+    const sticky = try test_subdirectory(arena, base, "shared");
+    try chmod_directory(sticky, 0o1777);
+    const squat = try std.fmt.allocPrintSentinel(arena, "{s}/trust.zon", .{sticky}, 0);
+    var diag: Diag = undefined;
+    diag.reset();
+    _ = try read(arena, io, target, test_options, &diag);
+    try sys.test_link(target, squat);
+    diag.reset();
+    try testing.expectError(error.BadConfig, read(arena, io, squat, test_options, &diag));
+    try testing.expectEqual(@as(?codes.Code, .E0505), diag.code);
+    const expected = try std.fmt.allocPrint(arena, "a file with 2 hard links, in a directory " ++
+        "others may write (mode 1777), is on the trust policy's path: {s}", .{squat});
+    try expect_cause(expected, diag.causes.slice()[0].slice());
+    // Under its first name, in a directory only its owner can write, it is still read.
+    diag.reset();
+    _ = try read(arena, io, target, test_options, &diag);
 }
 
 test "a refusal says why before it names the paths, which may be long" {
@@ -858,7 +941,8 @@ test "a refusal says why before it names the paths, which may be long" {
     diag.reset();
     try testing.expectError(error.BadConfig, read(arena, io, missing, test_options, &diag));
     const absent = diag.causes.slice()[0].slice();
-    const reason = "can't look up the trust policy: no such file or directory (statx ENOENT): ";
+    const reason = "can't look up the trust policy: no such file or directory (" ++
+        sys.look_up_call ++ " ENOENT): ";
     try testing.expect(std.mem.startsWith(u8, absent, reason));
     const path = try write_test_policy(arena, held);
     try chmod_directory(held, 0o775);

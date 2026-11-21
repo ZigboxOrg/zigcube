@@ -68,6 +68,7 @@ pub fn build(b: *std.Build) void {
     add_mtls_teeth_step(b, shared_options);
     add_local_smoke_step(b, built);
     add_x509_format_step(b, zigbox_module);
+    add_trust_macos_step(b, optimize);
     add_bench_watch_step(b, shared_options);
     add_public_tls_check_step(b, shared_options);
     add_zigbox_smoke_step(b, built);
@@ -771,6 +772,31 @@ fn add_local_smoke_step(b: *std.Build, built: Built) void {
 
 /// `zig build x509-format`: the certificates `src/x509.zig` writes, read by openssl, keytool and
 /// the JDK (src/x509_format_check.zig, tools/mtls/X509Dump.java). Never cached, not in `check`.
+/// `zig build trust-macos`: the tests of `src/trust_file.zig` (and the calls of `trust_sys.zig`
+/// they make) compiled for aarch64-macos and x86_64-macos, analysed only (nothing requests the
+/// binary, so no code is generated and no SDK is needed), as Zigbox's `fuzz-macos`. `zcube`
+/// reaches `trust_file.zig` on a Mac through `server_config.zig`, and the macOS half of
+/// `trust_sys.zig` is compiled by no other gate (PR #13's review); `check` runs it.
+fn add_trust_macos_step(b: *std.Build, optimize: std.builtin.OptimizeMode) void {
+    const step = b.step("trust-macos", "Compile trust_file's tests for macOS, without a binary");
+    for ([_]std.Target.Cpu.Arch{ .aarch64, .x86_64 }) |arch| {
+        const target = b.resolveTargetQuery(.{ .cpu_arch = arch, .os_tag = .macos });
+        const zigbox = b.dependency("zigbox", .{ .target = target, .optimize = optimize });
+        const tests = b.addTest(.{
+            .name = b.fmt("trust-macos-{t}", .{arch}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/trust_file.zig"),
+                .target = target,
+                .optimize = optimize,
+                // libSystem, which every Darwin program links: `trust_sys.zig` calls it there.
+                .link_libc = true,
+                .imports = &.{.{ .name = "zigbox", .module = zigbox.module("zigbox") }},
+            }),
+        });
+        step.dependOn(&tests.step);
+    }
+}
+
 fn add_x509_format_step(b: *std.Build, zigbox_module: *std.Build.Module) void {
     const exe = b.addExecutable(.{
         .name = "x509_format_check",
@@ -3093,7 +3119,7 @@ fn add_check_step(b: *std.Build) void {
         "install",            "test",          "tidy",                   "errors-site-check",
         "wasm-check",         "wasm-test",     "console-wasm",           "check-store-memory",
         "check-store-sqlite", "mtls-teeth",    "demo-b3-build",          "demo-b5-build",
-        "demos-build",        "jepsen-client", "register-barrier-build",
+        "demos-build",        "jepsen-client", "register-barrier-build", "trust-macos",
     };
     for (gates) |name| {
         const gate = b.top_level_steps.get(name) orelse @panic(name);
