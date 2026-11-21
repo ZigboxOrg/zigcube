@@ -460,7 +460,9 @@ on a real guest.
 `zcube-agent --trust-policy FILE` (ZON key `trust_policy`) names the node's own Zigbox trust policy
 (`docs/api.md`, "Signatures"). The agent reads it once at start through `src/trust_file.zig`, the
 reader the server uses too: a regular file, owned by root or by the agent's own user, writable by
-neither group nor others, and a policy Zigbox parses. Anything else is ZC-E0505 and the agent does
+neither group nor others, in directories each owned by root or that user and writable by neither
+group nor others unless sticky (`docs/decisions/2026-11-21-trust-policy-directories.md`), and a
+policy Zigbox parses. Anything else is ZC-E0505 and the agent does
 not start. No API call names, changes or switches the node's policy off; the node record carries its
 path (`trust_policy`) so `zcube why node` can say which file the agent registered with. An agent
 without the flag checks nothing, and neither does one whose policy asks for no signature and no

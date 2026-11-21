@@ -63,6 +63,7 @@ pub fn read(
         return bad(diag, options, "can't read the trust policy {s}", .{path}, options.fix);
     defer file.close(io);
     try check_owner(owner_of(file), path, options, diag);
+    try check_directories(io, path, options, diag);
     // A file of exactly the bound is allowed: the limit refuses one that reaches it.
     const limit: std.Io.Limit = .limited(zigbox.trust.limits.policy_bytes_max + 1);
     var reader = file.reader(io, &.{});
@@ -80,6 +81,57 @@ pub fn read(
 
 /// Who owns the policy file and its mode bits.
 pub const Owner = struct { uid: u32, mode: u32 };
+
+/// Each directory above the policy file, up to `/`, must be one that only root or the process's
+/// own user can change: whoever may write a directory on the way can rename the policy away and
+/// put their own in its place, which the next start reads (0.5.2 review 5927352205, item 8;
+/// docs/decisions/2026-11-21-trust-policy-directories.md). The path is resolved first, so a
+/// symbolic link is judged where it leads, as the file was.
+fn check_directories(io: std.Io, path: []const u8, options: Options, diag: *Diag) Error!void {
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const length = std.Io.Dir.cwd().realPathFile(io, path, &buffer) catch
+        return bad(diag, options, "can't resolve the trust policy {s}", .{path}, options.fix);
+    var real: []const u8 = buffer[0..length];
+    assert(std.fs.path.isAbsolute(real));
+    // A resolved path has at most one directory per separator: the walk is bounded by its length.
+    var steps: usize = 0;
+    while (std.fs.path.dirname(real)) |parent| : (steps += 1) {
+        assert(steps < length);
+        assert(parent.len < real.len);
+        var parent_buffer: [std.fs.max_path_bytes:0]u8 = undefined;
+        @memcpy(parent_buffer[0..parent.len], parent);
+        parent_buffer[parent.len] = 0;
+        const parent_z = parent_buffer[0..parent.len :0];
+        const owner = owner_stat(std.os.linux.AT.FDCWD, parent_z, 0) orelse
+            return bad(diag, options, "can't read the owner of {s}, the directory of the " ++
+                "trust policy {s}", .{ parent, path }, options.fix);
+        if (directory_problem(owner, std.os.linux.geteuid())) |problem| {
+            return bad(diag, options, "the trust policy {s} is in {s}, which {s}{s} " ++
+                "(owner uid {d}, mode {o:0>4})", .{
+                path,
+                parent,
+                problem.text(),
+                if (problem == .foreign_owner) options.user else "",
+                owner.uid,
+                owner.mode & 0o7777,
+            }, directory_fix);
+        }
+        real = parent;
+    }
+}
+
+const directory_fix = "keep the policy in a directory that only root or the process's own " ++
+    "user can write, such as /etc/zcube, and chmod go-w every directory above it";
+
+/// Null when a directory of this owner and mode keeps a policy file in it from being swapped by
+/// anyone but root and `euid`; otherwise what is wrong (never `not_regular`). A directory others
+/// may write is allowed only with the sticky bit (`/tmp`): there no one may rename or remove a
+/// file they do not own.
+pub fn directory_problem(owner: Owner, euid: u32) ?OwnerProblem {
+    if (owner.uid != 0 and owner.uid != euid) return .foreign_owner;
+    if (owner.mode & 0o022 != 0 and owner.mode & std.os.linux.S.ISVTX == 0) return .writable;
+    return null;
+}
 
 fn check_owner(owner_or_null: ?Owner, path: []const u8, options: Options, diag: *Diag) Error!void {
     const owner = owner_or_null orelse
@@ -234,4 +286,63 @@ test "a refusal raises the caller's code and names its setting" {
     const bad_policy = parse(arena, ".{ .keys = .{} }", "p.zon", test_options, &diag);
     try testing.expectError(error.BadConfig, bad_policy);
     try testing.expectEqual(@as(?codes.Code, .E0505), diag.code);
+}
+
+test "a policy file's directories must be ones only root or the process's own user can change" {
+    // Goal: the 0.5.2 review 5927352205, item 8: a policy file owned and moded right, in a
+    // directory others may write, could be renamed away and replaced before the next start.
+    // Method: the rule on owners and modes; then a real policy read in its directory at 0755,
+    // refused at 0775 and 0757 (the cause names the directory and its mode), and read at 1777.
+    const euid: u32 = 1000;
+    const directory: u32 = std.os.linux.S.IFDIR;
+    try testing.expect(directory_problem(.{ .uid = 0, .mode = directory | 0o755 }, euid) == null);
+    const own: Owner = .{ .uid = euid, .mode = directory | 0o700 };
+    try testing.expect(directory_problem(own, euid) == null);
+    try testing.expect(directory_problem(.{ .uid = 0, .mode = directory | 0o1777 }, euid) == null);
+    const refused = [_]struct { Owner, OwnerProblem }{
+        .{ .{ .uid = 1001, .mode = directory | 0o755 }, .foreign_owner },
+        .{ .{ .uid = 1001, .mode = directory | 0o1777 }, .foreign_owner },
+        .{ .{ .uid = 0, .mode = directory | 0o775 }, .writable },
+        .{ .{ .uid = euid, .mode = directory | 0o757 }, .writable },
+    };
+    for (refused) |case| try testing.expectEqual(case[1], directory_problem(case[0], euid).?);
+
+    const io = testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "policy", .default_dir);
+    const public = zigbox.trust.key.public_text(zigbox.trust.key.public_of_seed(@splat(7)));
+    const good = try std.fmt.allocPrint(arena, ".{{ .version = 1, .keys = .{{ .{{ " ++
+        ".name = \"botpike\", .public = \"{s}\" }} }}, .require_signature = true }}", .{&public});
+    try tmp.dir.writeFile(io, .{ .sub_path = "policy/trust.zon", .data = good });
+    const file = try tmp.dir.openFile(io, "policy/trust.zon", .{ .mode = .read_write });
+    defer file.close(io);
+    try file.setPermissions(io, .fromMode(0o644));
+    const held = try std.fmt.allocPrintSentinel(arena, ".zig-cache/tmp/{s}/policy", .{
+        tmp.sub_path,
+    }, 0);
+    const path = try std.fmt.allocPrint(arena, "{s}/trust.zon", .{held});
+    var diag: Diag = undefined;
+    for ([_]u32{ 0o755, 0o1777 }) |mode| {
+        try chmod_directory(held, mode);
+        diag.reset();
+        _ = try read(arena, io, path, test_options, &diag);
+    }
+    for ([_]u32{ 0o775, 0o757 }) |mode| {
+        try chmod_directory(held, mode);
+        diag.reset();
+        try testing.expectError(error.BadConfig, read(arena, io, path, test_options, &diag));
+        try testing.expectEqual(@as(?codes.Code, .E0505), diag.code);
+        const cause = diag.causes.slice()[0].slice();
+        try testing.expect(std.mem.indexOf(u8, cause, "/policy, which can be written") != null);
+    }
+    try chmod_directory(held, 0o755);
+}
+
+fn chmod_directory(path: [:0]const u8, mode: u32) !void {
+    const linux = std.os.linux;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.chmod(path, mode)));
 }
