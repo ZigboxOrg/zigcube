@@ -584,6 +584,42 @@ test "a cancelled run the job fence stopped is reported cancelled, not unreachab
     try testing.expectEqual(@as(?records.StopCause, .@"unreachable"), unasked.stop_cause);
 }
 
+test "the job fence counts from when the runs read was sent, not when it was answered" {
+    // Goal: the 0.5.2 review 5927352205, item 5: no test pinned the job fence to the time the
+    // runs read was sent. A stop committed while a slow read is in flight may be missing from
+    // its answer, so a fence counted from the answer would stop the run too late.
+    // Method: one read of the runs takes 2 s; the fence's stamp must be the time it was sent,
+    // and with every later read failing, the run runs until `sent + ttl - margin` and is stopped
+    // by the fence after it.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const world = rig.world;
+    _ = try rig.assign(600_000);
+    rig.step();
+    try testing.expect(rig.running());
+    const cost_ms: u32 = 2_000;
+    world.switched.slow_list = .{
+        .prefix = records.prefix_job_runs,
+        .clock = &world.manual,
+        .cost_ms = cost_ms,
+    };
+    rig.step();
+    const sent_ms = world.switched.slow_list.?.sent_ms.?;
+    world.switched.slow_list = null;
+    try testing.expect(world.now_ms() >= sent_ms + cost_ms);
+    try testing.expectEqual(sent_ms, world.agent.runs_read_mono_ms);
+    const fence_at = sent_ms + world.agent.lease_ttl_ms - constants.fence_margin_ms;
+    try testing.expectEqual(fence_at, world.agent.job_fence_at_ms().?);
+    world.switched.down_list_prefix = records.prefix_job_runs;
+    world.advance(fence_at - world.now_ms() - 1);
+    try testing.expect(rig.running());
+    world.advance(1 + constants.fence_stop_ms + 1_000);
+    try testing.expect(!rig.running());
+    const kept = (try rig.start_record()).?;
+    try testing.expectEqual(@as(?records.StopCause, .@"unreachable"), kept.stop_cause);
+    world.switched.down_list_prefix = null;
+}
+
 test "an agent restart does not move the job fence later (#143)" {
     // Goal: the job fence counts from the last runs read that succeeded, so a restart in the same
     // boot must not count it from the restart. Method: as above, but the agent restarts halfway
