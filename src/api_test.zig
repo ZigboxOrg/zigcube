@@ -2284,6 +2284,8 @@ test "replicas and nodes answer the state at one revision, grouped, with env val
     try rig.compact(revision);
     try rig.refused(rig.get("/v1/nodes", "at=1"), 410, "ZC-E0203");
     try rig.refused(rig.get("/v1/replicas", old), 410, "ZC-E0203");
+}
+
 /// Writes replica `web-1` of service web (image `relay_image`) and its assignment to `node`;
 /// returns the assignment's revision, the placement epoch.
 fn place_replica(rig: *Rig, node: []const u8) !u64 {
