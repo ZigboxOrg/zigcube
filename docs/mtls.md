@@ -172,7 +172,8 @@ included, gets 403 `ZC-E0822` there (an admin cannot mint a node's identity thro
 `ca issue-node` on the server host is the only bootstrap). `POST
 /v1/agent/nodes/<name>/runs/<job>/certificate`, which signs a job's identity for the key it is
 given, is node `<name>`'s own the same way: an admin client must not mint a job's identity for a
-key of its own (0.5.2 review). A node renews and registers only on
+key of its own (0.5.2 review). `POST /v1/agent/nodes/<name>/replicas/<id>/certificate`, which
+signs a service replica's identity (C4 slice 3), is node `<name>`'s own for the same reason. A node renews and registers only on
 the lease of its own registration: a keepalive of another node's lease is `ZC-E0205`, and a
 registration on a lease another node is registered on is `ZC-E0104` (`agent_api.zig`).
 
