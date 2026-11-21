@@ -792,6 +792,8 @@ pub const Args = struct {
     registry: ?IpAddress = null,
     /// zcube-server: where the peers and their chunk filters are read (`/node-store/`).
     server: ?IpAddress = null,
+    /// `--server` as given, for its refusal.
+    server_text: []const u8 = "",
     peers: [constants.fetch_peers_max]Peer = undefined,
     peer_count: u32 = 0,
     /// `--peer` values left out because the name is not a node name, and the first of them.
@@ -833,6 +835,7 @@ pub fn parse(args: []const []const u8) ?Args {
             parsed.report = value;
         } else if (std.mem.eql(u8, flag, "--server")) {
             parsed.server = parse_address(value) orelse return null;
+            parsed.server_text = value;
         } else if (std.mem.eql(u8, flag, "--peer")) {
             if (!parse_peer(&parsed, value)) return null;
         } else if (!parse_tls(&parsed, flag, value)) return null;
@@ -870,6 +873,16 @@ fn parse_tls(parsed: *Args, flag: []const u8, value: []const u8) bool {
     if (value.len == 0) return false;
     field.* = value;
     return true;
+}
+
+/// The agent's own rule for `--server` (ZC-E0505): plain HTTP, without `--ca`, only to a
+/// loopback address. The agent passes its own `--server` and TLS flags, which it has checked;
+/// this keeps a fetch run by hand from reading the peers and chunk filters in the clear.
+fn check_server(parsed: *const Args, diag: *diag_mod.Diag) agent_config.Error!void {
+    assert(diag.code == null);
+    const server = parsed.server orelse return;
+    assert(parsed.server_text.len > 0);
+    try agent_config.check_plain_server(server, parsed.server_text, parsed.ca.len > 0, diag);
 }
 
 /// The TLS flags go with `--server` and `--ca`, and `--cert` with `--key`.
@@ -1049,6 +1062,7 @@ pub fn run(init: std.process.Init, args: []const []const u8) u8 {
         diag.fix(.{ .sentence = usage });
         return finish(io, &diag, constants.exit_user);
     };
+    check_server(&parsed, &diag) catch return finish(io, &diag, constants.exit_user);
     const gpa = init.gpa;
     const identity = identity_or_wait(io, &parsed, constants.fetch_peer_wait_ms, &diag);
     if (diag.code != null) {
@@ -2169,6 +2183,33 @@ test "the fetch arguments need a node, directories, a digest and a registry" {
     long[7] = "b3:" ++ a64;
     try std.testing.expect(parse(&long) != null);
     try std.testing.expect(parse(&.{ "--node", "n", "--bogus", "x" }) == null);
+}
+
+test "a fetch reads the server in plain HTTP only on loopback" {
+    // Goal: PR #11's review (NIT): the agent's rule for --server (ZC-E0505) holds for a fetch
+    // too. Method: a --server on 127.0.0.2 and [::1] without --ca passes; 10.0.2.2 without --ca
+    // is refused naming it; with --ca it passes; no --server passes.
+    const base = [_][]const u8{
+        "--node",       "node1",          "--state-dir", "/s",
+        "--images-dir", "/i",             "--digest",    "b3:00000000",
+        "--registry",   "127.0.0.1:9000",
+    };
+    var diag: diag_mod.Diag = undefined;
+    diag.reset();
+    try check_server(&parse(&base).?, &diag);
+    for ([_][]const u8{ "127.0.0.2:9100", "[::1]:9100" }) |server| {
+        try check_server(&parse(&(base ++ [_][]const u8{ "--server", server })).?, &diag);
+        try std.testing.expect(diag.code == null);
+    }
+    const remote = base ++ [_][]const u8{ "--server", "10.0.2.2:9100" };
+    try std.testing.expectError(error.BadConfig, check_server(&parse(&remote).?, &diag));
+    try std.testing.expect(diag.code.? == .E0505);
+    const cause = diag.causes.slice()[0].slice();
+    try std.testing.expect(std.mem.indexOf(u8, cause, "10.0.2.2:9100 is not a loopback") != null);
+    diag.reset();
+    const secured = remote ++ [_][]const u8{ "--ca", "/ca.crt" };
+    try check_server(&parse(&secured).?, &diag);
+    try std.testing.expect(diag.code == null);
 }
 
 test "the TLS flags go with --server and --ca, and --cert with --key" {
