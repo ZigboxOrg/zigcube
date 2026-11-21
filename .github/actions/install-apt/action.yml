@@ -16,16 +16,43 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Identify the runner image
+      id: image
+      shell: bash
+      # ImageVersion (e.g. 20261116.376.1) is a process environment variable on
+      # GitHub's hosted runners; it is not in the `env` expression context, so the
+      # key must take it from this step's output. ImageOS and /etc/os-release name
+      # the OS, not the image, so they only narrow the key; without ImageVersion
+      # the cache is skipped altogether rather than shared across images.
+      run: |
+        set -euo pipefail
+        version="${ImageVersion:-}"
+        os="${ImageOS:-}"
+        if [ -z "$os" ] && [ -r /etc/os-release ]; then
+          # shellcheck disable=SC1091
+          os=$(. /etc/os-release && echo "${ID:-}${VERSION_ID:-}")
+        fi
+        if [ -z "$version" ]; then
+          echo "::warning::install-apt: ImageVersion is not set on this runner;" \
+            "the .deb cache is not used"
+        fi
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+        echo "os=${os:-unknown}" >> "$GITHUB_OUTPUT"
     - name: Restore the .deb cache
       id: cache
+      if: steps.image.outputs.version != ''
       # Keyed on the package list and the runner image, so a new image (new
       # package versions) misses and refetches.
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ~/.cache/zbx-debs
-        # v2: the closure saved before the dpkg fallback could be incomplete; a new
-        # key saves a fresh one.
-        key: debs-v2-${{ runner.os }}-${{ env.ImageVersion }}-${{ inputs.packages }}
+        # v4: v3 keys carried an empty image version (`env.ImageVersion` is not an
+        # expression context value), so one entry served every image. v3 itself
+        # replaced v2, whose closures left out dependencies the saving runner
+        # already had (libpmem1, librdmacm1t64 for qemu-system-x86).
+        key: >-
+          debs-v4-${{ runner.os }}-${{ runner.arch }}-${{ steps.image.outputs.os }}-${{
+          steps.image.outputs.version }}-${{ inputs.packages }}
     - name: Install
       shell: bash
       env:
@@ -36,17 +63,51 @@ runs:
         debs="$HOME/.cache/zbx-debs"
         mkdir -p "$debs"
 
-        # Warm cache: install straight from the saved closure, no network.
+        # Warm cache: install from the saved closure, no network. The closure holds
+        # packages this runner already has (and, through --reinstall, possibly
+        # newer versions of them), so install only the .debs whose package is not
+        # installed here at any version: the warm path never upgrades or
+        # downgrades a package the image ships.
         if [ "$CACHE_HIT" = "true" ] && ls "$debs"/*.deb >/dev/null 2>&1; then
           echo "install-apt: cache hit, installing from $debs"
-          # The saved closure leaves out what the runner that saved it already
-          # had; a runner without one of those packages fails dpkg -i. Then
-          # fall through to the network install, which completes the closure.
-          if sudo dpkg -i "$debs"/*.deb; then
+          missing=()
+          warm=yes
+          for f in "$debs"/*.deb; do
+            if ! pkg=$(dpkg-deb -f "$f" Package) || ! arch=$(dpkg-deb -f "$f" Architecture); then
+              echo "install-apt: cannot read $f"
+              warm=no
+              break
+            fi
+            [ "$arch" = all ] || pkg="$pkg:$arch"
+            st=$(dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null) || st=""
+            case "$st" in
+              *' installed') ;;
+              ''|*' not-installed'|*' config-files') missing+=("$f") ;;
+              *) echo "install-apt: $pkg is in state '$st'"; warm=no; break ;;
+            esac
+          done
+          if [ "$warm" = yes ] && [ "${#missing[@]}" -gt 0 ]; then
+            echo "install-apt: installing ${#missing[@]} cached package(s) this runner lacks"
+            if ! timeout 300 sudo env DEBIAN_FRONTEND=noninteractive dpkg -i "${missing[@]}"; then
+              echo "install-apt: dpkg -i of the cached .deb files failed"
+              warm=no
+            fi
+          fi
+          if [ "$warm" = yes ]; then
+            # The cache may lack a package (one apt could not download, see below):
+            # every requested package must now be installed, or use the archive.
+            for p in $PACKAGES; do
+              case "$(dpkg-query -W -f='${Status}' "$p" 2>/dev/null || true)" in
+                *' ok installed') ;;
+                *) echo "install-apt: $p is not installed after the cached install"
+                   warm=no ;;
+              esac
+            done
+          fi
+          if [ "$warm" = yes ]; then
             exit 0
           fi
-          echo "install-apt: dpkg -i of the cached .deb files failed" \
-            "(an incomplete closure or a bad file); installing from the archive"
+          echo "install-apt: the cached closure did not install; installing from the archive"
         fi
 
         # Cold cache, or a cached closure dpkg refused. Point every Ubuntu source
@@ -74,9 +135,43 @@ runs:
               -o Acquire::Retries=2 -o Dir::Cache::archives="$debs")
         mkdir -p "$debs/partial"
         timeout 300 sudo apt-get "${opts[@]}" update
-        # --fix-broken completes packages a refused dpkg -i left unconfigured; a no-op otherwise.
+        # A refused dpkg -i leaves packages unpacked but unconfigured, and apt then
+        # refuses to install anything by name ("not going to be installed"). Repair
+        # that state first, with no package names; a no-op on a clean runner.
+        timeout 300 sudo env DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true
+        timeout 600 sudo apt-get "${opts[@]}" install -y -f --no-install-recommends
         # shellcheck disable=SC2086
-        timeout 600 sudo apt-get "${opts[@]}" install -y --fix-broken --no-install-recommends $PACKAGES
+        timeout 600 sudo apt-get "${opts[@]}" install -y --no-install-recommends $PACKAGES
+
+        # Save the packages' whole dependency tree, not only what this runner
+        # lacked, so a runner of the same image that lacks a dependency can still
+        # install from the cache. Essential, Protected and required/important
+        # packages stay out. That filter is not the safety: --reinstall of a package
+        # with a newer candidate is an upgrade, and apt adds what the upgrade needs
+        # (systemd for libsystemd0, say); the warm path above installs only packages
+        # the runner lacks, so such files are never installed from the cache.
+        # Packages from a source that is not configured here (libpq-dev and libpq5
+        # from pgdg on the runner image) cannot be downloaded: apt warns, exits 0
+        # and leaves them out, and the warm path falls back to the archive if a
+        # requested package is then missing.
+        # Runs only after the install above succeeded, so a bad run saves nothing
+        # new (actions/cache saves only on a miss, and only when the job passes).
+        closure=()
+        # shellcheck disable=SC2086
+        while read -r name; do
+          st=$(dpkg-query -W -f='${db:Status-Abbrev}|${Essential}|${Protected}|${Priority}' "$name" \
+            2>/dev/null) || continue
+          IFS='|' read -r status essential protected priority <<<"$st"
+          [ "$status" = "ii " ] || continue
+          [ "$essential" = yes ] || [ "$protected" = yes ] && continue
+          [ "$priority" = required ] || [ "$priority" = important ] && continue
+          closure+=("$name")
+        done < <(apt-cache depends --recurse --no-recommends --no-suggests --no-conflicts \
+                   --no-breaks --no-replaces --no-enhances $PACKAGES | grep -E '^[a-z0-9]')
+        if [ "${#closure[@]}" -gt 0 ]; then
+          timeout 600 sudo apt-get "${opts[@]}" install -y --download-only --reinstall \
+            --no-install-recommends "${closure[@]}"
+        fi
         # Leave only readable .deb files for actions/cache to archive.
         sudo rm -rf "$debs/partial" "$debs/lock"
         sudo chmod -R a+rX "$debs"
