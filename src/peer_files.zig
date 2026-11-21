@@ -270,17 +270,29 @@ pub fn rename_new(
     assert(!std.mem.eql(u8, from, to));
     dir.renamePreserve(from, dir, to, io) catch |err| switch (err) {
         error.PathAlreadyExists => return false,
-        error.OperationUnsupported => {
-            dir.hardLink(from, dir, to, io, .{}) catch |link_err| switch (link_err) {
-                error.PathAlreadyExists => return false,
-                else => return unusable(diag, where, to, "write", @errorName(link_err)),
-            };
-            dir.deleteFile(io, from) catch |unlink_err| {
-                return unusable(diag, where, from, "remove", @errorName(unlink_err));
-            };
-            return true;
-        },
+        error.OperationUnsupported => return link_new(io, dir, where, from, to, diag),
         else => return unusable(diag, where, to, "write", @errorName(err)),
+    };
+    return true;
+}
+
+/// `rename_new` where the file system has no such rename: a hard link, never over `to`, then
+/// an unlink of `from`. Apart so that a test reaches it on any file system.
+fn link_new(
+    io: std.Io,
+    dir: Dir,
+    where: []const u8,
+    from: []const u8,
+    to: []const u8,
+    diag: *Diag,
+) Error!bool {
+    assert(!std.mem.eql(u8, from, to));
+    dir.hardLink(from, dir, to, io, .{}) catch |err| switch (err) {
+        error.PathAlreadyExists => return false,
+        else => return unusable(diag, where, to, "write", @errorName(err)),
+    };
+    dir.deleteFile(io, from) catch |err| {
+        return unusable(diag, where, from, "remove", @errorName(err));
     };
     return true;
 }
@@ -428,5 +440,32 @@ test "write takes the mode of the file" {
         const stat = try file.stat(io);
         const mode: std.posix.mode_t = case[1];
         try std.testing.expectEqual(mode, stat.permissions.toMode() & 0o777);
+    }
+}
+
+test "rename_new and its hard-link fallback never replace a file and move the old one" {
+    // Goal: review of PR #8 (SHOULD): the fallback for a file system without a no-replace
+    // rename was never run. Method: run `rename_new` and `link_new` alike: each moves `a` to a
+    // free name (the old name gone, the bytes kept) and returns false, changing nothing, when
+    // the new name exists.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var diag: Diag = undefined;
+    diag.reset();
+    inline for (.{ rename_new, link_new }) |move| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "a", .data = "old\n" });
+        try tmp.dir.writeFile(io, .{ .sub_path = "taken", .data = "kept\n" });
+        try std.testing.expect(!try move(io, tmp.dir, "tmp", "a", "taken", &diag));
+        var buffer: [16]u8 = undefined;
+        try std.testing.expectEqualStrings("kept\n", try tmp.dir.readFile(io, "taken", &buffer));
+        try std.testing.expectEqualStrings("old\n", try tmp.dir.readFile(io, "a", &buffer));
+
+        try std.testing.expect(try move(io, tmp.dir, "tmp", "a", "free", &diag));
+        try std.testing.expectEqualStrings("old\n", try tmp.dir.readFile(io, "free", &buffer));
+        try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "a", .{}));
+        try std.testing.expect(diag.code == null);
+        try tmp.dir.deleteFile(io, "free");
+        try tmp.dir.deleteFile(io, "taken");
     }
 }

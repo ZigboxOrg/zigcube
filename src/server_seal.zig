@@ -41,19 +41,28 @@ pub const aside_name_bytes_max = key_name_bytes_max + ".discarded-".len + 20;
 
 /// The most records the start-up check reads under one prefix, and so the most `--discard-sealed`
 /// is ever asked to delete under one: 4096 pages of 500, 2,048,000.
-pub const scan_records_max: u64 =
-    @as(u64, constants.seal_scan_pages_max) * constants.store_list_limit_max;
+pub const scan_records_max: u64 = records_max(constants.seal_scan_pages_max);
+
+/// The most records a scan of `pages_max` pages reads under one prefix.
+fn records_max(pages_max: u32) u64 {
+    assert(pages_max > 0);
+    assert(pages_max <= constants.seal_scan_pages_max);
+    return @as(u64, pages_max) * constants.store_list_limit_max;
+}
 
 /// The discard's rounds of `store_txn_ops_max` deletes under one prefix: enough for every record
-/// the scan admits, plus one failed compare (a record rewritten meanwhile) per page.
-const discard_rounds_max: u64 =
-    (scan_records_max + constants.store_txn_ops_max - 1) / constants.store_txn_ops_max +
-    constants.seal_scan_pages_max;
+/// a scan of `pages_max` pages admits, plus one failed compare (a record rewritten meanwhile)
+/// per page.
+fn rounds_max(pages_max: u32) u64 {
+    const rounds = std.math.divCeil(u64, records_max(pages_max), constants.store_txn_ops_max) catch
+        unreachable; // The divisor is a positive constant.
+    assert(rounds * constants.store_txn_ops_max >= records_max(pages_max));
+    return rounds + pages_max;
+}
 
 comptime {
     assert(scan_records_max == 2_048_000);
-    assert((discard_rounds_max - constants.seal_scan_pages_max) *
-        constants.store_txn_ops_max >= scan_records_max);
+    assert(rounds_max(constants.seal_scan_pages_max) == 128_000 + 4096);
 }
 
 pub const Options = struct {
@@ -63,6 +72,9 @@ pub const Options = struct {
     discard: bool = false,
     /// Say nothing on stderr (tests).
     quiet: bool = false,
+    /// The pages the start-up check reads under one prefix, and so the discard's rounds: the
+    /// constant, lowered only by tests to reach the bound with few records.
+    scan_pages_max: u32 = constants.seal_scan_pages_max,
 };
 
 /// What `open` decided.
@@ -119,14 +131,14 @@ pub fn open(
     var found = try load(io, state_dir, options.key_name, diag);
     defer if (found) |*key| key.wipe();
     var result: Scan = .{};
-    try check(gpa, scan, if (found) |*key| key else null, &result, diag);
+    try check(gpa, scan, if (found) |*key| key else null, options.scan_pages_max, &result, diag);
     if (result.refused) |*refused| {
         if (options.discard) {
             // Planned first, so that the discard can finish: every prefix it empties is within
             // the bound its rounds are sized for.
             for (seal.discarded_prefixes) |prefix| {
                 var counter: Counter = .{};
-                try walk(gpa, scan, prefix, &counter, diag);
+                try walk(gpa, scan, prefix, options.scan_pages_max, &counter, diag);
             }
             return .discard;
         }
@@ -172,6 +184,18 @@ fn make(io: std.Io, state_dir: ?[]const u8, name: []const u8, diag: *Diag) Error
     defer dir.close(io);
     if (try files.write_seed_new(io, dir, path, name, key.bytes, diag)) return key;
     key.wipe();
+    return read_winner(io, dir, path, name, diag);
+}
+
+/// The key another start wrote first, which `make` found in its way: read, never replaced.
+/// Gone again by now is ZC-E0806, never a second key.
+fn read_winner(
+    io: std.Io,
+    dir: std.Io.Dir,
+    path: []const u8,
+    name: []const u8,
+    diag: *Diag,
+) Error!seal.Key {
     const seed = try files.read_seed(io, dir, path, name, diag) orelse {
         return files.unusable(diag, path, name, "read", "it was written and then removed");
     };
@@ -196,12 +220,13 @@ fn check(
     gpa: Allocator,
     scan: store.Store,
     key: ?*const seal.Key,
+    pages_max: u32,
     result: *Scan,
     diag: *Diag,
 ) Error!void {
     for (seal.sealed_prefixes) |prefix| {
         var checker: Checker = .{ .key = key, .result = result };
-        try walk(gpa, scan, prefix, &checker, diag);
+        try walk(gpa, scan, prefix, pages_max, &checker, diag);
         if (result.refused != null) return;
     }
 }
@@ -227,12 +252,13 @@ const Counter = struct {
 };
 
 /// Lists every record under `prefix` at one revision, page by page, handing each to
-/// `visitor.visit` until it returns false. More than `scan_records_max` records is ZC-E0824:
+/// `visitor.visit` until it returns false. More than `pages_max` pages of records is ZC-E0824:
 /// the start is refused, never half-checked.
 fn walk(
     gpa: Allocator,
     scan: store.Store,
     prefix: []const u8,
+    pages_max: u32,
     visitor: anytype,
     diag: *Diag,
 ) Error!void {
@@ -242,7 +268,8 @@ fn walk(
     var after: ?[]const u8 = null;
     var after_buffer: [constants.store_key_bytes_max]u8 = undefined;
     var pages: u32 = 0;
-    while (pages < constants.seal_scan_pages_max) : (pages += 1) {
+    assert(pages_max <= constants.seal_scan_pages_max);
+    while (pages < pages_max) : (pages += 1) {
         _ = arena_state.reset(.retain_capacity);
         const page = scan.list(arena_state.allocator(), .{
             .prefix = prefix,
@@ -258,20 +285,20 @@ fn walk(
         @memcpy(after_buffer[0..next.len], next);
         after = after_buffer[0..next.len];
     }
-    raise_too_many(diag, prefix);
+    raise_too_many(diag, prefix, pages_max);
     return error.Failed;
 }
 
 /// ZC-E0824 for a prefix past the bound: one cause naming the bound and what was found, and a
 /// fix that is not `--discard-sealed` (which would delete every one of them). Public for the
 /// CLI golden test.
-pub fn raise_too_many(diag: *Diag, prefix: []const u8) void {
+pub fn raise_too_many(diag: *Diag, prefix: []const u8, pages_max: u32) void {
     assert(diag.code == null);
+    const records = records_max(pages_max);
     diag.raise(.E0824);
     diag.cause("more than {d} records under {s}; the start-up check reads at most {d} " ++
         "({d} pages of {d}), so it refuses to start rather than check part of them", .{
-        scan_records_max,              prefix,                         scan_records_max,
-        constants.seal_scan_pages_max, constants.store_list_limit_max,
+        records, prefix, records, pages_max, constants.store_list_limit_max,
     });
     diag.fix(.{ .sentence = "delete the records under that prefix that no public host uses " ++
         "any more, then start again" });
@@ -374,7 +401,7 @@ pub fn discard(
     assert(options.discard);
     var deleted: u64 = 0;
     for (seal.discarded_prefixes) |prefix| {
-        deleted += try delete_all(gpa, write, prefix, diag);
+        deleted += try delete_all(gpa, write, prefix, options.scan_pages_max, diag);
     }
     var aside_buffer: [aside_name_bytes_max]u8 = undefined;
     const aside = try set_aside(io, state_dir, options.key_name, &aside_buffer, diag);
@@ -410,12 +437,19 @@ fn set_aside(
 }
 
 /// Deletes every record under `prefix`, `store_txn_ops_max` to a transaction. Returns how many.
-fn delete_all(gpa: Allocator, write: store.Store, prefix: []const u8, diag: *Diag) Error!u64 {
+fn delete_all(
+    gpa: Allocator,
+    write: store.Store,
+    prefix: []const u8,
+    pages_max: u32,
+    diag: *Diag,
+) Error!u64 {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     var deleted: u64 = 0;
     var round: u64 = 0;
-    while (round < discard_rounds_max) : (round += 1) {
+    const rounds = rounds_max(pages_max);
+    while (round < rounds) : (round += 1) {
         _ = arena_state.reset(.retain_capacity);
         const page = write.list(arena_state.allocator(), .{
             .prefix = prefix,
@@ -436,18 +470,18 @@ fn delete_all(gpa: Allocator, write: store.Store, prefix: []const u8, diag: *Dia
         }, diag) catch return error.Failed;
         if (result.succeeded) deleted += page.kvs.len;
     }
-    raise_unfinished(diag, prefix);
+    raise_unfinished(diag, prefix, rounds);
     return error.Failed;
 }
 
 /// ZC-E0824 for a discard that could not finish: something kept writing under `prefix`. The fix
 /// is not the flag, which the operator is already using. Public for the CLI golden test.
-pub fn raise_unfinished(diag: *Diag, prefix: []const u8) void {
+pub fn raise_unfinished(diag: *Diag, prefix: []const u8, rounds: u64) void {
     assert(diag.code == null);
     diag.raise(.E0824);
     diag.cause("--discard-sealed could not empty {s}: records kept appearing there after {d} " ++
         "rounds of deletes, so another writer is at work; the old key file is unchanged", .{
-        prefix, discard_rounds_max,
+        prefix, rounds,
     });
     diag.fix(.{ .sentence = "stop every other zcube-server on this store, then start again" });
 }
@@ -907,7 +941,7 @@ test "only the sealed member is opened: clear members shaped like envelopes star
 test "the scan's bound is one cause naming the bound, the count and a remedy without the flag" {
     var diag: Diag = undefined;
     diag.reset();
-    raise_too_many(&diag, "/edge-certs/");
+    raise_too_many(&diag, "/edge-certs/", constants.seal_scan_pages_max);
     var diagnostic: diag_mod.Diagnostic = undefined;
     diag_mod.to_diagnostic(&diagnostic, &diag);
     var buffer: [constants.diag_output_bytes_max]u8 = undefined;
@@ -916,7 +950,7 @@ test "the scan's bound is one cause naming the bound, the count and a remedy wit
         null);
     try testing.expect(std.mem.indexOf(u8, text, "--discard-sealed") == null);
     diag.reset();
-    raise_unfinished(&diag, "/edge-certs/");
+    raise_unfinished(&diag, "/edge-certs/", rounds_max(constants.seal_scan_pages_max));
     diag_mod.to_diagnostic(&diagnostic, &diag);
     const unfinished = diag_mod.render(&diagnostic, .text, false, &buffer);
     try testing.expectEqual(codes.Code.E0824, diag.code.?);
@@ -974,4 +1008,280 @@ fn cause_holds(diag: *Diag, needle: []const u8) bool {
         length += 1;
     }
     return std.mem.indexOf(u8, joined[0..length], needle) != null;
+}
+
+/// The memory store with a fault: every compare fails, or the transactions after the first
+/// `txns_left` fail outright (ZC-E0213, a dropped connection). `open` and `discard` reach only
+/// `list` and `txn`; the rest are never called.
+const FaultyStore = struct {
+    inner: store.Store,
+    compares_fail: bool = false,
+    txns_left: ?u32 = null,
+
+    const vtable: store.Store.VTable = .{
+        .status = Unused.status,
+        .get = Unused.get,
+        .list = list,
+        .txn = txn,
+        .watch = Unused.watch,
+        .lease_grant = Unused.lease_grant,
+        .lease_keepalive = Unused.lease_keepalive,
+        .lease_revoke = Unused.lease_revoke,
+        .lease_list = Unused.lease_list,
+        .expire_leases = Unused.expire_leases,
+        .compact = Unused.compact,
+        .hash_at = Unused.hash_at,
+    };
+
+    /// Neither `open` nor `discard` calls these.
+    const Unused = struct {
+        fn status(_: *anyopaque, _: *Diag) store.Error!store.Status {
+            unreachable;
+        }
+        fn get(
+            _: *anyopaque,
+            _: Allocator,
+            _: []const u8,
+            _: ?store.Revision,
+            _: *Diag,
+        ) store.Error!store.GetResult {
+            unreachable;
+        }
+        fn watch(_: *anyopaque, _: store.WatchOptions, _: *Diag) store.Error!store.Watch {
+            unreachable;
+        }
+        fn lease_grant(_: *anyopaque, _: u32, _: *Diag) store.Error!store.Lease {
+            unreachable;
+        }
+        fn lease_keepalive(_: *anyopaque, _: store.LeaseId, _: *Diag) store.Error!store.Lease {
+            unreachable;
+        }
+        fn lease_revoke(_: *anyopaque, _: store.LeaseId, _: *Diag) store.Error!store.Revision {
+            unreachable;
+        }
+        fn lease_list(_: *anyopaque, _: Allocator, _: *Diag) store.Error![]const store.LeaseInfo {
+            unreachable;
+        }
+        fn expire_leases(_: *anyopaque, _: *Diag) store.Error!u32 {
+            unreachable;
+        }
+        fn compact(_: *anyopaque, _: store.Revision, _: *Diag) store.Error!void {
+            unreachable;
+        }
+        fn hash_at(_: *anyopaque, _: store.Revision, _: *Diag) store.Error!store.Hash {
+            unreachable;
+        }
+    };
+
+    fn interface(faulty: *FaultyStore) store.Store {
+        return .{ .context = faulty, .vtable = &vtable };
+    }
+
+    fn from(context: *anyopaque) *FaultyStore {
+        return @ptrCast(@alignCast(context));
+    }
+
+    fn list(
+        context: *anyopaque,
+        arena: Allocator,
+        options_: store.ListOptions,
+        diag: *Diag,
+    ) store.Error!store.ListResult {
+        const inner = from(context).inner;
+        return inner.vtable.list(inner.context, arena, options_, diag);
+    }
+
+    fn txn(
+        context: *anyopaque,
+        request: store.TxnRequest,
+        diag: *Diag,
+    ) store.Error!store.TxnResult {
+        const faulty = from(context);
+        if (faulty.txns_left) |*left| {
+            if (left.* == 0) {
+                diag.raise(.E0213);
+                diag.cause("the test cut the store's connection", .{});
+                return error.BackendFailed;
+            }
+            left.* -= 1;
+        }
+        const inner = faulty.inner;
+        if (!faulty.compares_fail or request.compares.len == 0) {
+            return inner.vtable.txn(inner.context, request, diag);
+        }
+        const instead: store.TxnRequest = .{ .on_success = request.on_failure };
+        var failed = try inner.vtable.txn(inner.context, instead, diag);
+        failed.succeeded = false;
+        failed.hash = null;
+        return failed;
+    }
+};
+
+/// A rig whose key file holds another key than the one `sealed` records were sealed with, so
+/// that `open` plans a discard. Returns the other key's bytes.
+fn plant_unopenable(rig: *TestRig, edge: u32, accounts: u32, orders: u32) ![32]u8 {
+    var old = try rig.open_key(false);
+    defer old.wipe();
+    var name: [64]u8 = undefined;
+    for (0..edge) |index| {
+        const host = try std.fmt.bufPrint(&name, "/edge-certs/h{d}.example", .{index});
+        try rig.put_sealed(&old, host, plain_key);
+    }
+    for (0..accounts) |index| {
+        const account = try std.fmt.bufPrint(&name, "/acme-account/a{d}", .{index});
+        try rig.put_sealed(&old, account, plain_key);
+    }
+    for (0..orders) |index| {
+        const order = try std.fmt.bufPrint(&name, "/acme-orders/h{d}.example", .{index});
+        try rig.put(order, "{\"v\":1}");
+    }
+    const other: [32]u8 = @splat(0x5a);
+    try files.write_seed(testing.io, rig.tmp.dir, rig.path(), "seal.key", other, &rig.diag);
+    return other;
+}
+
+/// `open` and then `discard` with the flag, over `s`, scanning at most `pages_max` pages.
+fn discard_over(rig: *TestRig, s: store.Store, pages_max: u32) !seal.Key {
+    var o = TestRig.options(true);
+    o.scan_pages_max = pages_max;
+    const planned = try open(testing.allocator, testing.io, s, rig.path(), o, &rig.diag);
+    try testing.expect(planned == .discard);
+    return discard(testing.allocator, testing.io, s, rig.path(), o, &rig.diag);
+}
+
+test "a discard whose compares keep failing is ZC-E0824 unfinished, and keeps the old key" {
+    // Goal: review of PR #8 (SHOULD): `delete_all`'s bound was never reached. Method: every
+    // compare fails, as if another writer kept rewriting the records; one page bounds the
+    // rounds. The discard stops at the bound naming it, deletes nothing, renames no key file
+    // and writes no new one.
+    var rig: TestRig = undefined;
+    try rig.init(testing.io);
+    defer rig.deinit();
+    const other = try plant_unopenable(&rig, 3, 1, 1);
+    var faulty: FaultyStore = .{ .inner = rig.memory.interface(), .compares_fail = true };
+    try testing.expectError(error.Failed, discard_over(&rig, faulty.interface(), 1));
+    try testing.expectEqual(codes.Code.E0824, rig.diag.code.?);
+    var rounds_text: [64]u8 = undefined;
+    const rounds = try std.fmt.bufPrint(&rounds_text, "after {d}", .{rounds_max(1)});
+    try testing.expect(cause_holds(&rig.diag, "could not empty /edge-certs/"));
+    try testing.expect(cause_holds(&rig.diag, rounds));
+    rig.diag.reset();
+    try testing.expectEqual(@as(usize, 3), try rig.count("/edge-certs/"));
+    try testing.expectEqualSlices(u8, &other, &(try rig.key_file()).?);
+    var aside: [aside_name_bytes_max]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), try rig.asides(&aside));
+}
+
+test "a discard cut after one prefix leaves the old key; the next start with the flag ends it" {
+    // Goal: review of PR #8 (SHOULD): a discard that fails part way is never worse off. Method:
+    // the store drops its connection after the first delete, which empties /edge-certs/; the
+    // account and the order are left, and so is the old key file. A start without the flag is
+    // still refused (the account does not open); one with it, on a healthy store, finishes.
+    var rig: TestRig = undefined;
+    try rig.init(testing.io);
+    defer rig.deinit();
+    const other = try plant_unopenable(&rig, 3, 2, 1);
+    var faulty: FaultyStore = .{ .inner = rig.memory.interface(), .txns_left = 1 };
+    try testing.expectError(error.Failed, discard_over(&rig, faulty.interface(), 1));
+    try testing.expectEqual(codes.Code.E0213, rig.diag.code.?);
+    rig.diag.reset();
+    try testing.expectEqual(@as(usize, 0), try rig.count("/edge-certs/"));
+    try testing.expectEqual(@as(usize, 2), try rig.count("/acme-account/"));
+    try testing.expectEqual(@as(usize, 1), try rig.count("/acme-orders/"));
+    try testing.expectEqualSlices(u8, &other, &(try rig.key_file()).?);
+
+    try testing.expectError(error.Failed, rig.open_key(false));
+    try testing.expectEqual(codes.Code.E0824, rig.diag.code.?);
+    try testing.expect(cause_holds(&rig.diag, "/acme-account/a"));
+    rig.diag.reset();
+    var fresh = try rig.open_key(true);
+    defer fresh.wipe();
+    for (seal.discarded_prefixes) |prefix| {
+        try testing.expectEqual(@as(usize, 0), try rig.count(prefix));
+    }
+    try testing.expect(!std.mem.eql(u8, &other, &fresh.bytes));
+    try testing.expectEqualSlices(u8, &fresh.bytes, &(try rig.key_file()).?);
+    var aside: [aside_name_bytes_max]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), try rig.asides(&aside));
+}
+
+test "more records than the scan's pages hold refuse the start, never half-checked" {
+    // Goal: review of PR #8 (SHOULD): `walk`'s bound was never reached. Method: one page of
+    // `store_list_limit_max` clear records and one more, scanned with a bound of one page: the
+    // start is ZC-E0824 naming the bound, and no key is written.
+    var rig: TestRig = undefined;
+    try rig.init(testing.io);
+    defer rig.deinit();
+    var name: [64]u8 = undefined;
+    for (0..constants.store_list_limit_max + 1) |index| {
+        const host = try std.fmt.bufPrint(&name, "/edge-certs/h{d}.example", .{index});
+        try rig.put(host, "{\"v\":1,\"state\":\"pending\"}");
+    }
+    var o = TestRig.options(false);
+    o.scan_pages_max = 1;
+    const s = rig.memory.interface();
+    const refused = open(testing.allocator, testing.io, s, rig.path(), o, &rig.diag);
+    try testing.expectError(error.Failed, refused);
+    try testing.expectEqual(codes.Code.E0824, rig.diag.code.?);
+    var bound: [64]u8 = undefined;
+    const more = try std.fmt.bufPrint(&bound, "more than {d} records under /edge-certs/", .{
+        constants.store_list_limit_max,
+    });
+    try testing.expect(cause_holds(&rig.diag, more));
+    rig.diag.reset();
+    try testing.expect((try rig.key_file()) == null);
+    // At the bound itself the start goes ahead.
+    try rig.put("/edge-certs/h0.example", "{\"v\":1}");
+    const page = [_]store.Op{.{ .delete = "/edge-certs/h500.example" }};
+    _ = try rig.memory.interface().txn(.{ .on_success = &page }, &rig.diag);
+    var ready = try open(testing.allocator, testing.io, s, rig.path(), o, &rig.diag);
+    ready.ready.wipe();
+}
+
+test "an aside name in the way refuses the discard, and the old key is kept" {
+    // Goal: review of PR #8 (SHOULD): `set_aside` with `<name>.discarded-<s>` already there.
+    // Method: plant that name for this second and the next two; the discard deletes the records,
+    // then refuses (ZC-E0806) before replacing anything. The old key file is unchanged and the
+    // planted files keep their bytes; the next start, with no sealed records left, opens with
+    // the old key.
+    var rig: TestRig = undefined;
+    try rig.init(testing.io);
+    defer rig.deinit();
+    const other = try plant_unopenable(&rig, 2, 0, 1);
+    const now = @divFloor(std.Io.Clock.real.now(testing.io).toMilliseconds(), 1000);
+    var name: [aside_name_bytes_max]u8 = undefined;
+    for (0..3) |offset| {
+        const seconds = now + @as(i64, @intCast(offset));
+        const aside = try std.fmt.bufPrint(&name, "seal.key.discarded-{d}", .{seconds});
+        try rig.tmp.dir.writeFile(testing.io, .{ .sub_path = aside, .data = "planted\n" });
+    }
+    try testing.expectError(error.Failed, rig.open_key(true));
+    try testing.expectEqual(codes.Code.E0806, rig.diag.code.?);
+    try testing.expect(cause_holds(&rig.diag, "that file exists"));
+    rig.diag.reset();
+    try testing.expectEqualSlices(u8, &other, &(try rig.key_file()).?);
+    try testing.expectEqual(@as(usize, 3), try rig.asides(&name));
+    try testing.expectEqual(@as(usize, 0), try rig.count("/edge-certs/"));
+    var kept = try rig.open_key(false);
+    defer kept.wipe();
+    try testing.expectEqualSlices(u8, &other, &kept.bytes);
+}
+
+test "a key file gone between its write and its read is ZC-E0806, never a second key" {
+    // Goal: review of PR #8 (SHOULD): `make`'s "written and then removed" branch. Method: call
+    // the branch, `read_winner`, with no key file (another start wrote one and it was removed),
+    // then with one: the first refuses, the second returns the file's key.
+    var rig: TestRig = undefined;
+    try rig.init(testing.io);
+    defer rig.deinit();
+    const gone = read_winner(testing.io, rig.tmp.dir, rig.path(), "seal.key", &rig.diag);
+    try testing.expectError(error.Failed, gone);
+    try testing.expectEqual(codes.Code.E0806, rig.diag.code.?);
+    try testing.expect(cause_holds(&rig.diag, "it was written and then removed"));
+    rig.diag.reset();
+    const winner: [32]u8 = @splat(0x3c);
+    try files.write_seed(testing.io, rig.tmp.dir, rig.path(), "seal.key", winner, &rig.diag);
+    var read = try read_winner(testing.io, rig.tmp.dir, rig.path(), "seal.key", &rig.diag);
+    defer read.wipe();
+    try testing.expectEqualSlices(u8, &winner, &read.bytes);
 }

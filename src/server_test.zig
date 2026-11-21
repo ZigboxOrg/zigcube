@@ -1319,3 +1319,72 @@ fn seal_key_file(io: std.Io, tmp: testing.TmpDir, buffer: *[64]u8) ![]const u8 {
     }
     return found orelse error.NoSealKey;
 }
+
+test "a sealing key file that is loose or the wrong length refuses the start (ZC-E0806)" {
+    // Goal: review of PR #8 (SHOULD): the key file's own refusals, through the real server.
+    // Method: a SQLite server makes its key; the file is made 0644, then 0600 with 31 bytes
+    // (62 hex digits); each start is ZC-E0806 naming the file, holds no key, and leaves the file
+    // as it was. The whole key, 0600 again, starts with it.
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var path_buffer: [128]u8 = undefined;
+    const path = try tmp_file(&path_buffer, tmp, "data.db");
+    const first = try start_server(io, config_for(.{ .sqlite = path }, true));
+    var key = first.seal_key;
+    defer key.wipe();
+    first.stop();
+    var key_name_buffer: [64]u8 = undefined;
+    const key_name = try seal_key_file(io, tmp, &key_name_buffer);
+
+    const file = try tmp.dir.openFile(io, key_name, .{});
+    defer file.close(io);
+    try file.setPermissions(io, .fromMode(0o644));
+    try expect_key_file_refused(io, path, key_name, &key.bytes, "other users can read it");
+    const hex = std.fmt.bytesToHex(key.bytes, .lower);
+    try tmp.dir.writeFile(io, .{ .sub_path = key_name, .data = hex[0..62] ++ "\n" });
+    try file.setPermissions(io, .fromMode(0o600));
+    try expect_key_file_refused(io, path, key_name, &key.bytes, "64 hex digits");
+    var short_buffer: [64]u8 = undefined;
+    const kept = try tmp.dir.readFile(io, key_name, &short_buffer);
+    try testing.expectEqualStrings(hex[0..62] ++ "\n", kept);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = key_name, .data = &hex });
+    try file.setPermissions(io, .fromMode(0o600));
+    const again = try start_server(io, config_for(.{ .sqlite = path }, false));
+    try testing.expectEqualSlices(u8, &key.bytes, &again.seal_key.bytes);
+    again.stop();
+}
+
+/// A start refused with ZC-E0806 naming `key_name` and `why`, its text without the key.
+fn expect_key_file_refused(
+    io: std.Io,
+    path: []const u8,
+    key_name: []const u8,
+    key: []const u8,
+    why: []const u8,
+) !void {
+    const redaction = @import("testing/redaction.zig");
+    const codes = @import("diag/codes.zig");
+    var diag: Diag = undefined;
+    diag.reset();
+    const options: server_mod.Options = .{ .version = "0.0.0-test", .report_failures = false };
+    const refused = server_mod.Server.start(
+        testing.allocator,
+        io,
+        config_for(.{ .sqlite = path }, false),
+        options,
+        &diag,
+    );
+    try testing.expectError(error.StartFailed, refused);
+    try testing.expectEqual(@as(?codes.Code, .E0806), diag.code);
+    var diagnostic: diag_mod.Diagnostic = undefined;
+    diag_mod.to_diagnostic(&diagnostic, &diag);
+    var text_buffer: [constants.diag_output_bytes_max]u8 = undefined;
+    const text = diag_mod.render(&diagnostic, .text, false, &text_buffer);
+    try testing.expect(std.mem.indexOf(u8, text, key_name) != null);
+    try testing.expect(std.mem.indexOf(u8, text, why) != null);
+    try redaction.expect_absent(text, key, "ZC-E0806");
+}
