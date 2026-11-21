@@ -482,9 +482,9 @@ const Run = struct {
         // missing are the rollout's to start, and a paused rollout starts nothing more (R4).
         if (plan.stale > 0 or roll.paused) creations = @min(creations, removed_count);
         creations = @min(creations, roll.room);
-        // While the rollout starts nothing (paused, failed, or not begun), a replacement runs the
-        // generation the dead replica ran: replacing an old one at the new generation would be a
-        // start the rollout did not allow (R4). Otherwise it runs the service's.
+        // While the rollout starts nothing (paused or failed), a replacement runs the dead one's
+        // generation (R4). Otherwise, and before a rollout of the service's generation begins
+        // (`roll_of`'s defaults), it runs the service's: then `stale` bounds it by the dead.
         var templates: [batch_replicas_max]?*const records.Replica = @splat(null);
         if (!roll.starts) {
             for (removed[0..@min(creations, removed_count)], 0..) |item, index| {

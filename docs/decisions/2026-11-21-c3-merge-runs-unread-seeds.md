@@ -16,7 +16,8 @@ The tooth fails a node's whole runs read while any of its runs has a stop asked.
 fails and the step's later stages (`Agent.stages`: orphan containers, orphan records, the flush)
 do not run, so a replica container that rollouts or deletes left behind is never stopped and
 `track_unassigned` fires at the heal. C3's rollouts replace more replica containers, so more seeds
-hit it. Every seed of 1 to 40 that fails in this world (2, 4, 7, 12, 13, 14, 22, 23, 25, 31, 33,
+hit it. Seed 2's failure is that agent bug, not an accepted property of the world: `Agent.stages`
+skips the orphan stop after a failed job pass though the loading succeeded, and a follow-up fixes it. Every seed of 1 to 40 that fails in this world (2, 4, 7, 12, 13, 14, 22, 23, 25, 31, 33,
 38) passes in the plain `sim_cluster <seed> 100 0 --c1`.
 
 ## The search
