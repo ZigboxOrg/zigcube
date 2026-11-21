@@ -174,7 +174,26 @@ pub fn key_id_of(envelope: []const u8) ?KeyId {
 
 /// The member of a sealed record's JSON object that holds its envelope (docs/keys.md): the
 /// P-256 key of an `/edge-certs/` or `/acme-account/` record. Every other member is clear.
+/// A writer's record type names its field after this constant and passes `sealed_record`.
 pub const sealed_member = "key";
+
+/// A record type a writer under a sealed prefix serializes with `std.json`: `T` must be a struct
+/// whose sealed field is named `sealed_member`, at the top level, and holds the envelope as
+/// `[]const u8` or `?[]const u8` (null is written as `null`, read as nothing sealed). Call it at
+/// comptime beside the type, so a field named otherwise, or nested, fails the build instead of
+/// leaving every record unchecked at start (docs/sealing.md, "Writers").
+pub fn sealed_record(comptime T: type) void {
+    comptime {
+        if (@typeInfo(T) != .@"struct") @compileError(@typeName(T) ++ " is not a struct");
+        if (!@hasField(T, sealed_member)) {
+            @compileError(@typeName(T) ++ " has no field `" ++ sealed_member ++ "`");
+        }
+        const Field = @FieldType(T, sealed_member);
+        if (Field != []const u8 and Field != ?[]const u8) {
+            @compileError(@typeName(T) ++ "." ++ sealed_member ++ " is not a string");
+        }
+    }
+}
 
 /// What a sealed prefix's record holds, read by its schema (`sealed_of`).
 pub const Sealed = union(enum) {
@@ -219,6 +238,7 @@ const stack_bytes = @divExact(constants.seal_record_depth_max, 8);
 
 fn sealed_scan(scanner: *std.json.Scanner) std.json.Scanner.NextError!Sealed {
     if (try scanner.next() != .object_begin) return .{ .unreadable = "it is not a JSON object" };
+    var seen = false;
     var found: ?[]const u8 = null;
     var name_buffer: [sealed_member.len + 1]u8 = undefined;
     while (try member_name(scanner, &name_buffer)) |name| {
@@ -226,10 +246,14 @@ fn sealed_scan(scanner: *std.json.Scanner) std.json.Scanner.NextError!Sealed {
             try scanner.skipValue();
             continue;
         }
-        if (found != null) return .{ .unreadable = "it names its sealed member twice" };
+        if (seen) return .{ .unreadable = "it names its sealed member twice" };
+        seen = true;
         // An envelope has no escapes, so it is always one whole `.string` token of the input.
+        // `null` is a member present but empty: what `std.json.Stringify` writes for a null
+        // optional (`emit_null_optional_fields` defaults to true), so it reads as no member.
         switch (try scanner.next()) {
             .string => |text| found = text,
+            .null => assert(found == null),
             else => return .{ .unreadable = "its sealed member is not one envelope" },
         }
     }
@@ -238,6 +262,10 @@ fn sealed_scan(scanner: *std.json.Scanner) std.json.Scanner.NextError!Sealed {
         return .{ .unreadable = "it is not one JSON object" };
     }
     const envelope = found orelse return .none;
+    // No envelope is empty (`seal` of no bytes still has a header, nonce and tag), and an empty
+    // string is not how a pending entry is written: refused, so a key that was wiped or cut to
+    // nothing is never taken for an entry not yet given one.
+    if (envelope.len == 0) return .{ .unreadable = "its sealed member is empty" };
     return .{ .envelope = envelope };
 }
 
@@ -448,6 +476,36 @@ test "a clear member shaped like an envelope is never opened and never refuses t
     var opened: [constants.seal_plaintext_bytes_max]u8 = undefined;
     try testing.expectEqualStrings("leaf", try open(&key, path, found, &opened));
     try testing.expect(sealed_of("{" ++ clear ++ "}") == .none);
+}
+
+test "a pending record written by std.json, with a null key, holds nothing sealed" {
+    // Goal: a writer's record type with `key: ?[]const u8 = null`, serialized with std.json's
+    // defaults, reads as nothing sealed, not as a refusal; written with its envelope, it reads
+    // back as that envelope; and `"key":""` is refused (docs/sealing.md, "Writers"). Method: a
+    // record type as slice 3b's would be, checked by `sealed_record`, through `valueAlloc`.
+    const Record = struct { host: []const u8, state: []const u8, key: ?[]const u8 = null };
+    comptime sealed_record(Record);
+    const pending: Record = .{ .host = "a.example", .state = "pending" };
+    const text = try std.json.Stringify.valueAlloc(testing.allocator, pending, .{});
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "\"key\":null") != null);
+    try testing.expect(sealed_of(text) == .none);
+    try testing.expect(sealed_of("{\"key\":null}") == .none);
+    try testing.expect(sealed_of(" {\"a\":1, \"key\" : null } ") == .none);
+    // Null counts as naming the member: a second `key` is still refused.
+    const twice = sealed_of("{\"key\":null,\"key\":\"zcseal1.0123456789abcdef.AAAA\"}");
+    try testing.expectEqualStrings("it names its sealed member twice", twice.unreadable);
+
+    const key = test_key(0x66);
+    var out: [envelope_bytes_max]u8 = undefined;
+    const envelope = seal(&key, "/edge-certs/a.example", "p256", @splat(4), &out);
+    const ready: Record = .{ .host = "a.example", .state = "ready", .key = envelope };
+    const sealed_text = try std.json.Stringify.valueAlloc(testing.allocator, ready, .{});
+    defer testing.allocator.free(sealed_text);
+    try testing.expectEqualStrings(envelope, sealed_of(sealed_text).envelope);
+
+    const empty = sealed_of("{\"state\":\"pending\",\"key\":\"\"}");
+    try testing.expectEqualStrings("its sealed member is empty", empty.unreadable);
 }
 
 test "a sealed member of another version, or damaged, is refused by open, never skipped" {
