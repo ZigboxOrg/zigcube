@@ -1084,6 +1084,7 @@ test "POST /v1/jobs takes the worst-case input over the wire; every other body s
 // ---- B5: the trust policy from the configuration file to the refusal ------------------------
 
 const trust_fixture = @import("job_trust_fixture.zig");
+const trust_file = @import("trust_file.zig");
 
 test "a server started from --config with a trust policy refuses an unsigned job with 403" {
     // Goal: the production path of B5 slice 1, end to end (PR #241 review): `--config` names a
@@ -1098,17 +1099,20 @@ test "a server started from --config with a trust policy refuses an unsigned job
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const directory = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    // The policy sits in a directory of mode 0700 under /tmp, so the umask cannot refuse it.
+    const directory = try trust_file.test_directory(arena);
+    defer std.Io.Dir.cwd().deleteTree(io, directory) catch {}; // Best effort: it is in /tmp.
+    var tmp = try std.Io.Dir.cwd().openDir(io, directory, .{});
+    defer tmp.close(io);
 
     const public = trust_fixture.public_text(7);
     const policy = try std.fmt.allocPrint(arena, ".{{ .version = 1, .keys = .{{ .{{ " ++
         ".name = \"key-7\", .public = \"{s}\" }} }}, .require_signature = true }}", .{&public});
-    try tmp.dir.writeFile(io, .{ .sub_path = "trust.zon", .data = policy });
+    try tmp.writeFile(io, .{ .sub_path = "trust.zon", .data = policy });
+    try tmp.setFilePermissions(io, "trust.zon", .fromMode(0o644), .{});
     const settings = try std.fmt.allocPrint(arena, ".{{ .insecure_listen = \"127.0.0.1:0\", " ++
         ".store = \"memory\", .trust = .{{ .policy = \"{s}/trust.zon\" }} }}", .{directory});
-    try tmp.dir.writeFile(io, .{ .sub_path = "server.zon", .data = settings });
+    try tmp.writeFile(io, .{ .sub_path = "server.zon", .data = settings });
     const config_path = try std.fmt.allocPrint(arena, "{s}/server.zon", .{directory});
 
     var diag: Diag = undefined;

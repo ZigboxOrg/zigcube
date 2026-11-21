@@ -1002,6 +1002,8 @@ fn restart_with_policy(smoke: *Smoke, signed_image: []const u8) !void {
             .{&public},
         ),
     });
+    // Mode 0644 whatever the umask: a policy its group could write is refused (ZC-E0505).
+    try std.Io.Dir.cwd().setFilePermissions(smoke.io, policy, .fromMode(0o644), .{});
     smoke.images = images;
     smoke.trust_policy = policy;
     try smoke.stop(&smoke.agent, "the agent");
@@ -1248,6 +1250,10 @@ fn run(smoke: *Smoke) u8 {
     ) catch return 2;
     smoke.state = std.fmt.allocPrint(arena, "{s}/state", .{smoke.work}) catch return 2;
     std.Io.Dir.cwd().createDirPath(smoke.io, smoke.state) catch return 2;
+    // Step 8's trust policy lives here, and a directory its group or others could write is
+    // refused (ZC-E0505, ZC-E0106): 0755 whatever the umask.
+    std.Io.Dir.cwd().setFilePermissions(smoke.io, smoke.work, .fromMode(0o755), .{}) catch
+        return 2;
     smoke.port = free_port(smoke.io) catch return 2;
     defer std.Io.Dir.cwd().deleteTree(smoke.io, smoke.work) catch {}; // Best effort: it is in /tmp.
     defer smoke.cleanup();
