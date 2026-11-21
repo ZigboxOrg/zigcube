@@ -40,7 +40,7 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "user",
     "summary": "the server's configuration can't be used",
-    "explanation": "zcube-server read its configuration file and flags and found a setting\nit cannot use: a file that is not valid ZON, an unknown setting, a store\nthat is not memory, sqlite:<path> or postgres:<settings>, or a listen\naddress that is not host:port. The cause line names the setting.\n\nNothing was started. Correct the setting and start the server again."
+    "explanation": "zcube-server read its configuration file and flags and found a setting\nit cannot use: a file that is not valid ZON, an unknown setting, a store\nthat is not memory, sqlite:<path> or postgres:<settings>, a listen\naddress that is not host:port, or a `trust` entry whose policy file\ncannot be read, is not a policy zbx reads (the cause names its line,\ncolumn and what is wrong), or could be rewritten by someone other than\nroot or the server's user (it must be a regular file owned by one of\nthem, writable by neither group nor others, and so must every\ndirectory on its path, a symbolic link's own directory and those of\nits target included, unless the directory has the sticky bit, as /tmp\ndoes; in such a directory every entry the path passes, a link\nincluded, must be owned by root or the server's user, and must be\nneither a mount point nor on another mount than the directory). A\npath that goes on past a file, or that can't be resolved (a name on\nit missing or unsearchable, its working directory unreadable, a link\nunreadable, too long, or /proc not mounted), is refused too. The\ncause line says why, then names the path.\n\nNothing was started. Correct the setting and start the server again."
   },
   {
     "code": "ZC-E0107",
@@ -145,7 +145,7 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "user",
     "summary": "the lease settings cannot fence an agent in time",
-    "explanation": "An agent that loses contact with the server stops its containers a fixed\nmargin before its lease can run out, and the server places replacements\nonly after the lease has run out and a grace period has passed. The\nmargin must cover the time the agent needs to stop its containers, the\ndrift between the two clocks over one lease, and the time the kernel\nneeds to kill a process. These settings leave too little, so two copies\nof a replica could run at once.\n\nThe cause line names the numbers. A lease time to live that is too\nlong for the margin must be shortened. One that is too short, under\n8000 ms, leaves the agent no time to renew it before it fences, so it\nmust be lengthened; the cause line names the shortest. The default is\n10000 ms. An agent that is granted a lease time to live below 8000 ms\nby an older server stops its containers and reports this code."
+    "explanation": "An agent that loses contact with the server stops its containers a fixed\nmargin before its lease can run out, and the server places replacements\nonly after the lease has run out and a grace period has passed. The\nmargin must cover the time the agent needs to stop its containers, the\ndrift between the two clocks over one lease, and the time the kernel\nneeds to kill a process. The margin and the grace together must also\ncover how late the agent may send the kill and how far the database's\nclock may step forward (500 ms). These settings leave too little, so\ntwo copies of a replica could run at once.\n\nThe cause line names the numbers and the setting that falls short. A\nlost grace that is too short must be lengthened; the cause line names\nthe shortest, and the default is 1000 ms. A lease time to live that is too\nlong for the margin must be shortened. One that is too short, under\n8000 ms, leaves the agent no time to renew it before it fences, so it\nmust be lengthened; the cause line names the shortest. The default is\n10000 ms. An agent that is granted a lease time to live below 8000 ms\nby an older server stops its containers and reports this code."
   },
   {
     "code": "ZC-E0122",
@@ -173,7 +173,7 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "user",
     "summary": "a job is not valid",
-    "explanation": "`zcube job run`, or a POST to /v1/jobs, named a job that cannot run as it\nstands. The cause line names the field and the limit it broke: a name that\nis not 1 to 48 bytes of lowercase letters, digits and hyphens (none at\neither end), or the name `watch`, which /v1/jobs/watch reserves, no\ncommand or too many words, a deadline of zero or above 24 hours, a grace\nperiod above 60 seconds, env above 8 KiB, an input above 64 KiB or with a\nNUL byte, a submit time more than an hour ahead,\nmore labels than a job may carry, a label or env key given twice, or a\n`limits` member outside its range (`cpu_millis` 10 to 1,024,000,\n`memory_bytes` 4 MiB to 2^40, `pids` 1 to 4,194,304).\n\nTwo fields are refused because they are not built yet, and the cause says\nso: retries above 0 (a job runs at most once), and placement. Accepting a\nfield and ignoring it would say something false about where the job runs.\n\nA relay must be the name of one of the relays in the server's `relays`\nsetting; an unknown name is refused, and a job may not set ZCUBE_RELAY in\nits own env, because the relay's supervisor sets it.\n\nFix the field it names and submit again."
+    "explanation": "`zcube job run`, or a POST to /v1/jobs, named a job that cannot run as it\nstands. The cause line names the field and the limit it broke: a name that\nis not 1 to 48 bytes of lowercase letters, digits and hyphens (none at\neither end), or the name `watch`, which /v1/jobs/watch reserves, no\ncommand or too many words, a deadline of zero or above 24 hours, a grace\nperiod above 60 seconds, env above 8 KiB, an input above 64 KiB or with a\nNUL byte, a submit time more than an hour ahead,\nmore labels than a job may carry, a label or env key given twice, or a\n`limits` member outside its range (`cpu_millis` 10 to 1,024,000,\n`memory_bytes` 4 MiB to 2^40, `pids` 1 to 4,194,304).\n\nRetries above 0 are refused because they are not built yet, and the cause\nsays so (a job runs at most once). Accepting a field and ignoring it would\nsay something false about what the job does.\n\nA `placement` must be `{\"require\": {\"key\": \"value\"}}` with at most 4 pairs,\neach key and value within a label's bounds, no key twice and no other\nmember; the cause names what is wrong.\n\nA relay must be the name of one of the relays in the server's `relays`\nsetting; an unknown name is refused, and a job may not set ZCUBE_RELAY in\nits own env, because the relay's supervisor sets it.\n\n`signatures` holds at most 4 envelopes, each 1 to 2048 bytes of printable\nASCII: one line of `zbx trust export` each. Under the server's trust\npolicy, a line zbx cannot read as a DSSE envelope is refused too; a job\nno trusted line covers is ZBX-E0905, not this code.\n\nFix the field it names and submit again."
   },
   {
     "code": "ZC-E0131",
@@ -236,7 +236,7 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "environment",
     "summary": "the lease has expired or was revoked",
-    "explanation": "A lease holds keys alive for as long as its owner keeps renewing it. This\none is gone: it ran out of time (the owner could not reach the store in\ntime) or someone revoked it. The keys attached to it were deleted.\n\nA node agent that sees this has lost its place in the cluster. It stops\nits workloads, grants a new lease and registers again."
+    "explanation": "A lease holds keys alive for as long as its owner keeps renewing it. This\none is gone: it ran out of time (the owner could not reach the store in\ntime) or someone revoked it. The keys attached to it were deleted.\n\nA node agent that sees this has lost its place in the cluster. It stops\nits workloads, grants a new lease and registers again.\n\nThe same code answers a keepalive for a lease the node's registration is\nnot on: a later registration took the node, and the agent fences, as\nabove.\n\nIt also answers a registration that cannot take the node: one made on a\nlease that is gone, or on a lease older than the one the node is\nregistered on (an earlier attempt that arrived late, #237). Nothing was\nwritten and the agent holds no tenure on that lease, so it fences\nnothing: its step fails, and its next step registers on a new lease,\nwhich is accepted at once."
   },
   {
     "code": "ZC-E0206",
@@ -418,7 +418,7 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "user",
     "summary": "the agent's configuration can't be used",
-    "explanation": "A flag or a setting in the agent's ZON file is missing, unknown or out of\nrange, or the image fixtures file it names cannot be read. The cause\nline names the setting. The agent did not start and changed nothing.\n\nRun zcube-agent --help for the flags and the file's fields."
+    "explanation": "A flag or a setting in the agent's ZON file is missing, unknown or out of\nrange, the node's labels are malformed or given by --label and by the\nfile's .labels differently, the labels differ from those the node\nregistered with while its lease in --state-dir is live, or a file it\nnames (the image fixtures, the --trust-policy file) cannot be read or\nused. The --trust-policy file, and every directory on its path (a\nsymbolic link's own directory and those of its target included), must\nbe owned by root or the agent's user and writable by neither group nor\nothers (a directory with the sticky bit, as /tmp, may be, and then\nevery entry the path passes in it, a link included, must be owned by\nroot or the agent's user, and must be neither a mount point nor on\nanother mount than the directory). Without --ca (or .ca in the file)\nthe agent speaks plain HTTP, so --server must then be a loopback\naddress (127.0.0.0/8 or [::1]): the server serves plain HTTP on\nloopback only, and a node must not take its work unauthenticated over\na network; give --ca, --cert and --key to reach any other address over\nTLS (zcube-agent fetch keeps the same rule for its --server). The\ncause line says what was refused and why. The agent did not start and\nchanged nothing.\n\nRun zcube-agent --help for the flags and the file's fields."
   },
   {
     "code": "ZC-E0506",
@@ -571,8 +571,8 @@ export const ZC_CODES = [
     "code": "ZC-E0702",
     "severity": "error",
     "blame": "environment",
-    "summary": "a job's relay could not listen",
-    "explanation": "The supervisor of a job could not set up the relay the job asked for, so the\njob does not run without the route it was promised. The cause line says\nwhich step failed (the socket, the bind, the listen, the relay's address).\n\nOn the fake runtime the job is not started and ends as a start failure. On\nthe real runtime the container has already started, so the supervisor kills\nit: it ends as killed by signal 9 and the cause is the line `ZC-E0702` in\nthe job's `relay.log`.\n\nIf the cause is a socket or file descriptor error, the host may be out of\ndescriptors: check `ulimit -n` and the node's load. If it names the relay's\naddress, correct the relay's address in the server's `relays` setting. Then\nsubmit the job again."
+    "summary": "a job's relay could not be served",
+    "explanation": "A job asked for a relay, and the job's supervisor could not serve it, so the\njob does not run without the route it was promised. The cause line says\nwhich of three things happened:\n\n- The relay could not be set up: the socket, the bind, the listen or the\n  relay's address failed. If the cause is a socket or file descriptor error,\n  the host may be out of descriptors: check `ulimit -n` and the node's load.\n  If it names the relay's address, correct it in the server's `relays`\n  setting.\n- The relay stopped while the job ran, and the job's command was killed with\n  it. Look in the node agent's log for why, around the time of the ending.\n- The relay cannot be served as the job names it: a job submitted before B4\n  carries no upstream server name and CA, a release build serves no plain\n  relay, and the zigbox runtime does not speak TLS to an upstream until B4\n  slice 4. Run the job on the fake runtime, or wait for that release.\n\nOn the fake runtime a relay that cannot be set up stops the job before it\nstarts, and it ends as a start failure. Otherwise the container has already\nstarted, so the supervisor kills it: it ends as killed by signal 9 and the\ncause is the line `ZC-E0702` in the job's `relay.log`. In each case, fix\nwhat the cause names, then submit the job again."
   },
   {
     "code": "ZC-E0703",
@@ -594,6 +594,13 @@ export const ZC_CODES = [
     "blame": "environment",
     "summary": "a relayed connection failed in the middle",
     "explanation": "A connection through a job's relay was open and then a read or a write on\nit failed: the peer reset it, or the host refused the call. Both ends were\nclosed. Bytes already copied were delivered; nothing is retried, because\nthe relay cannot know which request the bytes belonged to.\n\nA reset by the job or the upstream is ordinary and needs no action. If it\nrepeats on every connection, check the node's network and the upstream."
+  },
+  {
+    "code": "ZC-E0706",
+    "severity": "error",
+    "blame": "environment",
+    "summary": "the server refused a relayed run's certificate",
+    "explanation": "A relayed job's supervisor made a key for the run, and the agent asked the\nserver to sign it. The server signs only for the node that holds the job's\ncurrent claim, at the claim's placement epoch, for an image that matches\nthe job's, while the run has not ended. It refused: the cause says which\ncheck failed (not this node's claim, a stale epoch, the run has ended, a\ndifferent image).\n\nThe relay stays closed: the job's connections to it are closed without\nreaching the upstream, and the line is in the job's `relay.log`. This is\nwhat a run that lost its claim (the node was cut off, the job was placed\nelsewhere, or it was cancelled) should see, and needs no action. If it\nrepeats for a run that is still this node's, check `zcube job status` for\nthe claim and compare the agent's and the server's versions.\n\nTwo causes are not final: no node has claimed the run yet, or the claim has\nnot started it. The server then answers 503, not 409, and the agent asks\nagain by itself; it marks the run refused only on a 409."
   },
   {
     "code": "ZC-W0701",
@@ -648,15 +655,15 @@ export const ZC_CODES = [
     "code": "ZC-E0806",
     "severity": "error",
     "blame": "user",
-    "summary": "a peer key or trust file can't be used",
-    "explanation": "The server's CA key (ca*.key in its state directory), the list of removed\nnodes (revoked), or an agent's node key (peer.key), credential (peer.cred)\nor trusted CA key (ca.pub) could not be read, created, written or parsed,\nor its file or directory has permissions that let other users read a secret\nor write a trust file. Key files must be owned by the process, mode 0600,\nand hold one line of 64 hex digits; the state directory must not be\nwritable by group or others. A revoked line must be a node name.\n\nThe secret is never printed. If the file is damaged and there is a backup,\nput it back. An agent's files are caches: it ignores a damaged peer.cred\nor ca.pub and joins again by itself; delete peer.key to get a new node key.\nA server whose CA key is missing although its store has run refuses to\nstart: put the key back, or start once with --new-ca to make a new CA on\npurpose (every agent then joins again by itself)."
+    "summary": "a peer key, certificate or trust file can't be used",
+    "explanation": "The server's CA key (ca*.key in its state directory), the list of removed\nnames (revoked), an agent's node key (peer.key), credential (peer.cred),\nnode certificate (node.crt) or trusted CA key (ca.pub), or a file that\nzcube-server ca issue-client or issue-node writes (NAME.key, NAME.crt)\ncould not be read, created, written or parsed, or its file or directory has\npermissions that let other users read a secret or write a trust file. Key\nfiles must be owned by the process, mode 0600; the CA key and peer.key hold\none line of 64 hex digits. The state directory must not be writable by\ngroup or others (the server and the agent create it with mode 0700). A\nrevoked line must be a node or client name.\n\nThe secret is never printed. If the file is damaged and there is a backup,\nput it back. An agent's files are caches: it ignores a damaged peer.cred,\nnode.crt or ca.pub and joins or renews again by itself; delete peer.key to\nget a new node key. A server whose CA key is missing although its store has\nrun refuses to start: put the key back, or start once with --new-ca to make\na new CA on purpose (every agent then joins again by itself).\n\nca issue-client and ca issue-node never make a CA: if the store has none,\ngive the --store and --state-dir the server runs with, or start the server\nwith this --store first. They never replace an existing NAME.key or NAME.crt\nunless run with --replace, which is how a certificate is re-issued."
   },
   {
     "code": "ZC-E0807",
     "severity": "error",
     "blame": "user",
-    "summary": "a node was refused a credential: it was removed",
-    "explanation": "The server will not issue or renew a peer credential for this node,\nbecause its name is on the server's list of removed nodes (the revoked\nfile in its state directory). The node's current credential stays valid\nuntil it expires, within a day, and then its peers refuse it.\n\nIf the node should be in the cluster, remove its name from the revoked\nfile and restart zcube-server; the agent asks again by itself. The API is\nunauthenticated, so this binds an honest node only: until the API has auth,\nanyone who can reach it can register a name and ask for a credential."
+    "summary": "a name on the removed list was refused a certificate",
+    "explanation": "The server will not issue or renew a credential or certificate for this\nname, because it is on the server's list of removed names (the revoked file\nin its state directory), which holds node and client names alike. A node's\ncurrent credential stays valid until it expires, within a day, and then its\npeers refuse it; a certificate already issued stays valid until it expires.\n\nFor a node that should be in the cluster: remove its name from the revoked\nfile; the server rereads it within 5 seconds and the agent asks again by\nitself.\nFor a client: remove its name from the revoked file and run\nzcube-server ca issue-client again, or choose another name.\n\nOver --listen only a node's own certificate may ask for its credential;\nthe loopback --insecure-listen caller is trusted, as anyone on the host."
   },
   {
     "code": "ZC-E0808",
@@ -684,7 +691,7 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "external",
     "summary": "a certificate is expired or not yet valid",
-    "explanation": "The certificate is signed by the pinned anchor but the current time is\noutside its validity window, allowing peer_clock_skew_ms of clock difference\non each side. The signature was checked first, so the certificate is\ngenuine. The cause shows notBefore, notAfter and this machine's time.\n\nCheck the clocks on both machines. A workload certificate lives for the\nservice's deadline, at most x509_leaf_ttl_ms_max: ask for a new one."
+    "explanation": "The certificate is signed by the pinned anchor but the current time is\noutside its validity window, allowing peer_clock_skew_ms of clock difference\non each side. The signature was checked first, so the certificate is\ngenuine. The cause shows notBefore, notAfter and this machine's time.\n\nThe API server checks the client's certificate again before each request,\nso a connection outlives its certificate by at most one request; the agent\nchecks its own node.crt before each connection.\n\nCheck the clocks on both machines. A workload certificate lives for the\nservice's deadline, at most x509_leaf_ttl_ms_max: ask for a new one."
   },
   {
     "code": "ZC-E0812",
@@ -705,7 +712,7 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "external",
     "summary": "the TLS client certificate was not asked for, or was refused",
-    "explanation": "The client was told to present a certificate and the server did not ask\nfor one, or the server refused the one presented (the alert names why:\nbad_certificate, certificate_expired, unknown_ca, certificate_required).\nA client that sends an empty Certificate (it has no certificate, or the\nrequest does not list Ed25519) and is refused by the server is this too,\nand so is a client that must authenticate facing a request without\nEd25519. The connection is closed; a refusal arrives after the client's\nown handshake is done, so data written before the alert was read was\nnot accepted.\n\nA server that never asks cannot learn which workload is calling, so a\nconnection that must prove identity stops. Check that the server is\nconfigured to require client certificates and trusts the cluster CA;\na refused certificate is expired, issued by another CA, or for a\ndifferent workload than the server allows. A signer that fails is a\ndifferent error (ZC-E0820).\n\nOn a zcube server, this is a client that came without a certificate: it\nsent an empty Certificate, and the server answered certificate_required.\nThe server takes no connection without one. Give the client a\ncertificate from this cluster's CA."
+    "explanation": "The client was told to present a certificate and the server did not ask\nfor one, or the server refused the one presented (the alert names why:\nbad_certificate, certificate_expired, unknown_ca, certificate_required).\nA client that sends an empty Certificate (it has no certificate, or the\nrequest does not list Ed25519) and is refused by the server is this too,\nand so is a client that must authenticate facing a request without\nEd25519. The connection is closed; a refusal arrives after the client's\nown handshake is done, so data written before the alert was read was\nnot accepted.\n\nA server that never asks cannot learn which workload is calling, so a\nconnection that must prove identity stops. Check that the server is\nconfigured to require client certificates and trusts the cluster CA;\na refused certificate is expired, issued by another CA, or for a\ndifferent workload than the server allows. A signer that fails is a\ndifferent error (ZC-E0820).\n\nOn a zcube server, this is a client that came without a certificate: it\nsent an empty Certificate, and the server answered certificate_required.\nThe server takes no connection without one. Give the client a\ncertificate from this cluster's CA. A browser (a client that offers\nno Ed25519) is told so by name: it needs a certificate from the\ncluster's browser CA, imported from the .p12 that zcube-server ca\nissue-client NAME --scope admin --p12 FILE writes (docs/mtls.md)."
   },
   {
     "code": "ZC-E0815",
@@ -726,21 +733,21 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "user",
     "summary": "an identity could not be issued",
-    "explanation": "A workload or server certificate was not made because its request breaks a\nbound: more labels than x509_labels_max, a label key or value over its limit\nor with a character that is not allowed, label keys not sorted and unique,\nlabels together over x509_labels_bytes_max, a cluster or service name that\ndoes not make a SPIFFE ID spiffe://<cluster>/service/<name>, a DNS name that\nis not lowercase, has a wildcard or an all-digit label, or a lifetime that\nis empty or over x509_leaf_ttl_ms_max (x509_ca_ttl_ms_max for a CA), or a\nsubject key that is not a valid Ed25519 public key (off the curve, or in a\nsmall subgroup), which no honest holder has.\n\nThe cause names the rule. Correct the request and issue again; nothing was\nwritten."
+    "explanation": "A workload, server, node or client certificate was not made because its\nrequest breaks a bound: more labels than x509_labels_max, a label key or\nvalue over its limit or with a character that is not allowed, label keys not\nsorted and unique, labels together over x509_labels_bytes_max, a cluster,\nservice, node or client name that does not make a SPIFFE ID\nspiffe://<cluster>/<service|node|client>/<name>, a DNS name that is not\nlowercase, has a wildcard or an all-digit label, or a lifetime that\nis empty or over x509_leaf_ttl_ms_max (x509_ca_ttl_ms_max for a CA), or a\nsubject key that is not a valid Ed25519 public key (off the curve, or in a\nsmall subgroup), which no honest holder has.\n\nThe cause names the rule. Correct the request and issue again; nothing was\nwritten."
   },
   {
     "code": "ZC-E0818",
     "severity": "error",
     "blame": "external",
     "summary": "a TLS peer needs something zcube does not offer",
-    "explanation": "zcube speaks TLS 1.3 only, with x25519, TLS_AES_128_GCM_SHA256 and Ed25519\nsignatures, and offers no resumption and no retry. The peer answered with\nan older protocol version, another suite, group or signature scheme, or a\nHelloRetryRequest. The cause names which.\n\nPeers of a zcube cluster are zcube servers. If this is not one, connect to\nthe right address; there is no setting that widens what zcube offers."
+    "explanation": "zcube speaks TLS 1.3 only, with x25519, TLS_AES_128_GCM_SHA256 and Ed25519\nsignatures, and offers no resumption, no early data and no retry. The peer\nanswered or asked with an older protocol version, another suite, group or\nsignature scheme, early data, or a HelloRetryRequest. The cause names which.\n\nPeers of a zcube cluster are zcube servers. If this is not one, connect to\nthe right address; there is no setting that widens what zcube offers.\n\nOn a public listener, which browsers reach, the server takes ECDSA P-256\nsignatures (ecdsa_secp256r1_sha256) instead of Ed25519 and asks for no\nclient certificate. It also refuses, with this code, a ClientHello with no\nserver name (SNI), one whose name is not a host name or not a service public\nhere (alert unrecognized_name), one whose ALPN list lacks http/1.1 (alert\nno_application_protocol), and one that lists x25519 without a key share for\nit. Check that the name the client asked for is the service's public host,\nthat its DNS points at this listener, and that the client speaks HTTP/1.1;\nthe cause names the name and the rule."
   },
   {
     "code": "ZC-E0819",
     "severity": "error",
     "blame": "external",
     "summary": "a certificate is of another kind than this use needs",
-    "explanation": "The certificate is genuine and well formed, but it is not for this use: a\nworkload's client certificate presented as a server's, a CA certificate\npresented as a leaf, or, under a foreign anchor, a certificate whose\nextended key usage lacks serverAuth or whose basic constraints say CA.\n\nThe cause names the kind found and the kind needed. Give the peer a\ncertificate issued for its role: a server certificate for a server."
+    "explanation": "The certificate is genuine and well formed, but it is not for this use: a\nworkload's, node's or client's certificate presented as a server's, one of\nthose three where another of them is needed (a workload's where the API\nneeds a node's or a client's), a CA certificate presented as a leaf, or,\nunder a foreign anchor, a certificate whose extended key usage lacks\nserverAuth or whose basic constraints say CA.\n\nThe server also refuses, with this code, a node or client certificate whose\nname is in its revoked file: at the handshake, and before each request on\na connection opened before the name was revoked, which is then closed.\n\nThe cause names the kind found and the kind needed, or the revoked name.\nGive the peer a certificate issued for its role: a server certificate for\na server."
   },
   {
     "code": "ZC-E0820",
@@ -755,6 +762,27 @@ export const ZC_CODES = [
     "blame": "environment",
     "summary": "the operating system's secure random source failed",
     "explanation": "A key, a nonce or a seed was not made because the kernel's secure random\nsource (getrandom) returned an error. Nothing weaker is used instead, and\nnothing is retried.\n\nCheck that getrandom works where this runs: the kernel, the seccomp profile\nand the container sandbox must allow it. Then run the command again."
+  },
+  {
+    "code": "ZC-E0822",
+    "severity": "error",
+    "blame": "user",
+    "summary": "the caller's certificate does not allow this request",
+    "explanation": "The server refused a request because the client certificate it came with\ndoes not give the scope the request needs. The diagnostic names the caller\nand the scope it would need. The answer is HTTP 403, and nothing was read\nor written.\n\nA node's certificate (an agent) may call only the agent API under its own\nnode's name: /v1/agent/nodes/<its name>/. A client certificate of scope\n`jobs` may submit, list, watch and cancel jobs (/v1/jobs) and ask why about\na job. Everything else needs a client certificate of scope `admin`, but\nno client may call /v1/agent/nodes/<name>/credential: it signs a node's\nown certificate, so only that node's certificate may ask.\n\nUse a certificate with the scope the request needs: an operator issues one\nwith `zcube-server ca issue-client NAME --scope admin`."
+  },
+  {
+    "code": "ZC-E0824",
+    "severity": "error",
+    "blame": "user",
+    "summary": "sealed records do not open with this server's sealing key",
+    "explanation": "The store holds sealed records (certificate keys under /edge-certs/ and\nACME account keys under /acme-account/), and the server's sealing key\ndoes not open one of them: the key file is missing, or it is another key.\nThe server refuses to start, so that it never orders new certificates\nover records it cannot read. The diagnostic names the key file, the\nrecord and the key id the records expect; it never prints a key.\n\nRestore the key file (seal-<hash>.key, mode 0600, beside the CA key in\nthe state directory) from a backup and start again. If there is no\nbackup, start once with `zcube-server --discard-sealed`: every sealed\nrecord is deleted, a new key is made, and every public host is ordered\nagain (ZC-W0808); the old key file is kept, renamed aside.\n\nA record that no key can open (not one JSON object, or a sealed key\nthat is not an envelope this server reads) is damaged, not sealed with\nanother key: the diagnostic names it and says so, and the fix is to\ndelete that one record from the store and start again. The key file is\nnot at fault; --discard-sealed also clears it, with every other record.\n\nThe start-up check reads at most 2,048,000 records under each prefix\n(4096 pages of 500). Past that the server refuses to start rather than\ncheck part of them: delete the records no public host uses any more.\nThe same code ends a --discard-sealed start that could not empty a\nprefix because another writer kept adding records: stop it, then start\nagain."
+  },
+  {
+    "code": "ZC-W0808",
+    "severity": "warning",
+    "blame": "user",
+    "summary": "the server started with --discard-sealed",
+    "explanation": "The server started with --discard-sealed. If its sealing key opened every\nsealed record, the flag did nothing: no record was deleted, the key was\nkept, and the warning says to remove the flag.\n\nOtherwise it deleted every sealed record (certificates and ACME accounts)\nand every ACME order, renamed the old key file aside\n(seal-<hash>.key.discarded-<unix seconds>, still 0600; docs/sealing.md\nsays how to restore it) and made a new sealing key. Every public host is\nordered again, which counts against Let's Encrypt's limits: 50\ncertificates per registered domain per week, and 5 duplicate\ncertificates per week.\n\nBack up the new key file and start without --discard-sealed from now on."
   },
   {
     "code": "ZC-B0001",
