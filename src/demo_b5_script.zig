@@ -3,7 +3,8 @@
 //!   1. start: in the guest, a signer's own Zigbox store pulls the image (v1) and another (v2),
 //!      makes two keys, `release` and `stranger`, and signs with `zbx sign`; `zbx trust export`
 //!      gives the lines. The server's policy and the node's both trust `release` only and require
-//!      a signature. The server starts on the host, the agent (`--runtime zigbox`) in the guest;
+//!      a signature. The server starts on the host (TLS, `--listen`), the agent (`--runtime
+//!      zigbox`, with a node certificate) in the guest;
 //!   2. a job signed by `release` is submitted (`POST /v1/jobs`), runs and exits 0;
 //!   3. three jobs are refused at the server: unsigned, signed by `stranger`, and signed for v2
 //!      but naming v1. Each answer is 403 with ZBX-E0905 and its own cause, and no job exists
@@ -164,13 +165,18 @@ fn start(demo: *Demo) !void {
     const host = demo.host;
     host.section("1. Start: zcube-server with the policy, one node with the same policy");
     try host.start_server(30 * 1000);
+    try host.check_tls_only();
     host.say("  zcube-server is up on 127.0.0.1:{d} (SQLite); the guest reaches it at {s}", .{
         host.port, demo.server,
     });
     _ = try demo.guest(0, "images {s} {s} {s} {s}", .{
         demo.v1_tree, steps.v1_ref, demo.v2_tree, steps.v2_ref,
     });
-    _ = try demo.guest(0, "agent {s} {s}", .{ vms.names[0], demo.server });
+    // The guest is not on the server's loopback, so its agent talks TLS with a node certificate.
+    try steps.put_tls(demo, 0);
+    _ = try demo.guest(0, "agent {s} {s} {s}", .{
+        vms.names[0], demo.server, steps.guest_tls_dir,
+    });
     try demo.wait_hard({}, node_joined, "the node to join", steps.join_ms);
     _ = try host.zcube(&.{ "get", "nodes" });
 }

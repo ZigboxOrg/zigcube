@@ -193,7 +193,9 @@ refused; `api_tls_test.zig` does it end to end over TLS.
 | `--key FILE` | `ZCUBE_KEY` | `.key` | its Ed25519 key (PKCS#8 PEM, mode 0600) |
 | `--tls-name NAME` | `ZCUBE_TLS_NAME` | `.tls_name` | the DNS name the server's certificate must carry (default `zcube-server`) |
 
-Without `--ca` a client speaks plain HTTP (to `--insecure-listen`). `zcube` needs all three
+Without `--ca` a client speaks plain HTTP (to `--insecure-listen`); the agent then refuses a
+`--server` that is not a loopback address (`ZC-E0505`,
+decisions/2026-11-21-agent-plain-http-loopback-only.md). `zcube` needs all three
 files together. A file that cannot be used is `ZC-E0806` naming it; a certificate not issued by
 the CA of `--ca`, or a key that is not the certificate's, is refused before any connection.
 
