@@ -316,7 +316,7 @@ pub const Server = struct {
     fn open_seal(server: *Server, config: config_mod.Config, diag: *Diag) Error!void {
         var name_buffer: [server_seal.key_name_bytes_max]u8 = undefined;
         const place = try server.seal_place(config, &name_buffer, diag);
-        const opened = server_seal.open(
+        var opened = server_seal.open(
             server.gpa,
             server.io,
             server.backend.handle(),
@@ -324,6 +324,8 @@ pub const Server = struct {
             place.options,
             diag,
         ) catch |err| return seal_failed(err, diag);
+        // The copy on the stack is wiped; the server's own is wiped in `stop`.
+        defer if (opened == .ready) opened.ready.wipe();
         switch (opened) {
             .ready => |key| server.seal_key = key,
             .discard => {
@@ -339,7 +341,7 @@ pub const Server = struct {
         if (!server.seal_discard) return;
         var name_buffer: [server_seal.key_name_bytes_max]u8 = undefined;
         const place = try server.seal_place(config, &name_buffer, diag);
-        server.seal_key = server_seal.discard(
+        var key = server_seal.discard(
             server.gpa,
             server.io,
             server.verified.interface(),
@@ -347,6 +349,8 @@ pub const Server = struct {
             place.options,
             diag,
         ) catch |err| return seal_failed(err, diag);
+        defer key.wipe(); // The copy on the stack; the server's own is wiped in `stop`.
+        server.seal_key = key;
         server.seal_discard = false;
     }
 
