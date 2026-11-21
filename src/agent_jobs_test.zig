@@ -620,6 +620,37 @@ test "the job fence counts from when the runs read was sent, not when it was ans
     world.switched.down_list_prefix = null;
 }
 
+test "the job fence stops a run container whose start record is gone or damaged" {
+    // Goal: the 0.5.2 review 5927352205, item 7: with no readable start record the job fence
+    // skipped the container, and `pass`, which stops it as `unknown`, cannot run while no read
+    // of the runs succeeds, so it ran on for as long as the runs were unreadable.
+    // Method: run a run, remove its record (then, in a second world, damage it), fail every read
+    // of the runs: before the fence it runs on, after the fence and its grace it is stopped.
+    for ([_]bool{ false, true }) |damaged| {
+        var rig = try Rig.start();
+        defer rig.stop();
+        const world = rig.world;
+        _ = try rig.assign(600_000);
+        rig.step();
+        try testing.expect(rig.running());
+        world.switched.down_list_prefix = records.prefix_job_runs;
+        var buffer: [96]u8 = undefined;
+        const name = agent_jobs.record_name(&buffer, run_id);
+        if (damaged) {
+            try world.files.interface().put_atomic(name, "{not");
+        } else {
+            try world.files.interface().remove(name);
+        }
+        const fence_at = world.agent.job_fence_at_ms().?;
+        world.advance(fence_at - world.now_ms() - 500);
+        try testing.expect(rig.running());
+        world.advance(500 + constants.fence_stop_ms + 1_000);
+        try testing.expect(!rig.running());
+        try testing.expect(!world.agent.fence.active);
+        world.switched.down_list_prefix = null;
+    }
+}
+
 test "an agent restart does not move the job fence later (#143)" {
     // Goal: the job fence counts from the last runs read that succeeded, so a restart in the same
     // boot must not count it from the restart. Method: as above, but the agent restarts halfway

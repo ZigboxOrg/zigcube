@@ -181,11 +181,22 @@ pub fn enforce_deadlines(
             continue;
         };
         switch (read) {
-            // No record to say when: `pass` stops it as `unknown`, with the server's word.
-            .absent, .damaged => {},
+            .absent, .damaged => enforce_unrecorded(agent, ctx, listing),
             .record => |found| enforce_one(agent, ctx, state, listing, found),
         }
     }
+}
+
+/// A running run container with no start record to say when, or a damaged one. `pass` stops it
+/// as `unknown`, with the server's word; while no read of the runs succeeds there is no pass, so
+/// the job fence stops it as it stops a recorded run (0.5.2 review 5927352205, item 7). No cause
+/// can be recorded without a record: once the server answers, `pass` reports what it finds.
+fn enforce_unrecorded(agent: *Agent, ctx: *const Context, listing: *const runtime.Listing) void {
+    assert(is_running(listing));
+    const fence_at = agent.job_fence_at_ms() orelse return;
+    const mono = ctx.mono_ms();
+    if (mono < fence_at) return note_deadline_wake(agent, fence_at);
+    stop_enforced(agent, ctx, listing, constants.fence_stop_ms);
 }
 
 fn enforce_one(
@@ -213,12 +224,25 @@ fn enforce_one(
             agent.note_enforce_failure(ctx, "record a run's stop cause");
     }
     // Any recorded cause is a stop under way: send it, or the kill once the grace has passed.
-    agent.stop_listing(ctx, listing, record.grace_ms) catch {
-        agent.note_enforce_failure(ctx, "stop a run's container");
-        return; // The next step tries again (the loop's resync), not a busy retry.
-    };
+    assert(record.stop_cause != null);
+    stop_enforced(agent, ctx, listing, record.grace_ms);
+}
+
+/// Sends a run container its stop, or the kill once the grace has passed, and wakes the agent
+/// for the kill. A failure is noted; the next step tries again (the loop's resync), not a busy
+/// retry.
+fn stop_enforced(
+    agent: *Agent,
+    ctx: *const Context,
+    listing: *const runtime.Listing,
+    grace_ms: u32,
+) void {
+    assert(is_running(listing));
+    agent.stop_listing(ctx, listing, grace_ms) catch
+        return agent.note_enforce_failure(ctx, "stop a run's container");
     const pending = agent.pending_stop(listing.handle.name()) orelse return;
     const now = ctx.clock.now_ms();
+    const mono = ctx.mono_ms();
     if (pending.deadline_ms > now) note_deadline_wake(agent, mono + (pending.deadline_ms - now));
 }
 
