@@ -23,9 +23,10 @@ runs:
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ~/.cache/zbx-debs
-        # v2: the closure saved before the dpkg fallback could be incomplete; a new
-        # key saves a fresh one.
-        key: debs-v2-${{ runner.os }}-${{ env.ImageVersion }}-${{ inputs.packages }}
+        # v3: v2 held closures that left out dependencies the saving runner already
+        # had (libpmem1, librdmacm1t64 for qemu-system-x86), so dpkg -i half-installed
+        # them on every later run. A new key saves a complete closure.
+        key: debs-v3-${{ runner.os }}-${{ env.ImageVersion }}-${{ inputs.packages }}
     - name: Install
       shell: bash
       env:
@@ -74,9 +75,32 @@ runs:
               -o Acquire::Retries=2 -o Dir::Cache::archives="$debs")
         mkdir -p "$debs/partial"
         timeout 300 sudo apt-get "${opts[@]}" update
-        # --fix-broken completes packages a refused dpkg -i left unconfigured; a no-op otherwise.
+        # A refused dpkg -i leaves packages unpacked but unconfigured, and apt then
+        # refuses to install anything by name ("not going to be installed"). Repair
+        # that state first, with no package names; a no-op on a clean runner.
+        sudo dpkg --configure -a || true
+        timeout 600 sudo apt-get "${opts[@]}" install -y -f --no-install-recommends
         # shellcheck disable=SC2086
-        timeout 600 sudo apt-get "${opts[@]}" install -y --fix-broken --no-install-recommends $PACKAGES
+        timeout 600 sudo apt-get "${opts[@]}" install -y --no-install-recommends $PACKAGES
+
+        # Save a closure that works on any runner: the packages' whole dependency
+        # tree, not only what this runner lacked. Essential and required/important
+        # packages stay out (reinstalling libc and friends from a cache is unsafe).
+        # Runs only after the install above succeeded, so a bad run saves nothing
+        # new (actions/cache saves only on a miss, and only when the job passes).
+        closure=()
+        while read -r name; do
+          st=$(dpkg-query -W -f='${db:Status-Abbrev}|${Essential}|${Priority}' "$name" 2>/dev/null) || continue
+          case "$st" in
+            ii\ *'|yes|'*|ii\ *'|'*'|required'|ii\ *'|'*'|important') ;;
+            ii\ *) closure+=("$name") ;;
+          esac
+        done < <(apt-cache depends --recurse --no-recommends --no-suggests --no-conflicts \
+                   --no-breaks --no-replaces --no-enhances $PACKAGES | grep -E '^[a-z0-9]')
+        if [ "${#closure[@]}" -gt 0 ]; then
+          timeout 600 sudo apt-get "${opts[@]}" install -y --download-only --reinstall \
+            --no-install-recommends "${closure[@]}"
+        fi
         # Leave only readable .deb files for actions/cache to archive.
         sudo rm -rf "$debs/partial" "$debs/lock"
         sudo chmod -R a+rX "$debs"
