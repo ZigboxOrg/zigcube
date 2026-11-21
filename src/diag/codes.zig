@@ -243,7 +243,11 @@ pub const registry = [_]Entry{
         \\them, writable by neither group nor others, and so must every
         \\directory on its path, a symbolic link's own directory and those of
         \\its target included, unless the directory has the sticky bit, as /tmp
-        \\does). The cause line names the setting.
+        \\does; in such a directory every entry the path passes, a link
+        \\included, must be owned by root or the server's user). A path that
+        \\goes on past a file, or that can't be resolved (its working directory
+        \\unreadable, a link unreadable, too long, or /proc not mounted), is
+        \\refused too. The cause line names the setting and why.
         \\
         \\Nothing was started. Correct the setting and start the server again.
         ,
@@ -1156,8 +1160,10 @@ pub const registry = [_]Entry{
         \\used. The --trust-policy file, and every directory on its path (a
         \\symbolic link's own directory and those of its target included), must
         \\be owned by root or the agent's user and writable by neither group nor
-        \\others (a directory with the sticky bit, as /tmp, may be). The cause
-        \\line names the setting. The agent did not start and changed nothing.
+        \\others (a directory with the sticky bit, as /tmp, may be, and then
+        \\every entry the path passes in it, a link included, must be owned by
+        \\root or the agent's user). The cause line names the setting and why.
+        \\The agent did not start and changed nothing.
         \\
         \\Run zcube-agent --help for the flags and the file's fields.
         ,

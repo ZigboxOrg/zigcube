@@ -99,7 +99,8 @@ comptime {
 /// next start reads what they chose (0.5.2 review 5927352205, item 8; PR #10's review;
 /// docs/decisions/2026-11-21-trust-policy-directories.md). So the path is walked as given, a
 /// component at a time and never through a link unseen: a link's own directory is judged, then
-/// its target is walked in its place.
+/// its target is walked in its place. In a directory others may write (sticky), every entry it
+/// passes must be root's or the process's own user's (`check_entry`).
 const Walk = struct {
     /// The directories reached so far, from `/`, with no link left in them.
     resolved: [path_max]u8 = undefined,
@@ -127,13 +128,17 @@ fn walk(w: *Walk, path: []const u8, options: Options, diag: *Diag) Error!Owner {
     var prefix_len: usize = 0;
     if (!std.fs.path.isAbsolute(path)) {
         const result = linux.getcwd(&w.pending, w.pending.len);
-        if (linux.errno(result) != .SUCCESS) return unresolved(path, options, diag);
-        prefix_len = std.mem.indexOfScalar(u8, &w.pending, 0) orelse
-            return unresolved(path, options, diag);
+        const found = if (linux.errno(result) == .SUCCESS)
+            std.mem.indexOfScalar(u8, &w.pending, 0)
+        else
+            null;
+        prefix_len = found orelse return bad(diag, options, "can't read the working " ++
+            "directory, from which the trust policy {s} is a relative path", .{path}, //
+            "name the policy by an absolute path");
         w.pending[prefix_len] = '/';
         prefix_len += 1;
     }
-    if (prefix_len + path.len > w.pending.len) return unresolved(path, options, diag);
+    if (prefix_len + path.len > w.pending.len) return too_long(path, options, diag);
     @memcpy(w.pending[prefix_len..][0..path.len], path);
     w.pending_len = @intCast(prefix_len + path.len);
     // Each step takes at least one byte of `pending`, except one that meets a link, which starts
@@ -158,6 +163,8 @@ fn walk_step(w: *Walk, path: []const u8, options: Options, diag: *Diag) Error!vo
     assert(rest.len > 0);
     const end = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
     const name = rest[0..end];
+    // A separator after the name: what it names must be a directory (or a link to one).
+    const separated = end < rest.len;
     w.pending_start += @intCast(@min(end + 1, rest.len));
     assert(w.pending_start <= w.pending_len);
     if (name.len == 0 or std.mem.eql(u8, name, ".")) return;
@@ -168,10 +175,10 @@ fn walk_step(w: *Walk, path: []const u8, options: Options, diag: *Diag) Error!vo
         return;
     }
     // Whoever may write the directory that holds this component could swap it.
-    try check_directory(w.real(), path, options, diag);
+    const holder = try check_directory(w.real(), path, options, diag);
     const parent_len = w.resolved_len;
     const separator: usize = if (parent_len == 1) 0 else 1;
-    if (parent_len + separator + name.len >= path_max) return unresolved(path, options, diag);
+    if (parent_len + separator + name.len >= path_max) return too_long(path, options, diag);
     w.resolved[parent_len] = '/';
     @memcpy(w.resolved[parent_len + separator ..][0..name.len], name);
     w.resolved_len = @intCast(parent_len + separator + name.len);
@@ -179,15 +186,57 @@ fn walk_step(w: *Walk, path: []const u8, options: Options, diag: *Diag) Error!vo
     const candidate = terminated(&buffer, w.real());
     const owner = owner_stat(linux.AT.FDCWD, candidate, linux.AT.SYMLINK_NOFOLLOW) orelse
         return bad(diag, options, "can't read the trust policy {s}", .{path}, options.fix);
-    if (owner.mode & linux.S.IFMT != linux.S.IFLNK) return;
-    w.resolved_len = parent_len;
-    try walk_link(w, candidate, path, options, diag);
+    try check_entry(holder, owner, candidate, path, options, diag);
+    const kind = owner.mode & linux.S.IFMT;
+    if (kind == linux.S.IFLNK) {
+        w.resolved_len = parent_len;
+        return walk_link(w, candidate, separated, path, options, diag);
+    }
+    // The kernel refuses a file followed by a separator (ENOTDIR), so `trust.zon/` and
+    // `trust.zon/../trust.zon` are refused here too, not read by a textual `..`.
+    if (separated and kind != linux.S.IFDIR) {
+        return bad(diag, options, "the trust policy {s} goes on past {s}, which is not a " ++
+            "directory", .{ path, candidate }, options.fix);
+    }
+}
+
+/// In a directory others may write (the sticky exception), whoever made an entry owns it and may
+/// point it anywhere, so every entry the walk passes there, a link included, must be owned by
+/// root or the process's own user: the rule of `fs.protected_symlinks`, which the walk's
+/// `readlinkat` is not subject to (PR #10's re-review).
+fn check_entry(
+    holder: Owner,
+    entry: Owner,
+    name: []const u8,
+    path: []const u8,
+    options: Options,
+    diag: *Diag,
+) Error!void {
+    if (holder.mode & 0o022 == 0) return;
+    assert(holder.mode & linux.S.ISVTX != 0);
+    const euid = linux.geteuid();
+    if (entry.uid == 0 or entry.uid == euid) return;
+    const what = switch (entry.mode & linux.S.IFMT) {
+        linux.S.IFLNK => "a symbolic link",
+        linux.S.IFDIR => "a directory",
+        else => "a file",
+    };
+    // The policy's own path is named once when it is the entry, so the line stays short.
+    if (std.mem.eql(u8, name, path)) {
+        return bad(diag, options, "the trust policy {s} is {s} owned by uid {d}, in a " ++
+            "directory others may write (mode {o:0>4})", .{
+            path, what, entry.uid, holder.mode & 0o7777,
+        }, directory_fix);
+    }
+    return bad(diag, options, "the trust policy {s} goes through {s}, {s} owned by uid {d}, " ++
+        "in a directory others may write", .{ path, name, what, entry.uid }, directory_fix);
 }
 
 /// Puts the target of the symbolic link `link` in front of the components still to walk.
 fn walk_link(
     w: *Walk,
     link: [:0]const u8,
+    separated: bool,
     path: []const u8,
     options: Options,
     diag: *Diag,
@@ -199,16 +248,22 @@ fn walk_link(
     }
     var target: [path_max]u8 = undefined;
     const result = linux.readlinkat(linux.AT.FDCWD, link, &target, target.len);
-    if (linux.errno(result) != .SUCCESS) return unresolved(path, options, diag);
+    if (linux.errno(result) != .SUCCESS or result == 0) {
+        return bad(diag, options, "can't read the symbolic link {s} on the way to the trust " ++
+            "policy {s}", .{ link, path }, options.fix);
+    }
     const length: usize = result;
-    if (length == 0 or length == target.len) return unresolved(path, options, diag);
+    if (length == target.len) return too_long(path, options, diag);
+    // The separator that followed the link, if one did, follows its target.
     const rest = w.pending[w.pending_start..w.pending_len];
-    const total = length + 1 + rest.len;
-    if (total > path_max) return unresolved(path, options, diag);
+    if (!separated) assert(rest.len == 0);
+    const separator: usize = @intFromBool(separated);
+    const total = length + separator + rest.len;
+    if (total > path_max) return too_long(path, options, diag);
     var next: [path_max]u8 = undefined;
     @memcpy(next[0..length], target[0..length]);
-    next[length] = '/';
-    @memcpy(next[length + 1 ..][0..rest.len], rest);
+    if (separated) next[length] = '/';
+    @memcpy(next[length + separator ..][0..rest.len], rest);
     @memcpy(w.pending[0..total], next[0..total]);
     w.pending_start = 0;
     w.pending_len = @intCast(total);
@@ -221,7 +276,7 @@ fn check_directory(
     path: []const u8,
     options: Options,
     diag: *Diag,
-) Error!void {
+) Error!Owner {
     assert(directory.len > 0);
     assert(directory[0] == '/');
     var buffer: [path_max:0]u8 = undefined;
@@ -229,7 +284,7 @@ fn check_directory(
         linux.AT.SYMLINK_NOFOLLOW) orelse
         return bad(diag, options, "can't read the owner of {s}, the directory of the " ++
             "trust policy {s}", .{ directory, path }, options.fix);
-    const problem = directory_problem(owner, linux.geteuid()) orelse return;
+    const problem = directory_problem(owner, linux.geteuid()) orelse return owner;
     return bad(diag, options, "the trust policy {s} is in {s}, which {s}{s} " ++
         "(owner uid {d}, mode {o:0>4})", .{
         path,
@@ -251,14 +306,17 @@ fn check_same(
     diag: *Diag,
 ) Error!void {
     var buffer: [path_max]u8 = undefined;
-    const length = file.realPath(io, &buffer) catch return unresolved(path, options, diag);
+    const length = file.realPath(io, &buffer) catch return bad(diag, options, "can't confirm " ++
+        "which file was opened as the trust policy {s} (is /proc mounted?)", .{path}, //
+        "mount /proc where the process runs");
     if (std.mem.eql(u8, buffer[0..length], real)) return;
     return bad(diag, options, "the trust policy {s} changed while it was read: {s} was " ++
         "judged, {s} was opened", .{ path, real, buffer[0..length] }, options.fix);
 }
 
-fn unresolved(path: []const u8, options: Options, diag: *Diag) Error {
-    return bad(diag, options, "can't resolve the trust policy {s}", .{path}, options.fix);
+fn too_long(path: []const u8, options: Options, diag: *Diag) Error {
+    return bad(diag, options, "the trust policy {s} is longer than Linux's path limit once " ++
+        "made absolute and its links followed", .{path}, options.fix);
 }
 
 /// `text` with a terminating zero, in `buffer`.
@@ -518,6 +576,94 @@ test "a symbolic link to a policy is judged in its own directory and along its t
             try testing.expect(std.mem.indexOf(u8, cause, case[1]) != null);
         }
         try chmod_directory(case[0], 0o755);
+    }
+}
+
+test "in a directory others may write, every entry the walk passes must be root's or its own" {
+    // Goal: PR #10's re-review (MUST): in a sticky directory others may write, whoever made a
+    // link owns it and may repoint it, so a link owned by another uid there must be refused,
+    // as `fs.protected_symlinks` would, though its target is good. Method: a good policy in
+    // `good` (0755); a link to it in `shared` (1777), read while owned by the process's own
+    // user; then, as root only, the link and a copy of the policy chowned to uid 65534, each
+    // refused with a cause naming it and its owner.
+    const io = testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const base = try test_directory(arena);
+    defer std.Io.Dir.cwd().deleteTree(io, base) catch {}; // Best effort: it is in /tmp.
+    const good = try test_subdirectory(arena, base, "good");
+    const target = try arena.dupeSentinel(u8, try write_test_policy(arena, good), 0);
+    const shared = try test_subdirectory(arena, base, "shared");
+    try chmod_directory(shared, 0o1777);
+    const link = try std.fmt.allocPrintSentinel(arena, "{s}/trust.zon", .{shared}, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.symlink(target, link)));
+    var diag: Diag = undefined;
+    diag.reset();
+    _ = try read(arena, io, link, test_options, &diag);
+    if (linux.geteuid() != 0) return error.SkipZigTest;
+    const nobody: u32 = 65534;
+    const chowned = linux.fchownat(linux.AT.FDCWD, link, nobody, nobody, linux.AT.SYMLINK_NOFOLLOW);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(chowned));
+    diag.reset();
+    try testing.expectError(error.BadConfig, read(arena, io, link, test_options, &diag));
+    try testing.expectEqual(@as(?codes.Code, .E0505), diag.code);
+    const expected = "is a symbolic link owned by uid 65534, in a directory others may write " ++
+        "(mode 1777)";
+    try testing.expect(std.mem.indexOf(u8, diag.causes.slice()[0].slice(), expected) != null);
+    // Through the link, it is named as the entry the walk passed.
+    const through = try std.fmt.allocPrint(arena, "{s}/./trust.zon", .{shared});
+    diag.reset();
+    try testing.expectError(error.BadConfig, read(arena, io, through, test_options, &diag));
+    const through_cause = diag.causes.slice()[0].slice();
+    const named = try std.fmt.allocPrint(arena, "goes through {s}, a symbolic", .{link});
+    try testing.expect(std.mem.indexOf(u8, through_cause, named) != null);
+    // A file planted there by another uid is refused the same way.
+    const planted = try write_test_policy(arena, try test_subdirectory(arena, shared, "own"));
+    const file = try std.fmt.allocPrintSentinel(arena, "{s}/file.zon", .{shared}, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.rename(
+        try arena.dupeSentinel(u8, planted, 0),
+        file,
+    )));
+    const file_chowned = linux.fchownat(linux.AT.FDCWD, file, nobody, nobody, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(file_chowned));
+    diag.reset();
+    try testing.expectError(error.BadConfig, read(arena, io, file, test_options, &diag));
+    const file_cause = diag.causes.slice()[0].slice();
+    try testing.expect(std.mem.indexOf(u8, file_cause, "is a file owned by uid 65534,") != null);
+}
+
+test "a path that goes on past a file is refused, as the kernel refuses it" {
+    // Goal: PR #10's re-review (NIT): `trust.zon/` and `trust.zon/../trust.zon` were read,
+    // their `..` and separator taken textually, though open(2) refuses both with ENOTDIR.
+    // Method: the good path read; each of those, directly and through a link, refused.
+    const io = testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const base = try test_directory(arena);
+    defer std.Io.Dir.cwd().deleteTree(io, base) catch {}; // Best effort: it is in /tmp.
+    const good = try test_subdirectory(arena, base, "good");
+    const path = try write_test_policy(arena, good);
+    const link = try std.fmt.allocPrintSentinel(arena, "{s}/link.zon", .{good}, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.symlink("trust.zon", link)));
+    var diag: Diag = undefined;
+    diag.reset();
+    _ = try read(arena, io, path, test_options, &diag);
+    diag.reset();
+    _ = try read(arena, io, link, test_options, &diag);
+    const refused = [_][]const u8{
+        try std.fmt.allocPrint(arena, "{s}/", .{path}),
+        try std.fmt.allocPrint(arena, "{s}/../trust.zon", .{path}),
+        try std.fmt.allocPrint(arena, "{s}/.", .{path}),
+        try std.fmt.allocPrint(arena, "{s}/", .{link}),
+        try std.fmt.allocPrint(arena, "{s}/../trust.zon", .{link}),
+    };
+    for (refused) |bad_path| {
+        diag.reset();
+        try testing.expectError(error.BadConfig, read(arena, io, bad_path, test_options, &diag));
+        const cause = diag.causes.slice()[0].slice();
+        try testing.expect(std.mem.indexOf(u8, cause, "which is not a directory") != null);
     }
 }
 
