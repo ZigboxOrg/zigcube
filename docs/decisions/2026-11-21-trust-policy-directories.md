@@ -28,6 +28,22 @@ policy others can replace gates no more than one they can rewrite.
   `readlinkat`, which that rule does not cover, so a link uid 65534 planted in `/tmp` was
   followed). It is stricter than the kernel, which also accepts a link the directory's owner
   owns. The cause names the entry, what it is and its owner.
+- In such a directory an entry must also live on the directory's own mount: one that is a mount
+  root (`STATX_ATTR_MOUNT_ROOT`), or whose mount id (`stx_mnt_id`) differs from the directory's,
+  is refused (PR #10's third review: a user may mount a FUSE filesystem over a name they made,
+  and its root reports any owner and mode its daemon chooses, root's 0644 included). Where the
+  kernel reports no mount id (before Linux 5.8), the device (`stx_dev`) is compared instead. The
+  mount id decides when there is one, not the device: an overlay with layers on several
+  filesystems, or a btrfs subvolume, can report another device for an entry on the directory's
+  own mount, and refusing those would refuse a good policy in a container's `/tmp`. A directory
+  only root or the process's own user can write may hold mount points as before (`/etc` on its
+  own filesystem, say): whoever could mount there could rewrite the policy anyway.
+  The flag is read as the kernel's bit 0x2000, not through the pinned std's `STATX_ATTR`,
+  whose packed struct puts `MOUNT_ROOT` (and its other flags) at the wrong bits.
+- A cause says why before it names a path, and names the policy's path last: a cause is cut at
+  `diag_field_bytes_max` (200 bytes), and with the paths first an ordinary path cut the reason
+  away (the same review). A lookup that fails says which name and why (`statx` ENOENT is "no
+  such file or directory", EACCES "permission denied searching a directory above it").
 - A component followed by a separator must be a directory (or a link to one), as `open(2)`
   requires (ENOTDIR): `trust.zon/` and `trust.zon/../trust.zon` are refused, not resolved
   textually. A path that cannot be resolved says why: the working directory unreadable, a link
