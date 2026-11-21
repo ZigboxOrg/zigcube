@@ -244,6 +244,68 @@ const Fixture = struct {
         return count;
     }
 
+    /// Reports the last replica of `generation` (the highest number) as `status` and `health`.
+    fn report_last(
+        self: *Fixture,
+        generation: u64,
+        status: records.ObservedStatus,
+        health: records.HealthState,
+    ) !void {
+        var last: ?controller.Entry(records.Replica) = null;
+        for (try self.replicas()) |replica| {
+            if (replica.rec.generation == generation) last = replica;
+        }
+        const id = try testing.allocator.dupe(u8, last.?.rec.id);
+        defer testing.allocator.free(id);
+        const failures: u32 = @intFromBool(health == .unhealthy);
+        const observed: records.Observed = .{
+            .replica = id,
+            .node = "node1",
+            .generation = generation,
+            .status = status,
+            .reported_at_ms = self.manual.ms,
+            .health = health,
+            .health_failures = failures,
+            .last_probe_exit = @intCast(failures),
+        };
+        try self.put(.{ .agent = "node1" }, records.observed_key("node1", id).slice(), observed);
+    }
+
+    /// The PR #6 review's reproduction: rolls a checked `web` (3 replicas) to generation 2 and
+    /// steps 125 s into the rollout, its first two new replicas ready (100 s apart) and the
+    /// third placed and not reported.
+    fn long_rollout(self: *Fixture) !void {
+        var checked = web;
+        checked.health = checked_health;
+        try self.apply(checked);
+        try self.settle();
+        try testing.expectEqual(@as(u32, 3), try self.report_health(1, .running, .healthy));
+        try self.settle();
+        self.manual.advance(min_ready_ms);
+        try self.settle();
+        checked.image = "b3:9d20c4f1";
+        checked.request_id = "r-0002b15";
+        try self.apply(checked);
+        try self.settle();
+        const started = self.manual.ms;
+        _ = try self.report_health(2, .running, .healthy);
+        try self.settle();
+        self.manual.advance(min_ready_ms);
+        try self.settle();
+        self.manual.advance(100_000);
+        try self.settle();
+        _ = try self.report_health(2, .running, .healthy);
+        try self.settle();
+        self.manual.advance(min_ready_ms);
+        try self.settle();
+        self.manual.advance(started + 125_000 - self.manual.ms);
+        try self.settle();
+        const reached = try self.rollout();
+        try testing.expectEqual(records.RolloutPhase.progressing, reached.phase);
+        try testing.expectEqual(@as(u32, 2), reached.ready_new);
+        try testing.expectEqual(@as(u32, 3), try self.count_of(2));
+    }
+
     fn count_of(self: *Fixture, generation: u64) !u32 {
         var found: u32 = 0;
         for (try self.replicas()) |replica| {
@@ -734,6 +796,56 @@ test "a new replica unknown after healthy is not ready to the rollout controller
     try testing.expectEqual(@as(u32, 0), rollout.ready_new);
     try testing.expect(rollout.phase != .complete);
     try testing.expectEqual(@as(u32, 1), try fixture.count_of(1));
+}
+
+test "a ready new replica's one unknown report does not fail a long rollout" {
+    // Goal: PR #6 review MUST. The ready timeout of a new replica that was ready runs from when
+    // it stopped being ready, not from its placement: a rollout older than `ready_timeout_ms`
+    // whose ready new replicas report `unknown` once (an agent restart, or a step whose replica
+    // read failed) must not fail with ZC-E0304 and roll back. Method: the reviewer's
+    // reproduction (`long_rollout`), then `healthy` again until the rollout completes.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.long_rollout();
+    _ = try fixture.report_health(2, .running, .unknown);
+    try fixture.settle();
+    try testing.expectEqual(records.RolloutPhase.progressing, (try fixture.rollout()).phase);
+    try testing.expectEqual(@as(u64, 2), (try fixture.service()).generation);
+    for (0..20) |_| {
+        _ = try fixture.report_health(2, .running, .healthy);
+        try fixture.settle();
+        fixture.manual.advance(min_ready_ms);
+        try fixture.settle();
+    }
+    try testing.expectEqual(records.RolloutPhase.complete, (try fixture.rollout()).phase);
+    try testing.expectEqual(@as(u64, 2), (try fixture.service()).generation);
+}
+
+test "a ready new replica that stays not ready for ready_timeout_ms fails the rollout" {
+    // Goal: the other side of the MUST's fix. The timeout still bounds a new replica that was
+    // ready and then is not: the rollout fails `ready_timeout_ms` after the controller first saw
+    // it not ready, and not before. Method: `long_rollout`; the two ready new replicas report
+    // `unknown` and stay so, while the third becomes ready, so only they can time out.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    const ready_timeout_ms = (records.RolloutPolicy{}).ready_timeout_ms;
+    try fixture.long_rollout();
+    const unready_at = fixture.manual.ms;
+    _ = try fixture.report_health(2, .running, .unknown);
+    try fixture.settle();
+    try fixture.report_last(2, .running, .healthy);
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 1), (try fixture.rollout()).ready_new);
+    fixture.manual.advance(unready_at + ready_timeout_ms - 1_000 - fixture.manual.ms);
+    try fixture.settle();
+    try testing.expectEqual(@as(u64, 2), (try fixture.service()).generation);
+    fixture.manual.advance(2_000);
+    try fixture.settle();
+    try testing.expectEqual(@as(u64, 3), (try fixture.service()).generation);
 }
 
 test "an old replica unknown after an agent restart counts toward the replica floor" {

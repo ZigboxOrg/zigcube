@@ -18,7 +18,9 @@
 //!     (`Track.unknown_after_healthy`, docs/decisions/2026-11-15-c3-rollout-health-gate.md);
 //!   - a new replica that is held (`hold_failed_replica`), that dies more than
 //!     `constants.rollout_restarts_max` times in all, or that is placed and not ready within
-//!     `ready_timeout_ms` fails the rollout (ZC-E0304), as `rollout_plan` decides.
+//!     `ready_timeout_ms` fails the rollout (ZC-E0304), as `rollout_plan` decides; for a new
+//!     replica already seen ready, the timeout runs from when it was first seen not ready again
+//!     (`Track.unready_since_ms`), not from its placement.
 //!
 //! What it remembers between passes is in memory and starts empty: a restarted server judges
 //! readiness and deaths from what it sees after the restart, which can only delay a rollout.
@@ -70,8 +72,17 @@ const Track = struct {
     id_len: u8 = 0,
     /// The pass that first saw the replica record.
     first_pass: u64 = 0,
-    /// Since when the replica has had an assignment (the ready timeout runs from placement).
+    /// Since when the replica has had an assignment (the ready timeout of a replica not yet
+    /// seen ready runs from placement).
     assigned_since_ms: ?u64 = null,
+    /// The controller has seen this replica ready as a new replica (`Run.view`).
+    ready_seen: bool = false,
+    /// When the controller first saw a new replica not ready again after `ready_seen`: its ready
+    /// timeout runs from here, not from placement (PR #6 review), so one `unknown` report of a
+    /// ready replica in a rollout older than `ready_timeout_ms` does not fail it. Cleared while
+    /// it is ready. In memory: a restarted server starts the replica at `assigned_since_ms`,
+    /// which is the restart's pass, so a restart can only delay the timeout.
+    unready_since_ms: ?u64 = null,
     /// Since when the controller has seen it running (C3 slice 10: and healthy).
     running_since_ms: ?u64 = null,
     /// The replica has a health check, its last admissible report before this one said
@@ -414,6 +425,7 @@ const Run = struct {
             if (fresh) {
                 result.mix.new_live += 1;
                 if (ready) result.mix.new_ready += 1;
+                if (ready) note_ready(track);
                 if (!ready) run.note_unready(&result, track);
             } else {
                 result.mix.old_live += 1;
@@ -431,13 +443,27 @@ const Run = struct {
         return result;
     }
 
+    fn note_ready(track: ?*Track) void {
+        const found = track orelse return;
+        found.ready_seen = true;
+        found.unready_since_ms = null;
+    }
+
+    /// Notes a new replica that is not ready: its ready timeout runs from its placement until
+    /// the controller has seen it ready, and after that from when it first saw it not ready.
     fn note_unready(run: *Run, result: *View, track: ?*Track) void {
         const found = track orelse return;
-        if (found.assigned_since_ms) |since| {
-            result.unready_since_ms = earlier(result.unready_since_ms, since);
-        } else if (found.first_pass < run.rc.passes) {
-            result.unplaceable = true;
+        const placed_at = found.assigned_since_ms orelse {
+            if (found.first_pass < run.rc.passes) result.unplaceable = true;
+            return;
+        };
+        var since = placed_at;
+        if (found.ready_seen) {
+            if (found.unready_since_ms == null) found.unready_since_ms = run.now;
+            since = @max(placed_at, found.unready_since_ms.?);
         }
+        assert(since <= run.now);
+        result.unready_since_ms = earlier(result.unready_since_ms, since);
     }
 
     /// Counts deaths of the service's new replicas since `from_ms` against the restart bound;

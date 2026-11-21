@@ -33,6 +33,11 @@ says nothing about `unknown` after `healthy`.
   `min_ready_ms`, though nobody saw the replica healthy then (PR #261 re-review, NIT; kept as the
   supervisor's rule).
 - A new replica's `unknown` that follows anything but `healthy` (not yet probed) is not ready.
+- The ready timeout (ZC-E0304) of a new replica runs from its placement only until the controller
+  has seen it ready; after that it runs from when the controller first saw it not ready again
+  (`Track.unready_since_ms`), so one `unknown` report of a ready replica in a rollout older than
+  `ready_timeout_ms` delays the rollout and does not fail it (PR #6 review, MUST). The time is in
+  memory: a restarted server starts it at its first pass, which can only delay the failure.
 
 ## Consequences
 
