@@ -1388,3 +1388,104 @@ fn expect_key_file_refused(
     try testing.expect(std.mem.indexOf(u8, text, why) != null);
     try redaction.expect_absent(text, key, "ZC-E0806");
 }
+
+test "the server's stderr holds neither a sealing key nor a sealed plaintext" {
+    // Goal: review of PR #8 (SHOULD): the redaction test covered replies and diagnostics, not
+    // logs. Method: fd 2 goes to a file while a verbose, logging server seals a record, a
+    // `--discard-sealed` start warns (ZC-W0808) and a plain start serves the record; the file
+    // must hold the warning and every request line (the capture works), and neither key nor
+    // the plaintext in any form the harness knows.
+    const seal = @import("seal.zig");
+    const redaction = @import("testing/redaction.zig");
+    const Op = @import("store.zig").Op;
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var path_buffer: [128]u8 = undefined;
+    const path = try tmp_file(&path_buffer, tmp, "data.db");
+    const plain = "-----planted P-256 key for the stderr redaction test, never logged-----";
+    var capture: StderrCapture = undefined;
+    try capture.start(io, tmp);
+    defer capture.stop(io);
+
+    var config = config_for(.{ .sqlite = path }, true);
+    config.quiet = false;
+    config.verbose = true;
+    var keys: [2]@import("seal.zig").Key = undefined;
+    defer for (&keys) |*key| key.wipe();
+    for (&keys, 0..) |*key, round| {
+        config.discard_sealed = round == 1;
+        const server = try start_logging(io, config);
+        defer server.stop();
+        key.* = server.seal_key;
+        var key_name_buffer: [64]u8 = undefined;
+        // Round 0 seals a record; round 1 starts without its key, so the discard has work.
+        const nonce: [seal.nonce_bytes]u8 = @splat(@intCast(round + 1));
+        var envelope_buffer: [seal.envelope_bytes_max]u8 = undefined;
+        const envelope = seal.seal(key, "/edge-certs/a.example", plain, nonce, &envelope_buffer);
+        var value_buffer: [seal.envelope_bytes_max + 32]u8 = undefined;
+        const format = "{{\"v\":1,\"key\":\"{s}\"}}";
+        const value = try std.fmt.bufPrint(&value_buffer, format, .{envelope});
+        var diag: Diag = undefined;
+        diag.reset();
+        const put = [_]Op{.{ .put = .{ .key = "/edge-certs/a.example", .value = value } }};
+        _ = try server.verified.interface().txn(.{ .on_success = &put }, &diag);
+        const paths = [_][]const u8{
+            "/v1/list?prefix=%2F",
+            "/v1/watch?from=1&timeout=0",
+            "/v1/status",
+        };
+        for (paths) |api_path| {
+            const reply = try get(io, server.address(), api_path);
+            reply.free();
+        }
+        if (round == 0) try tmp.dir.deleteFile(io, try seal_key_file(io, tmp, &key_name_buffer));
+        config.create_store = false;
+    }
+    const logged = try capture.read(io, tmp);
+    defer testing.allocator.free(logged);
+    try testing.expect(std.mem.indexOf(u8, logged, "ZC-W0808") != null);
+    try testing.expect(std.mem.indexOf(u8, logged, "/v1/watch") != null);
+    for (&keys) |*key| try redaction.expect_absent(logged, &key.bytes, "the server's stderr");
+    try redaction.expect_absent(logged, plain, "the server's stderr");
+}
+
+/// `start_server` with request logging on.
+fn start_logging(io: std.Io, config: config_mod.Config) !*server_mod.Server {
+    try private_dir.state_dir(io, config);
+    var diag: Diag = undefined;
+    diag.reset();
+    return server_mod.Server.start(testing.allocator, io, config, .{
+        .version = "0.0.0-test",
+        .report_failures = true,
+        .log_requests = true,
+    }, &diag);
+}
+
+/// File descriptor 2 sent to `stderr.log` in a test directory, and put back.
+const StderrCapture = struct {
+    saved: std.os.linux.fd_t,
+    file: std.Io.File,
+
+    fn start(capture: *StderrCapture, io: std.Io, tmp: testing.TmpDir) !void {
+        const linux = std.os.linux;
+        capture.file = try tmp.dir.createFile(io, "stderr.log", .{ .read = true });
+        const saved = linux.dup(2);
+        if (linux.errno(saved) != .SUCCESS) return error.Dup;
+        capture.saved = @intCast(saved);
+        if (linux.errno(linux.dup3(capture.file.handle, 2, 0)) != .SUCCESS) return error.Dup;
+    }
+
+    fn stop(capture: *StderrCapture, io: std.Io) void {
+        const linux = std.os.linux;
+        _ = linux.dup3(capture.saved, 2, 0);
+        _ = linux.close(capture.saved);
+        capture.file.close(io);
+    }
+
+    fn read(_: *StderrCapture, io: std.Io, tmp: testing.TmpDir) ![]u8 {
+        return tmp.dir.readFileAlloc(io, "stderr.log", testing.allocator, .limited(1 << 20));
+    }
+};
