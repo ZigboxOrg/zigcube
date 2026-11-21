@@ -342,6 +342,98 @@ const Fixture = struct {
         return @intCast(list.items.len);
     }
 
+    /// What R2 counts for `web` (`sim_c3.surge_problem`): every replica not reported stopped
+    /// (one with no report yet too), and every report not stopped whose replica record is gone
+    /// (its container still stopping). No node is lost in the tests that use it.
+    fn surge_live(self: *Fixture) !u32 {
+        var live: u32 = 0;
+        for (try self.replicas()) |replica| {
+            const status = try self.status_of(replica.rec.id) orelse {
+                live += 1;
+                continue;
+            };
+            if (status != .stopped) live += 1;
+        }
+        const ctx = self.context();
+        for ([_][]const u8{ "node1", "node2" }) |node| {
+            const prefix = records.observed_prefix(node);
+            const query: store.ListOptions = .{ .prefix = prefix.slice(), .limit = 100 };
+            const page = try ctx.store.list(ctx.arena, query, &self.diag);
+            for (page.kvs) |kv| {
+                const observed = try records.read(records.Observed, ctx.arena, kv, &self.diag);
+                if (observed.status == .stopped) continue;
+                const key = records.replica_key(web.name, observed.replica);
+                const got = try ctx.store.get(ctx.arena, key.slice(), null, &self.diag);
+                if (got.kv == null) live += 1;
+            }
+        }
+        return live;
+    }
+
+    /// The status `id` is reported with, on either node, or null with no report.
+    fn status_of(self: *Fixture, id: []const u8) !?records.ObservedStatus {
+        for ([_][]const u8{ "node1", "node2" }) |node| {
+            const ctx = self.context();
+            const key = records.observed_key(node, id);
+            const got = try ctx.store.get(ctx.arena, key.slice(), null, &self.diag);
+            const kv = got.kv orelse continue;
+            const observed = try records.read(records.Observed, ctx.arena, kv, &self.diag);
+            return observed.status;
+        }
+        return null;
+    }
+
+    /// Reports node1's running replicas again in its current tenure, as its agent does once it
+    /// has registered again: the node controller removes reports of earlier tenures, so these
+    /// stay, each until its container stops (`reap`), after its replica's removal too.
+    fn report_in_tenure(self: *Fixture) !void {
+        const ctx = self.context();
+        const node_key = records.node_key("node1");
+        const node = try ctx.store.get(ctx.arena, node_key.slice(), null, &self.diag);
+        const tenure = node.kv.?.mod_revision;
+        const prefix = records.observed_prefix("node1");
+        const query: store.ListOptions = .{ .prefix = prefix.slice(), .limit = 100 };
+        const page = try ctx.store.list(ctx.arena, query, &self.diag);
+        for (page.kvs) |kv| {
+            var observed = try records.read(records.Observed, ctx.arena, kv, &self.diag);
+            if (observed.status == .stopped) continue;
+            observed.tenure = tenure;
+            const bytes = try records.encode(ctx.arena, observed, &self.diag);
+            const op: store.Op = .{ .put = .{ .key = kv.key, .value = bytes } };
+            const role: writers.Role = .{ .agent = "node1" };
+            const done = try writers.txn(ctx.store, role, .{ .on_success = &.{op} }, &self.diag);
+            try testing.expect(done.succeeded);
+        }
+    }
+
+    /// Reports one replica placed on `node` stopped (its container exited); returns its
+    /// generation.
+    fn stop_one_on(self: *Fixture, node: []const u8) !u64 {
+        var id_buffer: [64]u8 = undefined;
+        var id: []const u8 = "";
+        var generation: u64 = 0;
+        for (try self.replicas()) |replica| {
+            const ctx = self.context();
+            const key = records.assigned_key(node, replica.rec.id);
+            const got = try ctx.store.get(ctx.arena, key.slice(), null, &self.diag);
+            if (got.kv == null) continue;
+            @memcpy(id_buffer[0..replica.rec.id.len], replica.rec.id);
+            id = id_buffer[0..replica.rec.id.len];
+            generation = replica.rec.generation;
+            break;
+        }
+        try testing.expect(id.len > 0);
+        const observed: records.Observed = .{
+            .replica = id,
+            .node = node,
+            .generation = generation,
+            .status = .stopped,
+            .reported_at_ms = self.manual.ms,
+        };
+        try self.put(.{ .agent = node }, records.observed_key(node, id).slice(), observed);
+        return generation;
+    }
+
     fn rollout(self: *Fixture) !records.Rollout {
         const ctx = self.context();
         const key = records.rollout_key(web.name);
@@ -1127,8 +1219,11 @@ test "an old replica of a paused rollout on a node registered exclusive is moved
     // service replica (B6 P1; CI seed 44892876942, a failed rollout's stale replica kept on a
     // node an operator reinstalled exclusive), and each one moved is replaced at its own
     // generation, so the service keeps its count while paused (PR #6 review: two refused in one
-    // pass were removed and none replaced). Method: two nodes, pause after the first new
-    // replica starts, register node1 again as exclusive, and count what each generation has.
+    // pass were removed and none replaced). The rollout is paused at its surge, so the refused
+    // replicas' running containers fill the surge bound (R2): the first is removed alone, and
+    // the next is replaced once the first has stopped; the service ends at its count, not at
+    // its surge. Method: two nodes, pause after the first new replica starts, register node1
+    // again as exclusive, and count what each generation has.
     var fixture: Fixture = undefined;
     try fixture.start();
     defer fixture.stop();
@@ -1142,12 +1237,13 @@ test "an old replica of a paused rollout on a node registered exclusive is moved
     try fixture.put(.{ .agent = "node1" }, records.node_key("node1").slice(), exclusive_node1);
     try fixture.settle();
     try testing.expectEqual(@as(u32, 0), try fixture.held_by("node1"));
-    try testing.expectEqual(old_before + new_before, try fixture.held_by("node2"));
-    // Each removal replaced at its own generation, and nothing of the new one started (R4).
-    try testing.expectEqual(old_before, try fixture.count_of(1));
+    // Back at its count, and nothing of the new generation started (R4).
+    try testing.expectEqual(old_before + new_before, web.replicas + 1);
+    try testing.expectEqual(web.replicas, try fixture.held_by("node2"));
     try testing.expectEqual(new_before, try fixture.count_of(2));
+    try testing.expectEqual(web.replicas - new_before, try fixture.count_of(1));
     const total: u32 = @intCast((try fixture.replicas()).len);
-    try testing.expectEqual(old_before + new_before, total);
+    try testing.expectEqual(web.replicas, total);
     try testing.expectEqual(records.RolloutPhase.paused, (try fixture.rollout()).phase);
     // The review's case: more than one replica was moved off node1 in the same pass.
     try testing.expect(on_node1 >= 2);
@@ -1156,8 +1252,9 @@ test "an old replica of a paused rollout on a node registered exclusive is moved
 test "every old replica of a paused rollout moved off one node is replaced, one per pass" {
     // Goal: the halted repair rule with more forced removals than a batch holds: a paused
     // service whose every replica sits on a node registered exclusive comes back to its count at
-    // the same generations. Method: one node during the rollout, pause, add node2, then
-    // register node1 exclusive, so all four replicas are refused in the same pass.
+    // the same generations, less the surge its refused containers fill (R2, see the test
+    // above). Method: one node during the rollout, pause, add node2, then register node1
+    // exclusive, so all four replicas are refused in the same pass.
     var fixture: Fixture = undefined;
     try fixture.start();
     defer fixture.stop();
@@ -1171,9 +1268,49 @@ test "every old replica of a paused rollout moved off one node is replaced, one 
     try fixture.put(.{ .agent = "node1" }, records.node_key("node1").slice(), exclusive_node1);
     try fixture.settle();
     try testing.expectEqual(@as(u32, 0), try fixture.held_by("node1"));
-    try testing.expectEqual(old_before, try fixture.count_of(1));
+    try testing.expectEqual(old_before + new_before, web.replicas + 1);
+    try testing.expectEqual(web.replicas - new_before, try fixture.count_of(1));
     try testing.expectEqual(new_before, try fixture.count_of(2));
-    try testing.expectEqual(old_before + new_before, try fixture.held_by("node2"));
+    try testing.expectEqual(web.replicas, try fixture.held_by("node2"));
+    try testing.expectEqual(records.RolloutPhase.paused, (try fixture.rollout()).phase);
+}
+
+test "a refused replica still running holds its place in the surge bound (R2)" {
+    // Goal: the PR #6 re-review's R2 failure (seed 17 `--c3 --tenants`): a replica refused on a
+    // node registered exclusive is dead but its container runs until its removal is committed
+    // and its node stops it, so it counts toward `replicas + max_surge` and a dead replica's
+    // replacement waits for room. Method: a paused rollout at its surge, its replicas on both
+    // nodes; one replica on node2 stopped and node1 registered exclusive (its agent reports
+    // again in the new tenure); step the controller with the reports of removed replicas kept
+    // (their containers still stopping), checking R2's count after every pass; then let node1
+    // stop them.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.put(.{ .agent = "node2" }, records.node_key("node2").slice(), node2);
+    try fixture.roll();
+    try testing.expectEqual(records.RolloutPhase.paused, (try fixture.request(.pause)).done);
+    const surge_max = web.replicas + 1;
+    try testing.expectEqual(surge_max, try fixture.surge_live());
+    try testing.expect(try fixture.held_by("node1") > 0);
+    const new_before = try fixture.count_of(2);
+    _ = try fixture.stop_one_on("node2");
+    try fixture.put(.{ .agent = "node1" }, records.node_key("node1").slice(), exclusive_node1);
+    try fixture.report_in_tenure();
+    for (0..20) |_| {
+        const ctx = fixture.context();
+        _ = try fixture.plane.reconcile(&ctx);
+        try testing.expect(fixture.plane.mismatch == null);
+        try testing.expect(try fixture.surge_live() <= surge_max);
+        fixture.manual.advance(10);
+    }
+    try fixture.settle();
+    try testing.expect(try fixture.surge_live() <= surge_max);
+    try testing.expectEqual(@as(u32, 0), try fixture.held_by("node1"));
+    const total: u32 = @intCast((try fixture.replicas()).len);
+    try testing.expectEqual(web.replicas, total);
+    // Paused: nothing of the new generation beyond what it had (R4).
+    try testing.expect(try fixture.count_of(2) <= new_before);
     try testing.expectEqual(records.RolloutPhase.paused, (try fixture.rollout()).phase);
 }
 

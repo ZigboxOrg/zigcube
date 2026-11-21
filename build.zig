@@ -3159,6 +3159,12 @@ const c1_regressions = [_][]const []const u8{
         "44892876942", "150",       "0",        "--c1",
         "--strong",    "--tenants", "--health", "--profile=mixed",
     },
+    // R2 on C3's branch (3bb7952, PR #6 re-review): a replica refused on a node registered
+    // exclusive is dead, but its container runs until its removal commits and its node stops
+    // it; `roll_of` left it out of the surge count, so its replacement went past
+    // `replicas + max_surge`. A guard: it fails without the fix (`roll_of` in
+    // `replica_controller.zig`; docs/decisions/2026-11-21-c3-stale-replica-on-exclusive-node.md).
+    &.{ "17", "150", "0", "--c3", "--tenants", "--heal-at=108" },
 };
 
 /// `zig build sim-c1-regressions`: replays `c1_regressions` with the shipped code (ReleaseSafe).

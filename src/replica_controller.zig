@@ -210,6 +210,8 @@ const Roll = struct {
     live: u32 = 0,
     /// Replicas reported running on a ready node (R1's count).
     up: u32 = 0,
+    /// Containers of the service's removed replicas still stopping (`stopping_orphans`).
+    stopping: u32 = 0,
     /// Replicas that may be created before the surge bound: unbounded with no rollout.
     room: u32 = std.math.maxInt(u32),
     /// The rollout starts and retires replicas (progressing or rolling back), or there is none.
@@ -457,8 +459,10 @@ const Run = struct {
     /// the rollout's (`roll_out`). While a service has stale replicas or its rollout is halted
     /// (paused or failed), a replacement is repair, not rollout progress: each removal that the
     /// service's count needs back is replaced in the same transaction, one for one, so a
-    /// transaction removes only as many as it can also replace (`removals_max`) and no removal
-    /// leaves a replacement owed to a later pass that a halted rollout would not make. A replica
+    /// transaction removes only as many as it can also replace (`removals_max`). With no room
+    /// for a replacement (R2), a paused service removes only what its count does not need, or
+    /// waits (`paused_unreplaced_max`); a failed rollout's `scale_up` and an active rollout's
+    /// starts make up what it removes unreplaced. A replica
     /// of the service's generation is replaced whatever the rollout's phase but `failed` (R4)
     /// (`scale_up` restores that count), a stale one only
     /// while the rollout starts replicas or at its own generation, and neither past the surge
@@ -478,10 +482,15 @@ const Run = struct {
         // Halted (paused or failed), a replacement is repair: the stale replicas may all be
         // among the dead, so `stale` alone does not say a halted rollout would leave them owed.
         const paired = plan.stale > 0 or !roll.starts;
-        const removed_max = if (paired)
-            removals_max(@min(missing, roll.room))
+        const replaceable = @min(missing, roll.room);
+        const removed_max = if (!paired)
+            batch_replicas_max
+        else if (roll.paused and replaceable == 0 and missing > 0)
+            paused_unreplaced_max(plan, roll, wanted)
         else
-            batch_replicas_max;
+            removals_max(replaceable);
+        // A removal the paused service's count needs back waits for a stopping container.
+        if (removed_max == 0) return;
         var removed: [batch_replicas_max]*const Item = undefined;
         const removed_count = dead_to_remove(plan, removed[0..removed_max]);
         var creations = @min(batch_replicas_max - removed_count, missing);
@@ -527,26 +536,50 @@ const Run = struct {
     }
 
     /// The dead replicas one `replace` pass removes, into `removed` (its length is the pass's
-    /// limit), and how many: at most one per judged node.
+    /// limit), and how many: at most one per judged node. Those whose container may still run
+    /// (refused on a node registered exclusive) go first: each holds a place in the surge bound
+    /// (R2) until its removal is committed and its node stops it.
     fn dead_to_remove(plan: *const ServicePlan, removed: []*const Item) u32 {
         assert(removed.len > 0);
         assert(removed.len <= batch_replicas_max);
         var removed_count: u32 = 0;
         var lost_nodes: [judged_nodes_batch_max][]const u8 = undefined;
         var lost_nodes_count: u32 = 0;
-        for (plan.slice()) |*item| {
-            if (item.class != .dead) continue;
-            // A dead replica costs nothing to remove (it serves nothing), during a rollout too:
-            // what bounds the batch is the creations (`room`, R2) and the compares.
-            if (removed_count == removed.len) break;
-            if (judged_node(item)) |node| {
-                if (!note_node(lost_nodes[0..], &lost_nodes_count, node)) continue;
+        for ([_]bool{ true, false }) |live| {
+            for (plan.slice()) |*item| {
+                if (item.class != .dead or item.live != live) continue;
+                // A dead replica costs nothing to remove (it serves nothing), during a rollout
+                // too: what bounds the batch is the creations (`room`, R2) and the compares.
+                if (removed_count == removed.len) break;
+                if (judged_node(item)) |node| {
+                    if (!note_node(lost_nodes[0..], &lost_nodes_count, node)) continue;
+                }
+                removed[removed_count] = item;
+                removed_count += 1;
             }
-            removed[removed_count] = item;
-            removed_count += 1;
         }
         assert(removed_count > 0);
+        assert(removed_count <= removed.len);
         return removed_count;
+    }
+
+    /// How many dead replicas a paused service removes while the surge bound leaves no room to
+    /// replace one in the same transaction (R2: `room` is 0), so none is replaced: those its
+    /// count does not need back (`wanted` against the replicas it keeps, of either
+    /// generation), up to a batch. One the count needs waits while a removed replica's container
+    /// is stopping (that frees the room for a one-for-one replacement on a later pass); with
+    /// none stopping, waiting frees nothing (only with `max_surge` 0 can the dead replicas fill
+    /// the room alone), and one is removed unreplaced: P1 and R2 win over the paused count
+    /// (docs/decisions/2026-11-21-c3-stale-replica-on-exclusive-node.md).
+    fn paused_unreplaced_max(plan: *const ServicePlan, roll: *const Roll, wanted: u32) u32 {
+        assert(roll.paused);
+        assert(roll.room == 0);
+        assert(plan.dead > 0);
+        const owed = wanted -| (plan.live + plan.held + plan.stale);
+        const spare = plan.dead -| owed;
+        if (spare > 0) return @min(spare, batch_replicas_max);
+        if (roll.stopping > 0) return 0;
+        return 1;
     }
 
     /// The template of each replacement `replace` creates, in `templates` (one slot per
@@ -588,10 +621,15 @@ const Run = struct {
     /// the record does not decode.
     fn roll_of(run: *Run, service: *const ServiceEntry, plan: *const ServicePlan) Error!?Roll {
         var roll: Roll = .{ .policy = service.rec.rollout_policy() };
-        var live = rollout_controller.stopping_orphans(run.snap, service.rec.name);
+        roll.stopping = rollout_controller.stopping_orphans(run.snap, service.rec.name);
+        var live = roll.stopping;
         for (plan.slice()) |item| {
-            if (item.class == .dead or item.class == .held) continue;
+            // Every replica whose container may still run counts toward the surge bound (R2),
+            // whatever its class: a dead replica refused on a node registered exclusive runs
+            // until its removal is committed and its node stops it (then `stopping_orphans`
+            // counts it), so its replacement waits for room as any other creation does.
             if (item.live) live += 1;
+            if (item.class == .dead or item.class == .held) continue;
             if (item.running and item.lost == null) roll.up += 1;
         }
         roll.live = live;
@@ -1178,10 +1216,11 @@ const Run = struct {
     /// Creates the replicas the service lacks: past the surge bound only once the replicas
     /// being retired are observed stopped (R2), and none while its rollout is paused (R4). While
     /// its rollout has failed, they run the newest older generation a stale replica runs, not
-    /// the failed one. Only when no older replica is left to copy (a failed first generation,
-    /// or every old replica gone) do they run the failed generation: no record keeps an older
-    /// spec, and the service's count comes first (the decision file
-    /// 2026-11-21-c3-stale-replica-on-exclusive-node.md).
+    /// the failed one. When no older replica is left to copy (a failed first generation, or
+    /// every old replica gone), the count wins and they run the failed generation: no record
+    /// keeps an older spec, and leaving the service short fails the halted convergence checks
+    /// (sim_c0's `halted_converged`, sim_cluster's convergence step). The supervisor's decision,
+    /// in docs/decisions/2026-11-21-c3-stale-replica-on-exclusive-node.md.
     fn scale_up(
         run: *Run,
         service: *const Entry(records.Service),
@@ -1485,7 +1524,9 @@ fn newest_older(
 
 /// How many dead replicas one transaction may remove when each is replaced in it, one for one,
 /// up to `replaceable` replacements: the most whose removals and replacements together fit a
-/// batch. At least one, so a dead replica is always removed.
+/// batch. At least one, so a dead replica is always removed. 0 replaceable gives a whole batch,
+/// right when nothing is missing; when the surge bound leaves no room instead, `replace` asks
+/// `paused_unreplaced_max` for a paused service, and the others make up the removals later.
 fn removals_max(replaceable: u32) u32 {
     var removals: u32 = batch_replicas_max;
     while (removals > 1) : (removals -= 1) {
