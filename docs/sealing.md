@@ -51,11 +51,18 @@ After the store's first check and before the CA is loaded, the server reads ever
   and why. No key is written. Fixes: restore the key file from a backup, or start once with
   `--discard-sealed`.
 
-Every envelope in a value is opened, not only the first. An envelope is `zcseal`, a version in
-digits, a dot, a 16-hex key id and a dot, followed by base64url; text that is not of that shape
-(a host named `zcseal1.example.com`, say) is not one. An envelope of another version is refused
-as one this server cannot read. A value with no envelope is skipped: an entry not yet given a key
-holds nothing sealed.
+The sealed member is found by the record's schema, never by the shape of its text. A sealed
+record is one JSON object whose secret is the top-level member `key`, a string holding exactly one
+envelope; every other member is clear and is never opened, whatever it holds (a host named
+`zcseal1.0123456789abcdef.example.com`, say). A record with no `key` member is skipped: an entry
+not yet given a key holds nothing sealed. A `key` member that is not one envelope of this version
+(another version's header, a damaged key id, a clear key) is refused, never skipped, and so is a
+value that is not one JSON object, names `key` twice, or nests more than 64 levels deep
+(docs/decisions/2026-11-21-c5-seal-find-by-schema.md).
+
+When there is no key and no sealed record, the key is written before the CA and the listeners are
+opened, so a start that one of them refuses leaves the new key file behind. That is harmless: no
+record is sealed with it yet, and the next start uses it.
 
 The check reads at most 2,048,000 records under each prefix (`seal_scan_pages_max`, 4096 pages of
 `store_list_limit_max`, 500). Past that the start is refused with ZC-E0824 ("more than 2048000

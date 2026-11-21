@@ -42,7 +42,8 @@ Its files, the server's `ca.key` and `revoked` and the agent's `peer.key`, `peer
 `ca.pub`, live in the state directories, not in the store.
 
 Sealed records (C5 slice 2, `src/seal.zig`): the secret member of an `/edge-certs/` or
-`/acme-account/` record is an envelope `zcseal1.<16 hex key id>.<base64url, no padding, of the
+`/acme-account/` record is its top-level member `key`, found by name (every other member is
+clear), and holds an envelope `zcseal1.<16 hex key id>.<base64url, no padding, of the
 24-byte nonce, the ciphertext and the 16-byte tag>`, XChaCha20-Poly1305 under the sealing key with
 the envelope header and the record's store key as associated data, so a record cannot be moved
 to another key. The sealing key is `seal-<hash>.key` (or `seal.key`), 0600, beside the CA key in

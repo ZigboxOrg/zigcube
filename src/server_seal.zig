@@ -279,21 +279,26 @@ pub fn raise_too_many(diag: *Diag, prefix: []const u8) void {
 
 fn check_one(kv: store.KeyValue, key: ?*const seal.Key, result: *Scan) void {
     assert(result.refused == null);
-    // Every envelope in the value is checked; a record with none holds nothing sealed (an
-    // entry not yet given a key).
-    var envelopes = seal.envelopes(kv.value);
-    var counted = false;
-    while (envelopes.next()) |envelope| {
-        if (!counted) result.records += 1;
-        counted = true;
-        const why = refusal_of(envelope, kv.key, key) orelse continue;
-        result.refused = .{ .expected = seal.key_id_of(envelope), .why = why };
-        const refused = &result.refused.?;
-        assert(kv.key.len <= refused.key_buffer.len);
-        @memcpy(refused.key_buffer[0..kv.key.len], kv.key);
-        refused.key_length = @intCast(kv.key.len);
-        return;
-    }
+    // Only the record's sealed member is opened (seal.sealed_of): a record without one holds
+    // nothing sealed (an entry not yet given a key), and a record that cannot be read is
+    // refused like one that does not open.
+    const sealed = seal.sealed_of(kv.value);
+    if (sealed == .none) return;
+    result.records += 1;
+    var expected: ?seal.KeyId = null;
+    const why = switch (sealed) {
+        .none => unreachable, // Returned above.
+        .unreadable => |why| why,
+        .envelope => |envelope| why: {
+            expected = seal.key_id_of(envelope);
+            break :why refusal_of(envelope, kv.key, key) orelse return;
+        },
+    };
+    result.refused = .{ .expected = expected, .why = why };
+    const refused = &result.refused.?;
+    assert(kv.key.len <= refused.key_buffer.len);
+    @memcpy(refused.key_buffer[0..kv.key.len], kv.key);
+    refused.key_length = @intCast(kv.key.len);
 }
 
 /// Why `envelope` at `path` does not open with `key`, or null if it opens.
@@ -848,10 +853,12 @@ test "a key written by another start meanwhile is read, never replaced" {
     try testing.expectEqualSlices(u8, &racer, &(try rig.key_file()).?);
 }
 
-test "a record is checked envelope by envelope, and a clear member naming the magic is none" {
-    // Goal: the start check reads every envelope (ruling 3). Method: a record whose first
-    // envelope opens and whose second was sealed with another key is refused; a record whose
-    // clear member is a host named "zcseal1.example.com" next to a good envelope starts.
+test "only the sealed member is opened: clear members shaped like envelopes start" {
+    // Goal: review of PR #8 (MUST): a clear host `zcseal1.<16 hex>.example.com` refused every
+    // start with ZC-E0824, and `--discard-sealed` could not end it. Method: records whose clear
+    // members are such hosts (one ending at the quote), next to a good sealed member or with
+    // none, start, again and again; a record naming the sealed member twice, or whose sealed
+    // member does not open, or that is not JSON, is refused.
     var rig: TestRig = undefined;
     try rig.init(testing.io);
     defer rig.deinit();
@@ -861,21 +868,40 @@ test "a record is checked envelope by envelope, and a clear member naming the ma
     var first: [seal.envelope_bytes_max]u8 = undefined;
     var second: [seal.envelope_bytes_max]u8 = undefined;
     const nonce: [seal.nonce_bytes]u8 = @splat(7);
-    const path_ = "/acme-account/0123abcd";
-    const a = seal.seal(&key, path_, "one", nonce, &first);
-    var value: [2 * seal.envelope_bytes_max + 64]u8 = undefined;
-    try rig.put(path_, try std.fmt.bufPrint(&value, "{{\"a\":\"{s}\",\"b\":\"{s}\"}}", .{
-        a, seal.seal(&other, path_, "two", nonce, &second),
-    }));
-    try testing.expectError(error.Failed, rig.open_key(false));
-    try testing.expectEqual(codes.Code.E0824, rig.diag.code.?);
-    try testing.expect(cause_holds(&rig.diag, "sealed with another key"));
+    const host = "/edge-certs/zcseal1.0123456789abcdef.example.com";
+    const a = seal.seal(&key, host, "one", nonce, &first);
+    const b = seal.seal(&other, host, "two", nonce, &second);
+    var value: [2 * seal.envelope_bytes_max + 128]u8 = undefined;
+    const clear = "\"host\":\"zcseal1.0123456789abcdef.example.com\"," ++
+        "\"alias\":\"zcseal1.0123456789abcdef.dev\"";
+    try rig.put(host, try std.fmt.bufPrint(&value, "{{" ++ clear ++ ",\"key\":\"{s}\"}}", .{a}));
+    try rig.put("/edge-certs/pending.example", "{" ++ clear ++ ",\"state\":\"pending\"}");
+    for (0..3) |_| {
+        var ok = try rig.open_key(false);
+        defer ok.wipe();
+        try testing.expectEqualSlices(u8, &key.bytes, &ok.bytes);
+    }
 
+    const refused = [_][]const u8{
+        "{{\"key\":\"{s}\",\"key\":\"{s}\"}}",
+        "{{\"key\":\"{s}{s}\"}}",
+    };
+    inline for (refused) |format| {
+        rig.diag.reset();
+        try rig.put(host, try std.fmt.bufPrint(&value, format, .{ a, b }));
+        try testing.expectError(error.Failed, rig.open_key(false));
+        try testing.expectEqual(codes.Code.E0824, rig.diag.code.?);
+        try testing.expect(cause_holds(&rig.diag, host));
+    }
     rig.diag.reset();
-    try rig.put(path_, try std.fmt.bufPrint(&value, "{{\"host\":\"zcseal1.example.com\"," ++
-        "\"key\":\"{s}\"}}", .{a}));
-    var ok = try rig.open_key(false);
-    ok.wipe();
+    try rig.put(host, try std.fmt.bufPrint(&value, "{{\"key\":\"{s}\"}}", .{b}));
+    try testing.expectError(error.Failed, rig.open_key(false));
+    try testing.expect(cause_holds(&rig.diag, "sealed with another key"));
+    rig.diag.reset();
+    try rig.put(host, "not json");
+    try testing.expectError(error.Failed, rig.open_key(false));
+    try testing.expect(cause_holds(&rig.diag, "does not open: it is not one JSON object"));
+    rig.diag.reset();
 }
 
 test "the scan's bound is one cause naming the bound, the count and a remedy without the flag" {
@@ -924,10 +950,28 @@ fn expect_redacted_all(diag: *Diag, key: []const u8, plain: []const u8) !void {
     }
 }
 
+/// Whether the rendered diagnostic holds `needle`, the lines it wraps joined again: every run
+/// of white space is read as one space.
 fn cause_holds(diag: *Diag, needle: []const u8) bool {
     var diagnostic: diag_mod.Diagnostic = undefined;
     diag_mod.to_diagnostic(&diagnostic, diag);
     var buffer: [constants.diag_output_bytes_max]u8 = undefined;
     const text = diag_mod.render(&diagnostic, .verbose, false, &buffer);
-    return std.mem.indexOf(u8, text, needle) != null;
+    var joined: [constants.diag_output_bytes_max]u8 = undefined;
+    var length: usize = 0;
+    var spaced = false;
+    for (text) |byte| {
+        if (std.ascii.isWhitespace(byte)) {
+            spaced = true;
+            continue;
+        }
+        if (spaced and length > 0) {
+            joined[length] = ' ';
+            length += 1;
+        }
+        spaced = false;
+        joined[length] = byte;
+        length += 1;
+    }
+    return std.mem.indexOf(u8, joined[0..length], needle) != null;
 }

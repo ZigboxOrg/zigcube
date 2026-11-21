@@ -172,67 +172,102 @@ pub fn key_id_of(envelope: []const u8) ?KeyId {
     return id.*;
 }
 
-/// The envelopes inside a record's value (JSON string members, in later slices), in order.
-///
-/// A candidate is any text of the header's shape, `zcseal<digits>.<16 hex>.`, whatever the
-/// version, running on to the first byte that cannot be part of an envelope. So every sealed
-/// member is checked, not only the first; a clear member that merely contains the magic (a host
-/// named `zcseal1.example.com`, a URL) is not of the header's shape and is skipped, neither
-/// hiding a later envelope nor refusing the record; and a header of another version, written by
-/// a later build, is returned too, which `open` refuses as `Malformed`, never skipped as
-/// nothing sealed. A header whose key id is itself damaged is no longer of the shape and is
-/// skipped (accepted: `docs/decisions/2026-11-18-c5-seal-fix-discard-and-find.md`).
-pub fn envelopes(value: []const u8) Envelopes {
-    assert(value.len <= std.math.maxInt(u32));
-    return .{ .value = value };
-}
+/// The member of a sealed record's JSON object that holds its envelope (docs/keys.md): the
+/// P-256 key of an `/edge-certs/` or `/acme-account/` record. Every other member is clear.
+pub const sealed_member = "key";
 
-pub const Envelopes = struct {
-    value: []const u8,
-    at: u32 = 0,
-
-    pub fn next(it: *Envelopes) ?[]const u8 {
-        assert(it.at <= it.value.len);
-        while (std.mem.indexOfPos(u8, it.value, it.at, magic_stem)) |start| {
-            const header_end = header_shape(it.value[start..]) orelse {
-                it.at = @intCast(start + 1);
-                continue;
-            };
-            var end = start + header_end;
-            while (end < it.value.len and is_base64url(it.value[end])) end += 1;
-            it.at = @intCast(end);
-            const envelope = it.value[start..end];
-            assert(std.mem.startsWith(u8, envelope, magic_stem));
-            return envelope;
-        }
-        it.at = @intCast(it.value.len);
-        return null;
-    }
+/// What a sealed prefix's record holds, read by its schema (`sealed_of`).
+pub const Sealed = union(enum) {
+    /// No sealed member: nothing sealed yet (an entry not yet given a key).
+    none,
+    /// The sealed member's whole text, for `open`, which refuses anything but one envelope.
+    envelope: []const u8,
+    /// Not a record this build can read, and why: refused, never skipped.
+    unreadable: []const u8,
 };
 
-/// The magic without its version: `zcseal<digits>.` is how every format starts.
-const magic_stem = "zcseal";
-const version_digits_max = 9;
-
-comptime {
-    assert(std.mem.startsWith(u8, magic, magic_stem));
+/// The sealed member of a record's value. Found by the record's schema, not by the shape of
+/// its text: only the top-level member named `sealed_member` is sealed, and its whole string is
+/// the envelope. So a clear member, whatever it holds (a host named
+/// `zcseal1.0123456789abcdef.example.com`, a URL, an envelope copied in), is never opened and
+/// never refuses the start; and a sealed member that is anything but one envelope (another
+/// version's, a damaged header, a clear key) is handed to `open`, which refuses it. A value that
+/// is not one JSON object, nests deeper than `seal_record_depth_max`, or names the sealed member
+/// twice is unreadable (docs/decisions/2026-11-21-c5-seal-find-by-schema.md).
+pub fn sealed_of(value: []const u8) Sealed {
+    assert(value.len <= std.math.maxInt(u32));
+    // The scanner's nesting stack, one bit a level, in a fixed buffer: a deeper value runs out
+    // of it (OutOfMemory) rather than growing.
+    var stack_buffer: [stack_bytes]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&stack_buffer);
+    var scanner: std.json.Scanner = .initCompleteInput(fixed.allocator(), value);
+    scanner.stack.bytes.ensureTotalCapacityPrecise(stack_bytes) catch
+        unreachable; // The buffer is exactly `stack_bytes` and nothing else was allocated.
+    assert(fixed.end_index == stack_bytes);
+    const result = sealed_scan(&scanner) catch |err| return .{
+        .unreadable = switch (err) {
+            error.OutOfMemory => "it nests deeper than a sealed record may",
+            error.SyntaxError, error.UnexpectedEndOfInput => "it is not one JSON object",
+            error.BufferUnderrun => unreachable, // The input is complete.
+        },
+    };
+    if (result == .envelope) assert(result.envelope.len <= value.len);
+    return result;
 }
 
-/// The length of the header at the start of `text`, `zcseal<digits>.<16 hex>.`, or null.
-fn header_shape(text: []const u8) ?usize {
-    assert(std.mem.startsWith(u8, text, magic_stem));
-    var at: usize = magic_stem.len;
-    while (at < text.len and at - magic_stem.len < version_digits_max and
-        std.ascii.isDigit(text[at])) : (at += 1)
-    {}
-    if (at == magic_stem.len) return null;
-    if (at >= text.len or text[at] != '.') return null;
-    at += 1;
-    if (text.len < at + key_id_bytes + 1) return null;
-    if (!is_key_id(text[at..][0..key_id_bytes])) return null;
-    at += key_id_bytes;
-    if (text[at] != '.') return null;
-    return at + 1;
+const stack_bytes = @divExact(constants.seal_record_depth_max, 8);
+
+fn sealed_scan(scanner: *std.json.Scanner) std.json.Scanner.NextError!Sealed {
+    if (try scanner.next() != .object_begin) return .{ .unreadable = "it is not a JSON object" };
+    var found: ?[]const u8 = null;
+    var name_buffer: [sealed_member.len + 1]u8 = undefined;
+    while (try member_name(scanner, &name_buffer)) |name| {
+        if (!std.mem.eql(u8, name, sealed_member)) {
+            try scanner.skipValue();
+            continue;
+        }
+        if (found != null) return .{ .unreadable = "it names its sealed member twice" };
+        // An envelope has no escapes, so it is always one whole `.string` token of the input.
+        switch (try scanner.next()) {
+            .string => |text| found = text,
+            else => return .{ .unreadable = "its sealed member is not one envelope" },
+        }
+    }
+    assert(scanner.stackHeight() == 0);
+    if (try scanner.next() != .end_of_document) {
+        return .{ .unreadable = "it is not one JSON object" };
+    }
+    const envelope = found orelse return .none;
+    return .{ .envelope = envelope };
+}
+
+/// The next member's name of the top-level object, cut to `buffer.len` bytes (enough to tell
+/// it from `sealed_member`), escapes decoded; null at the object's end.
+fn member_name(
+    scanner: *std.json.Scanner,
+    buffer: *[sealed_member.len + 1]u8,
+) std.json.Scanner.NextError!?[]const u8 {
+    assert(scanner.stackHeight() == 1);
+    var length: usize = 0;
+    while (true) {
+        const token = try scanner.next();
+        const piece: []const u8 = switch (token) {
+            .object_end => return null,
+            .string, .partial_string => |text| text,
+            .partial_string_escaped_1 => |*bytes| bytes,
+            .partial_string_escaped_2 => |*bytes| bytes,
+            .partial_string_escaped_3 => |*bytes| bytes,
+            .partial_string_escaped_4 => |*bytes| bytes,
+            else => unreachable, // The scanner gives a name or the end after `{` or a value.
+        };
+        const taken = @min(piece.len, buffer.len - length);
+        @memcpy(buffer[length..][0..taken], piece[0..taken]);
+        length += taken;
+        if (token == .string) {
+            assert(length <= buffer.len);
+            return buffer[0..length];
+        }
+    }
 }
 
 pub fn is_key_id(text: []const u8) bool {
@@ -285,9 +320,9 @@ test "a sealed record opens at its own path with its own key, and round-trips ev
         const envelope = seal(&key, "/edge-certs/a.example", plain[0..length], nonce, &out);
         try testing.expectEqual(envelope_bytes(length), @as(u32, @intCast(envelope.len)));
         try testing.expectEqualSlices(u8, &key.id(), &key_id_of(envelope).?);
-        var found = envelopes(envelope);
-        try testing.expectEqualStrings(envelope, found.next().?);
-        try testing.expect(found.next() == null);
+        var value: [envelope_bytes_max + 16]u8 = undefined;
+        const record = try std.fmt.bufPrint(&value, "{{\"key\":\"{s}\"}}", .{envelope});
+        try testing.expectEqualStrings(envelope, sealed_of(record).envelope);
         const back = try open(&key, "/edge-certs/a.example", envelope, &opened);
         try testing.expectEqualSlices(u8, plain[0..length], back);
     }
@@ -323,26 +358,46 @@ test "a moved record, a tampered byte, a relabelled key id and another key are r
     try testing.expectError(error.Forged, open(&other, path, relabelled, &opened));
 }
 
-test "envelopes are found inside a record's value, and junk is not one" {
-    // Goal: the start-up check's parser. Method: an envelope inside JSON is found whole; values
-    // without one give none; a cut-short or damaged body is still returned and refused by
-    // `key_id_of` or `open`.
+test "the sealed member is found by the record's schema, and junk is unreadable" {
+    // Goal: the start-up check's parser. Method: the envelope in the `key` member is found whole
+    // wherever the member sits; values without the member hold nothing sealed; values that are
+    // not one JSON object, nest too deep, name the member twice or give it a non-string are
+    // unreadable; and `key_id_of` and `open` refuse a cut-short or damaged envelope.
     const key = test_key(0x44);
     var out: [envelope_bytes_max]u8 = undefined;
     const envelope = seal(&key, "/acme-account/0123", "account", @splat(9), &out);
     var value_buffer: [envelope_bytes_max + 64]u8 = undefined;
-    const value = try std.fmt.bufPrint(&value_buffer, "{{\"key\":\"{s}\",\"x\":1}}", .{envelope});
-    var found = envelopes(value);
-    try testing.expectEqualStrings(envelope, found.next().?);
-    try testing.expect(found.next() == null);
-    found = envelopes("{\"key\":\"plain\"}");
-    try testing.expect(found.next() == null);
-    found = envelopes("zcseal1.0123456789abcdef.");
-    try testing.expect(key_id_of(found.next().?) == null);
+    var value = try std.fmt.bufPrint(&value_buffer, "{{\"x\":[1,{{}}],\"key\":\"{s}\"}}", .{
+        envelope,
+    });
+    try testing.expectEqualStrings(envelope, sealed_of(value).envelope);
+    // An escaped name is the same name.
+    value = try std.fmt.bufPrint(&value_buffer, "{{\"k\\u0065y\":\"{s}\"}}", .{envelope});
+    try testing.expectEqualStrings(envelope, sealed_of(value).envelope);
+    try testing.expect(sealed_of("{\"state\":\"pending\",\"keys\":\"x\",\"ke\":1}") == .none);
+    try testing.expect(sealed_of("{\"a\":{\"key\":\"zcseal1.0123456789abcdef.AAAA\"}}") == .none);
+    try testing.expect(sealed_of("{}") == .none);
+
+    const unreadable = [_][]const u8{
+        "",                              "zcseal1.0123456789abcdef.AAAA",
+        "[\"key\"]",                     "{\"key\":\"a\"} {}",
+        "{\"key\":\"a\",\"key\":\"b\"}", "{\"key\":1}",
+        "{\"key\":{\"v\":\"a\"}}",       "{\"key\":\"zcseal1.\\u0030\"}",
+        "{\"key\":\"a\"",                "{\"key\" \"a\"}",
+    };
+    for (unreadable) |text| try testing.expect(sealed_of(text) == .unreadable);
+    // Depth: the bound itself is read, one level more is not.
+    var deep_buffer: [6 * (constants.seal_record_depth_max + 1)]u8 = undefined;
+    try testing.expect(sealed_of(nested(&deep_buffer, constants.seal_record_depth_max)) == .none);
+    const deeper = nested(&deep_buffer, constants.seal_record_depth_max + 1);
+    const why = sealed_of(deeper).unreadable;
+    try testing.expectEqualStrings("it nests deeper than a sealed record may", why);
+
+    try testing.expect(key_id_of("zcseal1.0123456789abcdef.") == null);
     try testing.expect(key_id_of("zcseal1.0123456789ABCDEF.AAAA") == null);
     try testing.expect(key_id_of("zcseal1.0123456789abcdef-AAAA") == null);
-    try testing.expect(key_id_of("zcseal1.0123456789abcdef.") == null);
     try testing.expect(key_id_of("zcseal1.0123456789abcdef.AA=A") == null);
+    try testing.expect(key_id_of("zcseal1.0123456789abcdef.example") != null);
     try testing.expect(key_id_of("zcseal1.0123456789abcdef.AAAA") != null);
     var opened: [constants.seal_plaintext_bytes_max]u8 = undefined;
     var short_buffer: [header_bytes + 4]u8 = undefined;
@@ -350,62 +405,74 @@ test "envelopes are found inside a record's value, and junk is not one" {
     try testing.expectError(error.Malformed, open(&key, "/edge-certs/x", short, &opened));
 }
 
-test "a clear member holding the magic neither hides nor fakes an envelope" {
-    // Goal: review of #284 (seal.zig `find`): a host named `zcseal1.example.com` in clear before
-    // the sealed member. Method: such a value yields exactly the real envelope, which opens; a
-    // value with only the clear member yields nothing.
-    const key = test_key(0x45);
-    var out: [envelope_bytes_max]u8 = undefined;
-    const path = "/edge-certs/zcseal1.example.com";
-    const envelope = seal(&key, path, "leaf", @splat(3), &out);
-    var value_buffer: [envelope_bytes_max + 128]u8 = undefined;
-    const value = try std.fmt.bufPrint(
-        &value_buffer,
-        "{{\"host\":\"zcseal1.example.com\",\"url\":\"https://zcseal7.x/zcseal1.\"," ++
-            "\"key\":\"{s}\"}}",
-        .{envelope},
-    );
-    var found = envelopes(value);
-    const first = found.next().?;
-    try testing.expectEqualStrings(envelope, first);
-    try testing.expect(found.next() == null);
-    var opened: [constants.seal_plaintext_bytes_max]u8 = undefined;
-    try testing.expectEqualStrings("leaf", try open(&key, path, first, &opened));
-    found = envelopes("{\"host\":\"zcseal1.example.com\"}");
-    try testing.expect(found.next() == null);
+/// `{"a":` nested `depth` objects deep, the innermost empty: `{"a":{"a":{}}}` is depth 3.
+fn nested(buffer: []u8, depth: u32) []const u8 {
+    assert(depth >= 1);
+    assert(buffer.len >= 6 * depth);
+    var length: usize = 0;
+    for (0..depth - 1) |_| {
+        @memcpy(buffer[length..][0..5], "{\"a\":");
+        length += 5;
+    }
+    buffer[length] = '{';
+    length += 1;
+    @memset(buffer[length..][0..depth], '}');
+    length += depth;
+    return buffer[0..length];
 }
 
-test "every envelope in a value is returned, and another version is one this build refuses" {
-    // Goal: review of #284 (seal.zig `find`): a second sealed member, and a `zcseal2.` met after
-    // a downgrade. Method: two envelopes sealed with two keys are both returned, in order, so
-    // the second's key is checked too; a header of version 2 is returned and `open` refuses it
-    // as `Malformed`, never as "nothing sealed".
-    const a = test_key(0x46);
-    const b = test_key(0x47);
-    const path = "/acme-account/0123";
-    var out_a: [envelope_bytes_max]u8 = undefined;
-    var out_b: [envelope_bytes_max]u8 = undefined;
-    const first = seal(&a, path, "one", @splat(1), &out_a);
-    const second = seal(&b, path, "two", @splat(2), &out_b);
-    var value_buffer: [2 * envelope_bytes_max + 64]u8 = undefined;
-    const value = try std.fmt.bufPrint(&value_buffer, "{{\"k\":\"{s}\",\"j\":\"{s}\"}}", .{
-        first, second,
-    });
-    var found = envelopes(value);
+test "a clear member shaped like an envelope is never opened and never refuses the record" {
+    // Goal: review of PR #8 (MUST): a clear host such as `zcseal1.0123456789abcdef.example.com`
+    // (a 16-hex DNS label is legal) was taken for an envelope and refused every start, which
+    // `--discard-sealed` could not cure. Method: such clear members, one ending at the quote,
+    // one an envelope from end to end, beside the sealed member yield exactly the sealed member,
+    // which opens; a record with only such clear members holds nothing sealed.
+    const key = test_key(0x45);
+    var out: [envelope_bytes_max]u8 = undefined;
+    const path = "/edge-certs/zcseal1.0123456789abcdef.example.com";
+    const envelope = seal(&key, path, "leaf", @splat(3), &out);
+    const other = test_key(0x46);
+    var other_out: [envelope_bytes_max]u8 = undefined;
+    const foreign = seal(&other, path, "copied", @splat(4), &other_out);
+    var value_buffer: [2 * envelope_bytes_max + 256]u8 = undefined;
+    const clear = "\"host\":\"zcseal1.0123456789abcdef.example.com\"," ++
+        "\"alias\":\"zcseal1.0123456789abcdef.dev\",\"url\":\"https://zcseal7.x/zcseal1.\"";
+    const value = try std.fmt.bufPrint(
+        &value_buffer,
+        "{{" ++ clear ++ ",\"copy\":\"{s}\",\"key\":\"{s}\"," ++
+            "\"after\":\"zcseal1.0123456789abcdef.x\"}}",
+        .{ foreign, envelope },
+    );
+    const found = sealed_of(value).envelope;
+    try testing.expectEqualStrings(envelope, found);
     var opened: [constants.seal_plaintext_bytes_max]u8 = undefined;
-    try testing.expectEqualStrings("one", try open(&a, path, found.next().?, &opened));
-    try testing.expectError(error.WrongKey, open(&a, path, found.next().?, &opened));
-    try testing.expect(found.next() == null);
+    try testing.expectEqualStrings("leaf", try open(&key, path, found, &opened));
+    try testing.expect(sealed_of("{" ++ clear ++ "}") == .none);
+}
 
+test "a sealed member of another version, or damaged, is refused by open, never skipped" {
+    // Goal: a `zcseal2.` met after a downgrade, and a damaged header, refuse the record. Method:
+    // the sealed member holding a version-2 header, an upper-case key id, or a clear value is
+    // returned whole, and `open` refuses each as `Malformed`.
+    const a = test_key(0x46);
+    const path = "/acme-account/0123";
+    var out: [envelope_bytes_max]u8 = undefined;
+    const first = seal(&a, path, "one", @splat(1), &out);
+    var opened: [constants.seal_plaintext_bytes_max]u8 = undefined;
     var later_buffer: [envelope_bytes_max + 64]u8 = undefined;
-    const later = try std.fmt.bufPrint(&later_buffer, "{{\"key\":\"zcseal2.{s}\"}}", .{
+    var later = try std.fmt.bufPrint(&later_buffer, "{{\"key\":\"zcseal2.{s}\"}}", .{
         first["zcseal1.".len..],
     });
-    found = envelopes(later);
-    const unknown = found.next().?;
+    const unknown = sealed_of(later).envelope;
     try testing.expect(std.mem.startsWith(u8, unknown, "zcseal2."));
     try testing.expectError(error.Malformed, open(&a, path, unknown, &opened));
-    try testing.expect(found.next() == null);
+    later = try std.fmt.bufPrint(&later_buffer, "{{\"key\":\"{s}\"}}", .{first});
+    const at = std.mem.indexOf(u8, later, "zcseal1.").? + magic.len;
+    later[at] = std.ascii.toUpper(later[at]);
+    later[at + 1] = 'G';
+    try testing.expectError(error.Malformed, open(&a, path, sealed_of(later).envelope, &opened));
+    const clear = sealed_of("{\"key\":\"-----BEGIN EC PRIVATE KEY-----\"}").envelope;
+    try testing.expectError(error.Malformed, open(&a, path, clear, &opened));
 }
 
 test "known answer: the envelope's bytes and the key id are pinned" {
