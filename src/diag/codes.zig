@@ -1346,8 +1346,12 @@ pub const registry = [_]Entry{
         \\file's .labels differently, the labels differ from those the node
         \\registered with while its lease in --state-dir is live, or a file it
         \\names (the image fixtures, the --trust-policy file) cannot be read or
-        \\used. The cause line names the setting. The agent did not start and
-        \\changed nothing.
+        \\used. Without --ca (or .ca in the file) the agent speaks plain HTTP,
+        \\so --server must then be a loopback address (127.0.0.0/8 or [::1]):
+        \\the server serves plain HTTP on loopback only, and a node must not
+        \\take its work unauthenticated over a network; give --ca, --cert and
+        \\--key to reach any other address over TLS. The cause line names the
+        \\setting. The agent did not start and changed nothing.
         \\
         \\Run zcube-agent --help for the flags and the file's fields.
         ,

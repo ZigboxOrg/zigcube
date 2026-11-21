@@ -25,6 +25,7 @@ const assert = std.debug.assert;
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const records = @import("records.zig");
+const server_config = @import("server_config.zig");
 const x509_identity = @import("x509_identity.zig");
 const text_util = @import("text.zig");
 const trust_file = @import("trust_file.zig");
@@ -65,7 +66,7 @@ pub const usage =
     \\  --registry ADDR    fake runtime: where an image the node lacks is fetched from when no
     \\                     peer has it (needs --images-dir)
     \\  --ca FILE          the cluster CA's certificate (ca.crt): talk to the server over TLS
-    \\                     (docs/mtls.md); without it, plain HTTP (--insecure-listen)
+    \\                     (docs/mtls.md); without it, plain HTTP, to a loopback --server only
     \\  --cert FILE, --key FILE  the certificate and key to present until the node has its
     \\                     own (node.crt in the state directory, issued at join)
     \\  --tls-name NAME    the DNS name in the server's certificate (default zcube-server)
@@ -288,6 +289,9 @@ fn merge(arena: Allocator, io: std.Io, flags: Flags, file: File, diag: *Diag) Er
     const peer_advertise = try peer_advertised(peer_listen, advertise_text, diag);
     const registry = try registry_of(flags.registry orelse file.registry, images_dir, diag);
     const labels = try merged_labels(&flags, file, diag);
+    const server = try parse_server(server_text, diag);
+    const tls = try tls_absolute(arena, io, try tls_of(flags, file, diag), diag);
+    try check_plain_server(server, server_text, tls != null, diag);
     const images_given = flags.images orelse file.images;
     const images_path = images_given orelse images_default;
     const pulls_wanted = kind == .zigbox and images_given != null;
@@ -295,7 +299,7 @@ fn merge(arena: Allocator, io: std.Io, flags: Flags, file: File, diag: *Diag) Er
         .runtime = kind,
         .pulls = if (pulls_wanted) try read_pulls(arena, io, images_path, diag) else &.{},
         .node = node,
-        .server = try parse_server(server_text, diag),
+        .server = server,
         .state_dir = try absolute_state_dir(arena, io, state_text, diag),
         .images = if (kind == .fake) try read_images(arena, io, images_path, diag) else &.{},
         .capacity = .{ .cpu_millis = cpu, .memory_bytes = memory },
@@ -305,9 +309,23 @@ fn merge(arena: Allocator, io: std.Io, flags: Flags, file: File, diag: *Diag) Er
         .peer_listen = peer_listen,
         .peer_advertise = peer_advertise,
         .registry = registry,
-        .tls = try tls_absolute(arena, io, try tls_of(flags, file, diag), diag),
+        .tls = tls,
         .labels = try arena.dupe([]const u8, labels),
     };
+}
+
+/// Plain HTTP (no `--ca`) only to a loopback `--server`: the server serves plain HTTP on loopback
+/// alone (`--insecure-listen`, ZC-E0106), and a node that spoke it over a network would take
+/// assignments and post `relay.pub` unauthenticated (docs/decisions/2026-11-21-agent-plain-http-
+/// loopback-only.md). Loopback is the server's own rule, `server_config.is_loopback`.
+fn check_plain_server(server: IpAddress, text: []const u8, tls: bool, diag: *Diag) Error!void {
+    if (tls) return;
+    if (server_config.is_loopback(server)) return;
+    const why = "--server {s} is not a loopback address, and without --ca the agent would " ++
+        "talk plain HTTP to it";
+    return bad(diag, why, .{text}, "give --ca, --cert and --key (or .ca, .cert and .key in " ++
+        "the file) to reach the server's --listen over TLS; plain HTTP goes to 127.0.0.1 or " ++
+        "[::1] only");
 }
 
 /// The registry to fetch images from, checked: it fetches into the chunk store, so it needs one.
@@ -1266,4 +1284,77 @@ test "the TLS paths are made absolute for the fetch child, as the state director
     try testing.expectEqualStrings("/k/n.key", got.key.?);
     try testing.expectEqualStrings("s", got.server_name);
     try testing.expect(diag.code == null);
+}
+
+test "plain HTTP goes to a loopback --server only; any other needs --ca (0.6.0 finding 1)" {
+    // Goal: an agent without TLS never talks plain HTTP over a network (docs/decisions/
+    // 2026-11-21-agent-plain-http-loopback-only.md). Method: load with each loopback form and no
+    // --ca (accepted), each other address with no --ca (E0505, nothing else), the same with --ca
+    // (accepted), and the refusal's wording against its golden.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    const loopback = [_][]const u8{ "127.0.0.1:7070", "127.1.2.3:7070", "[::1]:7070" };
+    for (loopback) |server| {
+        diag.reset();
+        const loaded = try load(arena, testing.io, &plain_args(server), &diag);
+        try testing.expect(loaded.run.tls == null);
+        try testing.expect(diag.code == null);
+    }
+    // `::ffff:127.0.0.1` is refused: the server's rule names only the plain forms.
+    const remote = [_][]const u8{
+        "10.0.2.2:7070",      "192.0.2.1:7070",          "0.0.0.0:7070", "128.0.0.1:7070",
+        "[2001:db8::1]:7070", "[::ffff:127.0.0.1]:7070", "[::]:7070",
+    };
+    for (remote) |server| {
+        diag.reset();
+        try expect_bad(load(arena, testing.io, &plain_args(server), &diag), &diag);
+        try testing.expect(std.mem.indexOf(u8, diag.last_cause().?, "not a loopback") != null);
+        diag.reset();
+        const tls_args = plain_args(server) ++ [_][]const u8{
+            "--ca", "/etc/zcube/ca.crt", "--cert", "/etc/zcube/n.crt", "--key", "/etc/zcube/n.key",
+        };
+        const loaded = try load(arena, testing.io, &tls_args, &diag);
+        try testing.expectEqualStrings("/etc/zcube/ca.crt", loaded.run.tls.?.ca);
+    }
+    // The same refusal from the file's `.server`, and a loopback flag wins over the file's.
+    diag.reset();
+    const file = try parse_file(arena, ".{ .server = \"10.0.2.2:7070\" }", "agent.zon", &diag);
+    const unnamed = plain_args("127.0.0.1:7070");
+    const no_server = unnamed[0..2] ++ unnamed[4..];
+    try expect_bad(merge(arena, testing.io, try parse_flags(no_server, &diag), file, &diag), &diag);
+    diag.reset();
+    const flagged = try merge(arena, testing.io, try parse_flags(&unnamed, &diag), file, &diag);
+    try testing.expect(server_config.is_loopback(flagged.server));
+    diag.reset();
+    try expect_bad(load(arena, testing.io, &plain_args("10.0.2.2:7070"), &diag), &diag);
+    var diagnostic: diag_mod.Diagnostic = undefined;
+    diag_mod.to_diagnostic(&diagnostic, &diag);
+    var buffer: [constants.diag_output_bytes_max]u8 = undefined;
+    try testing.expectEqualStrings(plain_refused_golden, diag_mod.render(
+        &diagnostic,
+        .text,
+        false,
+        &buffer,
+    ));
+}
+
+/// What `zcube-agent --server 10.0.2.2:7070` without `--ca` prints (default output).
+const plain_refused_golden =
+    "error[ZC-E0505]: the agent's configuration can't be used\n" ++
+    "  cause  --server 10.0.2.2:7070 is not a loopback address, and without --ca the\n" ++
+    "         agent would talk plain HTTP to it\n" ++
+    "  fix    give --ca, --cert and --key (or .ca, .cert and .key in the file) to reach " ++
+    "the server's --listen over TLS; plain HTTP goes to 127.0.0.1 or [::1] only\n" ++
+    "  more   zcube explain E0505 · rerun with --verbose for the full cause chain\n" ++
+    "  docs   https://zigbox.github.io/zigcube/errors/E0505.html\n";
+
+/// The flags of a fake-runtime agent that names `server` and no TLS setting.
+fn plain_args(server: []const u8) [12][]const u8 {
+    return .{
+        "--node",         "node1",   "--server",     server,
+        "--state-dir",    "/tmp",    "--cpu-millis", "1000",
+        "--memory-bytes", "1000000", "--images",     "fixtures/images.zon",
+    };
 }
