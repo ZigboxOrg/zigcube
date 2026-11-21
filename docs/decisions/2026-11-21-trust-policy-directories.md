@@ -14,9 +14,18 @@ policy others can replace gates no more than one they can rewrite.
 
 ## The rule
 
-- The path is resolved (`realpath`) and every directory from the file's parent up to `/` must be
-  owned by root or the process's effective user, and writable by neither group nor others, unless
-  it is sticky (`/tmp`'s mode, 1777: only a file's owner may rename or remove it there).
+- The path is walked as given (a relative one from the working directory), one component at a
+  time, without following a symbolic link unseen: every directory that holds a component, from
+  `/` down, must be owned by root or the process's effective user, and writable by neither group
+  nor others, unless it is sticky (`/tmp`'s mode, 1777: only a file's owner may rename or remove
+  it there). A link's own directory is judged, then its target is walked in its place, so the
+  target's directories are judged too, and a directory reached through a link is judged where it
+  is. At most `trust_policy_links_max` (40, Linux's own limit) links are followed.
+- The walk ends on a file with no link left in its path. That path is opened without following a
+  link, the file is judged again through its descriptor (`fstat`), the descriptor's own path
+  (`File.realPath`) must be the walked one, and the policy is read from that descriptor
+  (PR #10's review: resolving the whole path first judged only the target's directories, so a
+  link put in a directory others may write passed).
 - A directory that breaks this refuses the start with the same code the file check uses, with a
   cause naming the directory, its owner and its mode, and a fix that says to keep the policy in a
   directory such as `/etc/zcube` and `chmod go-w` the ones above it.

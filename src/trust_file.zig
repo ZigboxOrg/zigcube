@@ -1,7 +1,9 @@
 //! A Zigbox trust policy file, read once at start (B5): by `zcube-server` for its `trust` entry
 //! (ZC-E0106) and by `zcube-agent` for `--trust-policy` (ZC-E0505). Shell code: it reads a file.
 //!
-//! The file is judged and read through one descriptor, so it cannot be swapped between the two.
+//! The path is walked as given, every directory on the way (a symbolic link's own directory too)
+//! judged, and the file it ends on is judged and read through one descriptor, so it cannot be
+//! swapped between the two.
 //! It must be a regular file, owned by root or by the process's own user, and writable by neither
 //! group nor others: Zigbox's rule for its system policy (`trust/gate.zig`, "the system policy
 //! binds users who cannot write it"), carried over to a process that need not run as root
@@ -54,16 +56,19 @@ pub fn read(
             options.setting, constants.config_path_bytes_max,
         }, options.fix);
     }
-    // The path is judged before it is opened: opening a FIFO for reading blocks until a writer
-    // comes, so a FIFO must be refused unopened. The open file is judged again, in case the
-    // path was swapped in between.
-    const path_z = try arena.dupeSentinel(u8, path, 0);
-    try check_owner(owner_at(path_z), path, options, diag);
-    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch
+    // The path is walked as given, a component at a time, and every directory that holds one (a
+    // symbolic link's own directory too) is judged; the walk ends on the file the links lead to,
+    // which is judged before it is opened: opening a FIFO for reading blocks until a writer
+    // comes, so a FIFO must be refused unopened. The file is opened by the walked path, links
+    // not followed, judged again through its descriptor, and read from that descriptor.
+    var walked: Walk = .{};
+    const reached = try walk(&walked, path, options, diag);
+    try check_owner(reached, path, options, diag);
+    const file = std.Io.Dir.cwd().openFile(io, walked.real(), .{ .follow_symlinks = false }) catch
         return bad(diag, options, "can't read the trust policy {s}", .{path}, options.fix);
     defer file.close(io);
     try check_owner(owner_of(file), path, options, diag);
-    try check_directories(io, path, options, diag);
+    try check_same(io, file, walked.real(), path, options, diag);
     // A file of exactly the bound is allowed: the limit refuses one that reaches it.
     const limit: std.Io.Limit = .limited(zigbox.trust.limits.policy_bytes_max + 1);
     var reader = file.reader(io, &.{});
@@ -82,42 +87,186 @@ pub fn read(
 /// Who owns the policy file and its mode bits.
 pub const Owner = struct { uid: u32, mode: u32 };
 
-/// Each directory above the policy file, up to `/`, must be one that only root or the process's
-/// own user can change: whoever may write a directory on the way can rename the policy away and
-/// put their own in its place, which the next start reads (0.5.2 review 5927352205, item 8;
-/// docs/decisions/2026-11-21-trust-policy-directories.md). The path is resolved first, so a
-/// symbolic link is judged where it leads, as the file was.
-fn check_directories(io: std.Io, path: []const u8, options: Options, diag: *Diag) Error!void {
-    var buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const length = std.Io.Dir.cwd().realPathFile(io, path, &buffer) catch
-        return bad(diag, options, "can't resolve the trust policy {s}", .{path}, options.fix);
-    var real: []const u8 = buffer[0..length];
-    assert(std.fs.path.isAbsolute(real));
-    // A resolved path has at most one directory per separator: the walk is bounded by its length.
-    var steps: usize = 0;
-    while (std.fs.path.dirname(real)) |parent| : (steps += 1) {
-        assert(steps < length);
-        assert(parent.len < real.len);
-        var parent_buffer: [std.fs.max_path_bytes:0]u8 = undefined;
-        @memcpy(parent_buffer[0..parent.len], parent);
-        parent_buffer[parent.len] = 0;
-        const parent_z = parent_buffer[0..parent.len :0];
-        const owner = owner_stat(std.os.linux.AT.FDCWD, parent_z, 0) orelse
-            return bad(diag, options, "can't read the owner of {s}, the directory of the " ++
-                "trust policy {s}", .{ parent, path }, options.fix);
-        if (directory_problem(owner, std.os.linux.geteuid())) |problem| {
-            return bad(diag, options, "the trust policy {s} is in {s}, which {s}{s} " ++
-                "(owner uid {d}, mode {o:0>4})", .{
-                path,
-                parent,
-                problem.text(),
-                if (problem == .foreign_owner) options.user else "",
-                owner.uid,
-                owner.mode & 0o7777,
-            }, directory_fix);
-        }
-        real = parent;
+const linux = std.os.linux;
+const path_max = std.fs.max_path_bytes;
+comptime {
+    assert(path_max <= std.math.maxInt(u16));
+}
+
+/// A walk down a policy's path. Every directory that holds a component of the path, up to `/`,
+/// must be one that only root or the process's own user can change: whoever may write a
+/// directory on the way can rename the policy away, or put a symbolic link in its place, and the
+/// next start reads what they chose (0.5.2 review 5927352205, item 8; PR #10's review;
+/// docs/decisions/2026-11-21-trust-policy-directories.md). So the path is walked as given, a
+/// component at a time and never through a link unseen: a link's own directory is judged, then
+/// its target is walked in its place.
+const Walk = struct {
+    /// The directories reached so far, from `/`, with no link left in them.
+    resolved: [path_max]u8 = undefined,
+    resolved_len: u16 = 0,
+    /// The components still to walk: `pending[pending_start..pending_len]`.
+    pending: [path_max]u8 = undefined,
+    pending_start: u16 = 0,
+    pending_len: u16 = 0,
+    links: u32 = 0,
+
+    /// The path reached, absolute and free of links.
+    fn real(w: *const Walk) []const u8 {
+        assert(w.resolved_len >= 1);
+        assert(w.resolved[0] == '/');
+        return w.resolved[0..w.resolved_len];
     }
+};
+
+/// Walks `path` and returns the owner and mode of the file it ends on (not following it).
+fn walk(w: *Walk, path: []const u8, options: Options, diag: *Diag) Error!Owner {
+    assert(path.len > 0);
+    w.resolved[0] = '/';
+    w.resolved_len = 1;
+    // A relative path is walked from the working directory, whose directories are judged too.
+    var prefix_len: usize = 0;
+    if (!std.fs.path.isAbsolute(path)) {
+        const result = linux.getcwd(&w.pending, w.pending.len);
+        if (linux.errno(result) != .SUCCESS) return unresolved(path, options, diag);
+        prefix_len = std.mem.indexOfScalar(u8, &w.pending, 0) orelse
+            return unresolved(path, options, diag);
+        w.pending[prefix_len] = '/';
+        prefix_len += 1;
+    }
+    if (prefix_len + path.len > w.pending.len) return unresolved(path, options, diag);
+    @memcpy(w.pending[prefix_len..][0..path.len], path);
+    w.pending_len = @intCast(prefix_len + path.len);
+    // Each step takes at least one byte of `pending`, except one that meets a link, which starts
+    // `pending` again: the links are bounded, so the walk is.
+    const steps_max = (constants.trust_policy_links_max + 1) * (path_max + 1);
+    var steps: usize = 0;
+    while (w.pending_start < w.pending_len) : (steps += 1) {
+        assert(steps < steps_max);
+        try walk_step(w, path, options, diag);
+    }
+    var buffer: [path_max:0]u8 = undefined;
+    const reached = owner_stat(linux.AT.FDCWD, terminated(&buffer, w.real()), //
+        linux.AT.SYMLINK_NOFOLLOW) orelse
+        return bad(diag, options, "can't read the trust policy {s}", .{path}, options.fix);
+    assert(reached.mode & linux.S.IFMT != linux.S.IFLNK);
+    return reached;
+}
+
+/// Walks the next component of `pending`.
+fn walk_step(w: *Walk, path: []const u8, options: Options, diag: *Diag) Error!void {
+    const rest = w.pending[w.pending_start..w.pending_len];
+    assert(rest.len > 0);
+    const end = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
+    const name = rest[0..end];
+    w.pending_start += @intCast(@min(end + 1, rest.len));
+    assert(w.pending_start <= w.pending_len);
+    if (name.len == 0 or std.mem.eql(u8, name, ".")) return;
+    if (std.mem.eql(u8, name, "..")) {
+        // `resolved` holds no link, so its parent is its own dirname.
+        const parent = std.fs.path.dirname(w.real()) orelse "/";
+        w.resolved_len = @intCast(parent.len);
+        return;
+    }
+    // Whoever may write the directory that holds this component could swap it.
+    try check_directory(w.real(), path, options, diag);
+    const parent_len = w.resolved_len;
+    const separator: usize = if (parent_len == 1) 0 else 1;
+    if (parent_len + separator + name.len >= path_max) return unresolved(path, options, diag);
+    w.resolved[parent_len] = '/';
+    @memcpy(w.resolved[parent_len + separator ..][0..name.len], name);
+    w.resolved_len = @intCast(parent_len + separator + name.len);
+    var buffer: [path_max:0]u8 = undefined;
+    const candidate = terminated(&buffer, w.real());
+    const owner = owner_stat(linux.AT.FDCWD, candidate, linux.AT.SYMLINK_NOFOLLOW) orelse
+        return bad(diag, options, "can't read the trust policy {s}", .{path}, options.fix);
+    if (owner.mode & linux.S.IFMT != linux.S.IFLNK) return;
+    w.resolved_len = parent_len;
+    try walk_link(w, candidate, path, options, diag);
+}
+
+/// Puts the target of the symbolic link `link` in front of the components still to walk.
+fn walk_link(
+    w: *Walk,
+    link: [:0]const u8,
+    path: []const u8,
+    options: Options,
+    diag: *Diag,
+) Error!void {
+    w.links += 1;
+    if (w.links > constants.trust_policy_links_max) {
+        return bad(diag, options, "the trust policy {s} goes through more than {d} symbolic " ++
+            "links", .{ path, constants.trust_policy_links_max }, options.fix);
+    }
+    var target: [path_max]u8 = undefined;
+    const result = linux.readlinkat(linux.AT.FDCWD, link, &target, target.len);
+    if (linux.errno(result) != .SUCCESS) return unresolved(path, options, diag);
+    const length: usize = result;
+    if (length == 0 or length == target.len) return unresolved(path, options, diag);
+    const rest = w.pending[w.pending_start..w.pending_len];
+    const total = length + 1 + rest.len;
+    if (total > path_max) return unresolved(path, options, diag);
+    var next: [path_max]u8 = undefined;
+    @memcpy(next[0..length], target[0..length]);
+    next[length] = '/';
+    @memcpy(next[length + 1 ..][0..rest.len], rest);
+    @memcpy(w.pending[0..total], next[0..total]);
+    w.pending_start = 0;
+    w.pending_len = @intCast(total);
+    // An absolute target is walked from `/`; a relative one from the link's own directory.
+    if (target[0] == '/') w.resolved_len = 1;
+}
+
+fn check_directory(
+    directory: []const u8,
+    path: []const u8,
+    options: Options,
+    diag: *Diag,
+) Error!void {
+    assert(directory.len > 0);
+    assert(directory[0] == '/');
+    var buffer: [path_max:0]u8 = undefined;
+    const owner = owner_stat(linux.AT.FDCWD, terminated(&buffer, directory), //
+        linux.AT.SYMLINK_NOFOLLOW) orelse
+        return bad(diag, options, "can't read the owner of {s}, the directory of the " ++
+            "trust policy {s}", .{ directory, path }, options.fix);
+    const problem = directory_problem(owner, linux.geteuid()) orelse return;
+    return bad(diag, options, "the trust policy {s} is in {s}, which {s}{s} " ++
+        "(owner uid {d}, mode {o:0>4})", .{
+        path,
+        directory,
+        problem.text(),
+        if (problem == .foreign_owner) options.user else "",
+        owner.uid,
+        owner.mode & 0o7777,
+    }, directory_fix);
+}
+
+/// The file opened must be the one the walk judged: its descriptor names the walked path.
+fn check_same(
+    io: std.Io,
+    file: std.Io.File,
+    real: []const u8,
+    path: []const u8,
+    options: Options,
+    diag: *Diag,
+) Error!void {
+    var buffer: [path_max]u8 = undefined;
+    const length = file.realPath(io, &buffer) catch return unresolved(path, options, diag);
+    if (std.mem.eql(u8, buffer[0..length], real)) return;
+    return bad(diag, options, "the trust policy {s} changed while it was read: {s} was " ++
+        "judged, {s} was opened", .{ path, real, buffer[0..length] }, options.fix);
+}
+
+fn unresolved(path: []const u8, options: Options, diag: *Diag) Error {
+    return bad(diag, options, "can't resolve the trust policy {s}", .{path}, options.fix);
+}
+
+/// `text` with a terminating zero, in `buffer`.
+fn terminated(buffer: *[path_max:0]u8, text: []const u8) [:0]const u8 {
+    assert(text.len < path_max);
+    @memcpy(buffer[0..text.len], text);
+    buffer[text.len] = 0;
+    return buffer[0..text.len :0];
 }
 
 const directory_fix = "keep the policy in a directory that only root or the process's own " ++
@@ -129,14 +278,14 @@ const directory_fix = "keep the policy in a directory that only root or the proc
 /// file they do not own.
 pub fn directory_problem(owner: Owner, euid: u32) ?OwnerProblem {
     if (owner.uid != 0 and owner.uid != euid) return .foreign_owner;
-    if (owner.mode & 0o022 != 0 and owner.mode & std.os.linux.S.ISVTX == 0) return .writable;
+    if (owner.mode & 0o022 != 0 and owner.mode & linux.S.ISVTX == 0) return .writable;
     return null;
 }
 
 fn check_owner(owner_or_null: ?Owner, path: []const u8, options: Options, diag: *Diag) Error!void {
     const owner = owner_or_null orelse
         return bad(diag, options, "can't read the trust policy {s}", .{path}, options.fix);
-    const problem = owner_problem(owner, std.os.linux.geteuid()) orelse return;
+    const problem = owner_problem(owner, linux.geteuid()) orelse return;
     return bad(diag, options, "the trust policy {s} {s}{s} (owner uid {d}, mode {o:0>4})", .{
         path,
         problem.text(),
@@ -147,16 +296,10 @@ fn check_owner(owner_or_null: ?Owner, path: []const u8, options: Options, diag: 
 }
 
 fn owner_of(file: std.Io.File) ?Owner {
-    return owner_stat(file.handle, "", std.os.linux.AT.EMPTY_PATH);
+    return owner_stat(file.handle, "", linux.AT.EMPTY_PATH);
 }
 
-/// The owner of the file `path` names, following symbolic links as `openFile` does.
-fn owner_at(path: [:0]const u8) ?Owner {
-    return owner_stat(std.os.linux.AT.FDCWD, path, 0);
-}
-
-fn owner_stat(dir: std.os.linux.fd_t, path: [*:0]const u8, flags: u32) ?Owner {
-    const linux = std.os.linux;
+fn owner_stat(dir: linux.fd_t, path: [*:0]const u8, flags: u32) ?Owner {
     var stat = std.mem.zeroes(linux.Statx);
     const mask: linux.STATX = .{ .TYPE = true, .MODE = true, .UID = true };
     const result = linux.statx(dir, path, flags, mask, &stat);
@@ -183,7 +326,7 @@ pub const OwnerProblem = enum {
 
 /// Null when a file of this owner and mode may be used; otherwise what is wrong.
 pub fn owner_problem(owner: Owner, euid: u32) ?OwnerProblem {
-    if (owner.mode & std.os.linux.S.IFMT != std.os.linux.S.IFREG) return .not_regular;
+    if (owner.mode & linux.S.IFMT != linux.S.IFREG) return .not_regular;
     if (owner.uid != 0 and owner.uid != euid) return .foreign_owner;
     if (owner.mode & 0o022 != 0) return .writable;
     return null;
@@ -242,7 +385,7 @@ const test_options: Options = .{
 test "a policy file is used only when root or the process's own user alone can write it" {
     // Goal: Zigbox's rule for its system policy, for both callers. Method: each owner and mode.
     const euid: u32 = 1000;
-    const regular: u32 = std.os.linux.S.IFREG;
+    const regular: u32 = linux.S.IFREG;
     try testing.expect(owner_problem(.{ .uid = 0, .mode = regular | 0o644 }, euid) == null);
     try testing.expect(owner_problem(.{ .uid = euid, .mode = regular | 0o600 }, euid) == null);
     try testing.expect(owner_problem(.{ .uid = 0, .mode = regular | 0o4755 }, euid) == null);
@@ -250,7 +393,7 @@ test "a policy file is used only when root or the process's own user alone can w
         .{ .{ .uid = 1001, .mode = regular | 0o644 }, .foreign_owner },
         .{ .{ .uid = 0, .mode = regular | 0o664 }, .writable },
         .{ .{ .uid = euid, .mode = regular | 0o646 }, .writable },
-        .{ .{ .uid = 0, .mode = std.os.linux.S.IFDIR | 0o755 }, .not_regular },
+        .{ .{ .uid = 0, .mode = linux.S.IFDIR | 0o755 }, .not_regular },
     };
     for (refused) |case| try testing.expectEqual(case[1], owner_problem(case[0], euid).?);
 }
@@ -270,13 +413,9 @@ test "a refusal raises the caller's code and names its setting" {
     try testing.expect(std.mem.indexOf(u8, cause, "--trust-policy") != null);
     diag.reset();
     // A FIFO is refused without being opened, which would block until a writer came.
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var fifo_buffer: [128]u8 = undefined;
-    const fifo = try std.fmt.bufPrintSentinel(&fifo_buffer, ".zig-cache/tmp/{s}/trust.zon", .{
-        tmp.sub_path,
-    }, 0);
-    const linux = std.os.linux;
+    const base = try test_directory(arena);
+    defer std.Io.Dir.cwd().deleteTree(testing.io, base) catch {}; // Best effort: it is in /tmp.
+    const fifo = try std.fmt.allocPrintSentinel(arena, "{s}/trust.zon", .{base}, 0);
     const made = linux.mknodat(linux.AT.FDCWD, fifo, linux.S.IFIFO | 0o600, 0);
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(made));
     try testing.expectError(error.BadConfig, read(arena, testing.io, fifo, test_options, &diag));
@@ -294,7 +433,7 @@ test "a policy file's directories must be ones only root or the process's own us
     // Method: the rule on owners and modes; then a real policy read in its directory at 0755,
     // refused at 0775 and 0757 (the cause names the directory and its mode), and read at 1777.
     const euid: u32 = 1000;
-    const directory: u32 = std.os.linux.S.IFDIR;
+    const directory: u32 = linux.S.IFDIR;
     try testing.expect(directory_problem(.{ .uid = 0, .mode = directory | 0o755 }, euid) == null);
     const own: Owner = .{ .uid = euid, .mode = directory | 0o700 };
     try testing.expect(directory_problem(own, euid) == null);
@@ -311,20 +450,10 @@ test "a policy file's directories must be ones only root or the process's own us
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDir(io, "policy", .default_dir);
-    const public = zigbox.trust.key.public_text(zigbox.trust.key.public_of_seed(@splat(7)));
-    const good = try std.fmt.allocPrint(arena, ".{{ .version = 1, .keys = .{{ .{{ " ++
-        ".name = \"botpike\", .public = \"{s}\" }} }}, .require_signature = true }}", .{&public});
-    try tmp.dir.writeFile(io, .{ .sub_path = "policy/trust.zon", .data = good });
-    const file = try tmp.dir.openFile(io, "policy/trust.zon", .{ .mode = .read_write });
-    defer file.close(io);
-    try file.setPermissions(io, .fromMode(0o644));
-    const held = try std.fmt.allocPrintSentinel(arena, ".zig-cache/tmp/{s}/policy", .{
-        tmp.sub_path,
-    }, 0);
-    const path = try std.fmt.allocPrint(arena, "{s}/trust.zon", .{held});
+    const base = try test_directory(arena);
+    defer std.Io.Dir.cwd().deleteTree(io, base) catch {}; // Best effort: it is in /tmp.
+    const held = try test_subdirectory(arena, base, "policy");
+    const path = try write_test_policy(arena, held);
     var diag: Diag = undefined;
     for ([_]u32{ 0o755, 0o1777 }) |mode| {
         try chmod_directory(held, mode);
@@ -342,7 +471,93 @@ test "a policy file's directories must be ones only root or the process's own us
     try chmod_directory(held, 0o755);
 }
 
+test "a symbolic link to a policy is judged in its own directory and along its target's" {
+    // Goal: PR #10's review (MUST): a link to a good root-owned file, put in a directory others
+    // may write, must not pass, since whoever put it there can point it anywhere. Method: a good
+    // policy in `good` (0755); links to it, absolute and relative, in `links`, and a link to the
+    // `good` directory itself; each read with `links` at 0755, each refused at 0775 naming
+    // `links`; then refused through the links with `good` at 0775, naming `good`.
+    const io = testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const base = try test_directory(arena);
+    defer std.Io.Dir.cwd().deleteTree(io, base) catch {}; // Best effort: it is in /tmp.
+    const good = try test_subdirectory(arena, base, "good");
+    const target = try write_test_policy(arena, good);
+    const links = try test_subdirectory(arena, base, "links");
+    const absolute = try std.fmt.allocPrintSentinel(arena, "{s}/absolute.zon", .{links}, 0);
+    const relative = try std.fmt.allocPrintSentinel(arena, "{s}/relative.zon", .{links}, 0);
+    const directory = try std.fmt.allocPrintSentinel(arena, "{s}/dir", .{links}, 0);
+    const pairs = [_]struct { [:0]const u8, [:0]const u8 }{
+        .{ try arena.dupeSentinel(u8, target, 0), absolute },
+        .{ "../good/trust.zon", relative },
+        .{ "../good", directory },
+    };
+    for (pairs) |pair| {
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.symlink(pair[0], pair[1])));
+    }
+    const through_directory = try std.fmt.allocPrint(arena, "{s}/trust.zon", .{directory});
+    const paths = [_][]const u8{ absolute, relative, through_directory };
+    var diag: Diag = undefined;
+    for (paths) |path| {
+        diag.reset();
+        const loaded = try read(arena, io, path, test_options, &diag);
+        try testing.expectEqualStrings(path, loaded.path);
+    }
+    const cases = [_]struct { [:0]const u8, []const u8 }{
+        .{ links, "/links, which can be written" },
+        .{ good, "/good, which can be written" },
+    };
+    for (cases) |case| {
+        try chmod_directory(case[0], 0o775);
+        for (paths) |path| {
+            diag.reset();
+            try testing.expectError(error.BadConfig, read(arena, io, path, test_options, &diag));
+            const cause = diag.causes.slice()[0].slice();
+            try testing.expect(std.mem.indexOf(u8, cause, case[1]) != null);
+        }
+        try chmod_directory(case[0], 0o755);
+    }
+}
+
+/// A fresh directory for a test's policies, `/tmp/zcube-trust-<random>`, mode 0700 whatever the
+/// umask: `/tmp` (root's, sticky) and `/` pass the directory rule, so a policy in it is judged by
+/// its own owner and mode, never by the checkout's. The caller deletes it.
+pub fn test_directory(arena: Allocator) ![:0]const u8 {
+    var random: [8]u8 = undefined;
+    const got = linux.getrandom(&random, random.len, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(got));
+    try testing.expectEqual(random.len, got);
+    const name = std.mem.readInt(u64, &random, .little);
+    const path = try std.fmt.allocPrintSentinel(arena, "/tmp/zcube-trust-{x:0>16}", .{name}, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mkdir(path, 0o700)));
+    try chmod_directory(path, 0o700);
+    return path;
+}
+
+/// `parent/name`, made a directory of mode 0755 whatever the umask.
+fn test_subdirectory(arena: Allocator, parent: []const u8, name: []const u8) ![:0]const u8 {
+    const path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ parent, name }, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mkdir(path, 0o755)));
+    try chmod_directory(path, 0o755);
+    return path;
+}
+
+/// Writes a good policy, mode 0644, as `directory/trust.zon`, and returns its path.
+fn write_test_policy(arena: Allocator, directory: []const u8) ![]const u8 {
+    const io = testing.io;
+    const public = zigbox.trust.key.public_text(zigbox.trust.key.public_of_seed(@splat(7)));
+    const good = try std.fmt.allocPrint(arena, ".{{ .version = 1, .keys = .{{ .{{ " ++
+        ".name = \"botpike\", .public = \"{s}\" }} }}, .require_signature = true }}", .{&public});
+    const path = try std.fmt.allocPrint(arena, "{s}/trust.zon", .{directory});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = good });
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer file.close(io);
+    try file.setPermissions(io, .fromMode(0o644));
+    return path;
+}
+
 fn chmod_directory(path: [:0]const u8, mode: u32) !void {
-    const linux = std.os.linux;
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.chmod(path, mode)));
 }

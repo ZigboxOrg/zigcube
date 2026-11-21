@@ -1449,14 +1449,17 @@ test "a trust policy others can rewrite is ZC-E0106; one only root or the server
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
+    // The policy sits in a directory of mode 0700 under /tmp, so the umask cannot refuse it.
+    const base = try trust_file.test_directory(arena);
+    defer std.Io.Dir.cwd().deleteTree(io, base) catch {}; // Best effort: it is in /tmp.
+    var tmp = try std.Io.Dir.cwd().openDir(io, base, .{});
+    defer tmp.close(io);
     const public = zigbox.trust.key.public_text(zigbox.trust.key.public_of_seed(@splat(7)));
     const good = try std.fmt.allocPrint(arena, ".{{ .version = 1, .keys = .{{ .{{ " ++
         ".name = \"botpike\", .public = \"{s}\" }} }}, .require_signature = true }}", .{&public});
-    try tmp.dir.writeFile(io, .{ .sub_path = "trust.zon", .data = good });
-    const path = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/trust.zon", .{tmp.sub_path});
-    const file = try tmp.dir.openFile(io, "trust.zon", .{ .mode = .read_write });
+    try tmp.writeFile(io, .{ .sub_path = "trust.zon", .data = good });
+    const path = try std.fmt.allocPrint(arena, "{s}/trust.zon", .{base});
+    const file = try tmp.openFile(io, "trust.zon", .{ .mode = .read_write });
     defer file.close(io);
     var diag: Diag = undefined;
     diag.reset();
@@ -1471,8 +1474,8 @@ test "a trust policy others can rewrite is ZC-E0106; one only root or the server
         try testing.expect(std.mem.indexOf(u8, cause, "written by its group or by others") != null);
         try testing.expect(std.mem.indexOf(u8, cause, "trust.zon") != null);
     }
-    try tmp.dir.createDir(io, "dir.zon", .default_dir);
-    const dir_path = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/dir.zon", .{tmp.sub_path});
+    try tmp.createDir(io, "dir.zon", .default_dir);
+    const dir_path = try std.fmt.allocPrint(arena, "{s}/dir.zon", .{base});
     diag.reset();
     try expect_bad(read_policy(arena, io, dir_path, &diag), &diag);
 }
