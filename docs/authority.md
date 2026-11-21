@@ -82,6 +82,9 @@ the layout.
 | `/observed/<node>/<id>` | that node's agent, through the agent endpoint | process facts (class 2, projected) | until the agent or the node controller removes it |
 | `/decisions/<id>`, `/decisions-by-subject/…` | whoever acts, in the same transaction as the action | one action and its cause; **immutable** | retention (§5) |
 | `/decision-summaries/<kind>/<name>/<action>/<cause-kind>` | the actor of the decisions it counts, in the same transaction | a projection over immutable decisions: count, first and last time, the newest decision's id | with its subject |
+| `/edge-certs/<host>` | ACME shell (the server, C5 slice 3b); `zcube-server --discard-sealed` may delete | C5: a public host's certificate, dates and state, its private key sealed in the member `key` (docs/sealing.md) | until the host is removed, or the discard |
+| `/acme-account/<directory-hash>` | ACME shell (the server, C5 slice 3b); `--discard-sealed` may delete | C5: the ACME account for one directory, its key sealed in the member `key` | until the discard |
+| `/acme-orders/…` | ACME shell (the server, C5 slice 3b); `--discard-sealed` may delete | C5: an order in flight, clear | until it ends, or the discard |
 
 A seventh role, `retention`, deletes expired decisions (§5). It may write only `/decisions/`,
 `/decisions-by-subject/` and `/decision-summaries/`, which every role may write, and delete (never
