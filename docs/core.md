@@ -729,7 +729,23 @@ than `replicas + max_surge` once a replica is created, in every phase of a rollo
 failed too), R3 (every replica created runs a
 generation in the service's history), R4 (a paused rollout starts and retires nothing; a scale
 down the user asked for is exempt, counted as the replica controller counts it: held replicas and
-replicas on a node not yet lost count, `docs/decisions/2026-11-14-c3-paused-scale-down.md`) and R6 (a history record never changes under its generation).
+replicas on a node not yet lost count, `docs/decisions/2026-11-14-c3-paused-scale-down.md`; and
+no replica of an earlier incarnation of its service, one whose key is older than the service's
+key, is ever replaced: it is removed, alone, and a transaction that removes one and creates a
+replica of the service fails R4, `docs/decisions/2026-11-22-replicas-of-a-deleted-incarnation.md`)
+and R6 (a history record never changes under its generation).
+
+R4 and a paused rollout's scale-up. A paused (or failed) rollout's replicas removed while the
+surge left no room to replace them are made up later by a `scale_up`, which is repair, not a
+start, while it brings the service no higher than `replicas`. That scale-up runs an older
+generation, chosen by role: the rollout's `from` as a stale replica runs it, else as `/history`
+holds it (this incarnation's record), else the newest older stale replica. Behaviour change
+(issue #16, accepted by the supervisor on 2026-11-22: "It keeps the count and R2/P1 without
+advancing a paused rollout"): a paused service's scale-up now creates replicas at the older
+generation, not at the paused new one. R4 accepts a scale-up at the new generation only when no
+replica of an older spec is left and the history of this incarnation has no record of the
+rollout's `from` (a first generation, or its record trimmed); the report counts those as
+`first=`, and the incarnation removals as `foreign=`.
 Slice 8 adds R5, R7 and R8. R5: a history record with `restores` copies the spec (image,
 source, command, env, limits, health) of the generation it names, which must be in the history;
 and a rollout of reason `rollback` that completes leaves no live replica (not stopped, not on a
@@ -750,7 +766,7 @@ it in `rollout_controller.Track`.
 
 With `--c3` the world also pauses and resumes rollouts (`rollout_prng`, a stream of its own, so a
 run without `--c3` draws as before), and resumes any paused rollout at the heal. The report adds
-`sim-c3 R1 retirements=.. doubted=.. R2 surges=.. R3 versions=.. R4 paused=.. R5 rollbacks=..
+`sim-c3 R1 retirements=.. doubted=.. R2 surges=.. R3 versions=.. R4 paused=.. first=.. foreign=.. R5 rollbacks=..
 completed=.. R6 history=.. R7 settled=.. R8 auto=..; pauses=.. resumes=..` (`doubted` counts the replicas R1 gave that benefit; the simulator's controllers
 read and commit with nothing between, so it is 0 there, and the unit tests in
 `src/rollout_controller_test.zig` write between the read and the commit instead). The race the
@@ -768,7 +784,15 @@ a progressing budget while a rollout is paused or failed: R4) and
 R6), and slice 8's `rollout_exact` (a rollback keeps the current image: R5), `rollout_race` (the
 controller remembers an owed rollback and carries it out a pass later on the service as it is
 then, without comparing the service revision its pass read: R8) and `rollout_stuck` (the
-controller never carries out an owed rollback: R7). They are not yet in the canary manifest: the fleet has no `sim-c3` kind.
+controller never carries out an owed rollback: R7), and issue #16's `rollout_incarnation` (the
+replica and rollout controllers take a replica of an earlier incarnation for the service's, as
+before the fix: R4, "a replica of an earlier incarnation") and `rollout_template` (a halted rollout's
+scale-up finds no `/history` record of its `from`, so with no old replica left it starts the
+paused generation: R4, "a paused rollout started a replica of the new generation"). Those two
+are sparse and run drawn worlds (`auto`, `auto_shape` in `c1_teeth_roots`): `rollout_incarnation`
+seeds 127 and 160, `rollout_template` seeds 1 to 11 (caught at 11) and 12. C4's mesh, which `auto`
+turns on, changed those worlds: before it the seeds were 357 and 19, and 4 and 12. They are not yet
+in the canary manifest: the fleet has no `sim-c3` kind.
 
 ## sim-c4: services that connect (C4 slice 5)
 

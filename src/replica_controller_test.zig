@@ -504,8 +504,10 @@ test "a service deleted and applied again between two steps loses its old replic
 
 test "a service applied again with the same generation and another image loses its replicas" {
     // Goal: the second way to be wrong in issue 55, alone: the old replicas are equal in
-    // generation (1) to the new service and differ only in image, so only the spec comparison
-    // finds them. Method: apply, settle, delete and apply another image with no step between.
+    // generation (1) to the new service and differ only in image. Since issue 16 their keys,
+    // older than the service's, say they are not its replicas: they are removed, and the count
+    // is made up at the new spec. Method: apply, settle, delete and apply another image with no
+    // step between.
     var fixture: Fixture = undefined;
     try fixture.start();
     defer fixture.stop();
@@ -525,12 +527,56 @@ test "a service applied again with the same generation and another image loses i
     defer Fixture.free_ids(last);
     try expect_ids(&.{ "hello-3", "hello-4" }, last);
     try fixture.expect_replica_image("hello-3", second.image);
-    const reason = try fixture.reason_of(.service, "hello", "replace_replica");
-    // The rollout's budget (one surge replica, none unavailable) starts one new replica and
-    // retires one old one per step (C3 slice 7).
-    const expected = "service hello is at generation 1 and 2 replicas do not run what it asks " ++
-        "for; replacing hello-1";
+    const reason = try fixture.reason_of(.service, "hello", "scale_down");
+    const expected = "service hello was deleted and applied again; stopping hello-1, hello-2, " ++
+        "which belong to its earlier incarnation";
     try testing.expectEqualStrings(expected, reason);
+    const made_up = try fixture.reason_of(.service, "hello", "scale_up");
+    try testing.expectEqualStrings("service hello wants 2 replicas and 0 exist", made_up);
+}
+
+test "a replica of a deleted incarnation is removed, never replaced nor copied (issue 16)" {
+    // Goal: a replica whose key is older than its service's key (`create_revision`) belongs to
+    // the service as it was before it was deleted and applied again. It is removed, as the
+    // deletion's own pass would have removed it, and never replaced one for one nor counted
+    // (zigcube#16: one on a lost node was replaced at the new spec while the new incarnation's
+    // rollout was paused). Method: the old replicas are equal in generation (1) to the new service
+    // and run another image; one of them stopped, so it is dead too: before the fix it was
+    // replaced one for one and the running one was rolled out.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.register_node("node1");
+    var first = hello;
+    first.replicas = 2;
+    try fixture.apply(first);
+    _ = try fixture.settle();
+    try fixture.observe("hello-1", .running, null, null);
+    try fixture.observe("hello-2", .stopped, .{ .kind = .exited, .code = 1 }, null);
+    const ctx = fixture.context();
+    const gone = try apply_mod.delete_service(&ctx, &fixture.api, "hello", "alex", "r-00000016");
+    try testing.expect(gone == .written);
+    var second = first;
+    second.image = "b3:9d20c4f1";
+    try fixture.apply(second);
+    _ = try fixture.settle();
+    const last = try fixture.ids("hello");
+    defer Fixture.free_ids(last);
+    try expect_ids(&.{ "hello-3", "hello-4" }, last);
+    try fixture.expect_replica_image("hello-3", second.image);
+    try fixture.expect_replica_image("hello-4", second.image);
+    // Removed with the deletion's own action, then the count made up by a scale-up.
+    try testing.expectError(
+        error.NoSuchDecision,
+        fixture.reason_of(.service, "hello", "replace_replica"),
+    );
+    const removed = try fixture.reason_of(.service, "hello", "scale_down");
+    const expected = "service hello was deleted and applied again; stopping hello-1, hello-2, " ++
+        "which belong to its earlier incarnation";
+    try testing.expectEqualStrings(expected, removed);
+    const why = try fixture.reason_of(.replica, "hello-2", "stop_replica");
+    try testing.expectEqualStrings("stopping hello-2: it belongs to service hello as it was " ++
+        "before it was deleted and applied again", why);
 }
 
 test "a rolled service says its replicas run an older generation" {

@@ -23,10 +23,15 @@
 //!     nor replaced; a new `generation` of the service replaces it;
 //!   - a replica behind its service's `generation`, or whose image, source, command, env or
 //!     limits are not the service's: replaced (a change of the replica count alone does not bump
-//!     `generation`, so scaling never replaces what runs; the spec is compared as well because a
-//!     service deleted and applied again between two steps restarts at generation 1);
+//!     `generation`, so scaling never replaces what runs; a replica of an earlier incarnation
+//!     of the service, whatever its generation, is removed instead, below);
 //!   - replicas of a service that no longer exists: `scale_down` on the (gone) service and
 //!     `stop_replica` for each;
+//!   - replicas of an earlier incarnation of the service (their key is older than the service's
+//!     key: it was deleted and applied again before they were stopped): `scale_down` on the
+//!     service and `stop_replica` for each, before anything else is done for it. They are never
+//!     counted toward `replicas`, replaced nor copied (issue #16; the job rule of
+//!     docs/decisions/2026-11-18-job-incarnation.md);
 //!
 //! A transaction touches at most `batch_replicas_max` replicas, so a big change takes several
 //! steps; each leaves the system in a state the next step can continue from.
@@ -169,7 +174,8 @@ pub const ReplicaController = struct {
 
 // ---- One step --------------------------------------------------------------------------------
 
-const Class = enum { live, held, dead, stale };
+/// `foreign`: a replica of an earlier incarnation of its service (`earlier_incarnation`).
+const Class = enum { live, held, dead, stale, foreign };
 
 const Item = struct {
     replica: *const Entry(records.Replica),
@@ -193,6 +199,8 @@ const ServicePlan = struct {
     held: u32 = 0,
     dead: u32 = 0,
     stale: u32 = 0,
+    /// Replicas of an earlier incarnation of the service: removed before anything else.
+    foreign: u32 = 0,
     /// Of `held`, stale replicas a halted rollout holds (`hold_stale`): the rollout has not
     /// finished with them, so the surge it paused at is kept as for `stale` ones.
     held_stale: u32 = 0,
@@ -280,6 +288,9 @@ const Run = struct {
         if (try run.seed_counter(service)) return;
         var plan: ServicePlan = .{};
         try run.classify(service, &plan);
+        // Replicas of an earlier incarnation go first, and nothing else is done for the service
+        // until they are gone: every count below is of this incarnation's replicas.
+        if (plan.foreign > 0) return run.remove_foreign(service, &plan);
         // A rollout record that does not decode halts this service only (ZC-E0301 is the rollout
         // pass's to report): every write of its replicas rests on what the rollout allows.
         const roll_read = try run.roll_of(service, &plan);
@@ -324,8 +335,15 @@ const Run = struct {
                 .running = false,
                 .number = number,
             };
-            item.class = classify_one(&replica.rec, &service.rec, observed);
             item.live = rollout_controller.live_report(run.snap, &replica.rec);
+            if (earlier_incarnation(replica, service)) {
+                // Its container may still run: `item.live` keeps it in the surge bound (R2).
+                item.class = .foreign;
+                plan.items[plan.count] = item;
+                plan.count += 1;
+                continue;
+            }
+            item.class = classify_one(&replica.rec, &service.rec, observed);
             // A stale replica is refused too: a halted rollout (failed or paused) keeps its stale
             // replicas, and one on a node registered exclusive would stay there for good (P1).
             if (item.class != .dead) {
@@ -346,6 +364,7 @@ const Run = struct {
             .held => plan.held += 1,
             .dead => plan.dead += 1,
             .stale => plan.stale += 1,
+            .foreign => plan.foreign += 1,
         };
     }
 
@@ -479,6 +498,7 @@ const Run = struct {
         plan: *const ServicePlan,
         roll: *const Roll,
     ) Error!void {
+        assert(plan.foreign == 0);
         const keep = plan.live + plan.held;
         const wanted = service.rec.replicas;
         const missing = if (wanted > keep) wanted - keep else 0;
@@ -612,7 +632,7 @@ const Run = struct {
             // until its removal is committed and its node stops it (then `stopping_orphans`
             // counts it), so its replacement waits for room as any other creation does.
             if (item.live) live += 1;
-            if (item.class == .dead or item.class == .held) continue;
+            if (item.class != .live and item.class != .stale) continue;
             if (item.running and item.lost == null) roll.up += 1;
         }
         roll.live = live;
@@ -653,6 +673,7 @@ const Run = struct {
         plan: *const ServicePlan,
         roll: *const Roll,
     ) Error!void {
+        assert(plan.foreign == 0);
         const rollout = roll.rollout orelse return;
         if (!roll.starts) return;
         if (service.kv.mod_revision > rollout.rec.budget_revision) return;
@@ -718,7 +739,7 @@ const Run = struct {
         var left = service.rec.replicas -| roll.policy.max_unavailable;
         for (plan.slice()) |*item| {
             if (left == 0) return;
-            if (item.class == .dead or item.class == .held) continue;
+            if (item.class != .live and item.class != .stale) continue;
             if (!item.running or item.lost != null) continue;
             if (std.mem.indexOfScalar(*const Item, retired, item) != null) continue;
             const observed = item.observed orelse continue;
@@ -781,13 +802,24 @@ const Run = struct {
         const rolling = roll.policy.strategy == .rolling;
         var up = roll.up;
         var count: u32 = 0;
-        // The cheapest first: not live, then live and not running, then running.
-        for ([_]u8{ 0, 1, 2 }) |cost| {
+        // The cheapest first: not live, then live and not running, then running with its health
+        // `unknown`, then running and healthy. A running `unknown` one counts toward
+        // `budget.retire` without being known healthy (`running_healthy`): retired before a
+        // healthy one, it spends the budget its own count gave, and the healthy replicas the
+        // floor rests on stay (R1, demo-c3 step 4d on fabd921e).
+        for ([_]u8{ 0, 1, 2, 3 }) |cost| {
             for (plan.slice()) |*item| {
                 if (count == out.len) return count;
                 if (item.class != .stale) continue;
                 const running = item.running and item.lost == null;
-                const item_cost: u8 = if (!item.live) 0 else if (!running) 1 else 2;
+                const item_cost: u8 = if (!item.live)
+                    0
+                else if (!running)
+                    1
+                else if (health_unknown(item))
+                    2
+                else
+                    3;
                 if (item_cost != cost) continue;
                 if (c1_teeth.rollout_budget) {
                     out[count] = item;
@@ -795,7 +827,7 @@ const Run = struct {
                     continue;
                 }
                 if (cost == 1 and unready_left == 0) continue;
-                if (cost == 2) {
+                if (cost >= 2) {
                     if (ready_left == 0) continue;
                     if (rolling and up -| 1 < ready_min) continue;
                     up -|= 1;
@@ -1200,10 +1232,14 @@ const Run = struct {
     /// being retired are observed stopped (R2). While its rollout is halted (paused or failed),
     /// they run an older generation: a paused rollout starts nothing of its new generation (R4),
     /// and this is the repair of replicas removed while the surge left no room to replace them;
-    /// a failed rollout creates nothing of the failed one. The template is the newest older
-    /// generation a stale replica runs, else, with every old replica gone, the rollout's `from`
-    /// as `/history` holds it (`history_template`). Only when neither is left (a first
-    /// generation, or its history trimmed) does the count win, at the service's generation:
+    /// a failed rollout creates nothing of the failed one. The template is chosen by role, never
+    /// by generation number alone: the rollout's `from` generation, as a stale replica runs it
+    /// (the lowest number), else as `/history` holds it (`history_template`). A rollback's
+    /// rollout has the failed release among its stale replicas at a generation above `from`, and
+    /// copying the newest older one would start the release being rolled back from. Only with no
+    /// `from` to copy (a rollout from no earlier generation, or its record trimmed) is the newest
+    /// older stale replica copied (`newest_older`), and only when that is gone too (a first
+    /// generation) does the count win, at the service's generation:
     /// leaving the service short fails the halted convergence checks (sim_c0's
     /// `halted_converged`, sim_cluster's convergence step). The supervisor's decision, in
     /// docs/decisions/2026-11-21-c3-stale-replica-on-exclusive-node.md.
@@ -1217,6 +1253,7 @@ const Run = struct {
         const wanted = service.rec.replicas;
         assert(keep < wanted);
         assert(plan.dead == 0);
+        assert(plan.foreign == 0);
         const creations = @min(@min(batch_replicas_max, wanted - keep), roll.room);
         if (creations == 0) return;
         if (!run.budget()) return;
@@ -1224,8 +1261,9 @@ const Run = struct {
         var read: ?history.Stored = null;
         var template: ?*const records.Replica = null;
         if (roll.failed or roll.paused) {
-            template = newest_older(plan, service) orelse
-                try run.history_template(service, roll, &stored, &read);
+            template = from_replica(plan, roll) orelse
+                try run.history_template(service, roll, &stored, &read) orelse
+                newest_older(plan, service);
         }
         var batch: Batch = .{};
         batch.expect(service.kv.key, service.kv.mod_revision);
@@ -1258,6 +1296,8 @@ const Run = struct {
         out: *records.Replica,
         read: *?history.Stored,
     ) Error!?*const records.Replica {
+        // Test-only fault (sim-c3-teeth-template): the record is never found.
+        if (c1_teeth.rollout_template) return null;
         const rollout = roll.rollout orelse return null;
         const from = rollout.rec.from;
         if (from == 0 or from >= service.rec.generation) return null;
@@ -1295,6 +1335,57 @@ const Run = struct {
 
     // ---- Removing ----
 
+    /// Stops up to a batch of the service's replicas of an earlier incarnation (`foreign`): the
+    /// service was deleted and applied again before the orphan pass removed them. They are not
+    /// this service's to count, replace or copy, whatever they run (issue #16): a dead one
+    /// replaced here would come back at its old spec, and a held one would hold the new
+    /// incarnation. The removal rests on the service and each replica as read (a delete never
+    /// breaks R1 to R4: they bound the incarnation's own replicas).
+    fn remove_foreign(
+        run: *Run,
+        service: *const ServiceEntry,
+        plan: *const ServicePlan,
+    ) Error!void {
+        assert(plan.foreign > 0);
+        var victims: [batch_replicas_max]*const Item = undefined;
+        var count: u32 = 0;
+        for (plan.slice()) |*item| {
+            if (item.class != .foreign) continue;
+            if (count == batch_replicas_max) break;
+            victims[count] = item;
+            count += 1;
+        }
+        assert(count > 0);
+        if (!run.budget()) return;
+        var batch: Batch = .{};
+        batch.expect(service.kv.key, service.kv.mod_revision);
+        var names: std.ArrayList(u8) = .empty;
+        for (victims[0..count], 0..) |item, index| {
+            if (index > 0) names.appendSlice(run.ctx.arena, ", ") catch return nomem(run.ctx);
+            names.appendSlice(run.ctx.arena, item.replica.rec.id) catch return nomem(run.ctx);
+        }
+        const reason = try controller.format(run.ctx, "service {s} was deleted and applied " ++
+            "again; stopping {s}, which belong to its earlier incarnation", .{
+            service.rec.name, names.items,
+        });
+        const decision = try controller.put_decision(run.ctx, &run.rc.source, .{
+            .actor = actor,
+            .action = "scale_down",
+            .subject = .{ .kind = .service, .name = service.rec.name },
+            .reason = reason,
+            .cause = desired_cause(service),
+            .cause_evidence = try evidence.service(run.ctx, &service.rec),
+        }, &batch);
+        for (victims[0..count]) |item| {
+            const why = try controller.format(run.ctx, "stopping {s}: it belongs to service {s} " ++
+                "as it was before it was deleted and applied again", .{
+                item.replica.rec.id, service.rec.name,
+            });
+            try run.stop_replica(&batch, item.replica, why, &decision);
+        }
+        _ = try run.finish(&batch);
+    }
+
     /// Removes replicas until `wanted` are left: the service's count, or up to `max_surge` more
     /// while its rollout is halted.
     fn scale_down(
@@ -1305,6 +1396,7 @@ const Run = struct {
         wanted: u32,
     ) Error!void {
         assert(wanted >= service.rec.replicas);
+        assert(plan.foreign == 0);
         const keep = plan.live + plan.held + plan.stale;
         assert(keep > wanted);
         var victims: [constants.replicas_per_service_max]Item = undefined;
@@ -1413,7 +1505,8 @@ pub fn admissible_in(
 /// (old) replica whose health is `unknown` counts as running: an agent restart reports every
 /// replica `unknown` until it probes again, and that must not make old replicas free to retire
 /// (docs/decisions/2026-11-15-c3-rollout-health-gate.md). Counting it running is the cautious
-/// side here: it is retired only within `budget.retire` and above the floor. The rollout
+/// side here: it is retired only within `budget.retire` and above the floor, and before any
+/// healthy stale replica (`choose_retired`), so the budget it adds is spent on it. The rollout
 /// controller's `update` counts an old `unknown` replica running too, even one never healthy, so
 /// the two agree and a rollback over checks that never settle still ends.
 fn running_healthy(
@@ -1429,6 +1522,14 @@ fn running_healthy(
         .unknown => stale,
         .unhealthy => false,
     };
+}
+
+/// Whether a running item has a health check whose report says `unknown`: an agent restart's,
+/// or a replica never probed healthy (`running_healthy` counts either running when stale).
+fn health_unknown(item: *const Item) bool {
+    if (item.replica.rec.health == null) return false;
+    const observed = item.observed orelse return false;
+    return records.observed_health(&observed.rec) == .unknown;
 }
 
 fn by_number(context: void, first: Item, second: Item) bool {
@@ -1494,14 +1595,27 @@ fn hold_stale(run: *Run, plan: *ServicePlan, roll: *const Roll) void {
     }
 }
 
+/// Whether `replica` belongs to an earlier incarnation of `service`: its key is older than the
+/// service's key. The controller creates a replica only in a transaction that compares the
+/// service's revision, so every replica of the current incarnation was created after it; one
+/// created before was left by a service of the same name that was deleted and applied again
+/// before the orphan pass stopped it (issue #16). As the job rule
+/// (docs/decisions/2026-11-18-job-incarnation.md), it is never this service's.
+pub fn earlier_incarnation(replica: *const ReplicaEntry, service: *const ServiceEntry) bool {
+    // Test-only fault (sim-c3-teeth-incarnation): the replica and rollout controllers take
+    // every replica of the name for the service's, as before issue #16's fix.
+    if (c1_teeth.rollout_incarnation) return false;
+    return replica.kv.create_revision < service.kv.create_revision;
+}
+
 fn classify_one(
     replica: *const records.Replica,
     service: *const records.Service,
     observed: ?*const Entry(records.Observed),
 ) Class {
-    // A service deleted and applied again between two steps starts over at generation 1, so a
-    // replica of the old one can be ahead of the new service or equal to it (docs/keys.md): only
-    // what it runs says whether it is current.
+    // A replica of an earlier incarnation never gets here (`earlier_incarnation`); what it runs
+    // is compared as well as its generation, so one that does not run what the service asks
+    // for is never taken for current (docs/keys.md).
     const current = replica.generation >= service.generation and
         records.replica_runs_service(replica, service);
     const stopped = if (observed) |found| found.rec.status == .stopped else false;
@@ -1565,8 +1679,24 @@ fn stale_behind(plan: *const ServicePlan, service: *const Entry(records.Service)
     return behind;
 }
 
+/// The stale replica of the halted rollout's `from` generation with the lowest number, the first
+/// template of its scale-up (`Run.scale_up`); null if the rollout names none or none is left.
+fn from_replica(plan: *const ServicePlan, roll: *const Roll) ?*const records.Replica {
+    const rollout = roll.rollout orelse return null;
+    const from = rollout.rec.from;
+    // `roll_of` takes only a rollout to the service's generation: `to` is it.
+    if (from == 0 or from >= rollout.rec.to) return null;
+    for (plan.slice()) |*item| {
+        if (item.class != .stale) continue;
+        // The plan is sorted by number: the first one found is the lowest.
+        if (item.replica.rec.generation == from) return &item.replica.rec;
+    }
+    return null;
+}
+
 /// The stale replica of the newest generation older than the service's (the lowest number among
-/// equals), the template of a halted rollout's scale-up; null if there is none.
+/// equals), the template of a halted rollout's scale-up when it has no `from` to copy; null if
+/// there is none.
 fn newest_older(
     plan: *const ServicePlan,
     service: *const Entry(records.Service),

@@ -903,6 +903,44 @@ test "a never-healthy replica of a failed rollout whose checks never settle is r
     try testing.expectEqual(records.RolloutPhase.complete, (try fixture.rollout()).phase);
 }
 
+test "an apply over a rollout retires its never-healthy replica before a healthy old one (R1)" {
+    // Goal: demo-c3 step 4d on PR #18 (fabd921e): an apply during a rollback retired a healthy
+    // replica while the rollback's surge replica, still `unknown` (never probed healthy), became
+    // old. Both controllers count a running stale `unknown` replica running (health gate
+    // decision), so the rollout controller counts it ready after `min_ready_ms` and allows one
+    // retirement; the replica controller retired the lowest-numbered running stale replica, a
+    // healthy one, and left two of three healthy under `max_unavailable` 0 (R1, the witness
+    // counts healthy replicas). Method: generation 1 healthy; generation 2 starts its surge
+    // replica, reported `unknown`; generation 3 is applied before it is healthy; after
+    // `min_ready_ms` the retirement must take the `unknown` replica and keep the three healthy.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    var checked = web;
+    checked.health = checked_health;
+    try fixture.apply(checked);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 3), try fixture.report_health(1, .running, .healthy));
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms);
+    try fixture.settle();
+    checked.image = "b3:9d20c4f1";
+    checked.request_id = "r-0002b1a";
+    try fixture.apply(checked);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 1), try fixture.report_health(2, .running, .unknown));
+    try fixture.settle();
+    checked.image = "b3:51aa9c03";
+    checked.request_id = "r-0002b1b";
+    try fixture.apply(checked);
+    try fixture.settle();
+    try testing.expectEqual(@as(u64, 3), (try fixture.service()).generation);
+    fixture.manual.advance(min_ready_ms);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
+    try testing.expectEqual(@as(u32, 0), try fixture.count_of(2));
+}
+
 test "a new replica unknown after healthy is not ready to the rollout controller" {
     // Goal: PR #261 re-review SHOULD, the rollout controller's half of the `unknown` rule
     // (`!(fresh and held_over)` in `view`). A new replica that ran healthy for `min_ready_ms`
@@ -1669,6 +1707,81 @@ test "C3 slice 8: an automatic rollback restores the generation that completed, 
     const record = try fixture.history(4);
     try testing.expectEqual(records.HistoryReason.auto_rollback, record.reason);
     try testing.expectEqual(@as(?u64, 1), record.restores);
+}
+
+test "a paused rollout's scale-up runs its from generation, never a newer stale one (#16)" {
+    // Goal: the template of a halted scale-up is chosen by role (#16, review SHOULD 1), not as
+    // the newest older generation. Method: generation 2 never becomes ready when generation 3 is
+    // applied over it, so 3 rolls from 1 with a ready replica of 2 among its stale ones, above
+    // `from`; pause it with four replicas and scale it to 5. The new replica runs generation 1.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.roll();
+    try testing.expectEqual(@as(u32, 1), try fixture.report(2, .running));
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms);
+    try fixture.settle();
+    try fixture.apply(third);
+    try fixture.settle();
+    try testing.expectEqual(@as(u64, 1), (try fixture.rollout()).from);
+    try testing.expectEqual(records.RolloutPhase.paused, (try fixture.request(.pause)).done);
+    const old = try fixture.count_of(1);
+    const skipped = try fixture.count_of(2);
+    const new = try fixture.count_of(3);
+    try testing.expectEqual(@as(u32, 1), skipped);
+    try testing.expectEqual(@as(u32, 4), old + skipped + new);
+    var next = third;
+    next.replicas = 5;
+    next.request_id = "r-0002b16";
+    try fixture.apply(next);
+    try fixture.settle();
+    try testing.expectEqual(@as(u64, 3), (try fixture.service()).generation);
+    try testing.expectEqual(records.RolloutPhase.paused, (try fixture.rollout()).phase);
+    try testing.expectEqual(skipped, try fixture.count_of(2));
+    try testing.expectEqual(new, try fixture.count_of(3));
+    try testing.expectEqual(old + 1, try fixture.count_of(1));
+}
+
+test "replicas of a deleted incarnation start no rollout of the new one, nor count in it (#16)" {
+    // Goal: the rollout controller judges only the incarnation's own replicas, as the replica
+    // controller does (`earlier_incarnation`, PR #18 review SHOULD 1). Method: delete `web`
+    // halfway through its rollout to generation 2 and apply generation 2's manifest again (the
+    // new incarnation's generation 1), then run the rollout controller alone, before the replica
+    // controller stops the old replicas. Two old replicas run generation 1 (another image) and
+    // two run generation 2 (the same spec, one ready): before the fix the first two began a
+    // rollout of the new incarnation and the ready one counted as its new and ready replica.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    var next = web;
+    next.image = "b3:9d20c4f1";
+    next.request_id = "r-0002b11";
+    try fixture.roll_to(next);
+    _ = try fixture.report(2, .running);
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 2), try fixture.count_of(1));
+    try testing.expectEqual(@as(u32, 2), try fixture.count_of(2));
+    const started = try fixture.decisions("rollout_start", "service web");
+    const ctx = fixture.context();
+    const gone = try apply_mod.delete_service(&ctx, &fixture.api, web.name, "alex", "r-00000016");
+    try testing.expect(gone == .written);
+    next.request_id = "r-0002b16";
+    try fixture.apply(next);
+    try testing.expectEqual(@as(u64, 1), (try fixture.service()).generation);
+    try rollouts_only(&fixture);
+    try testing.expectEqual(started, try fixture.decisions("rollout_start", "service web"));
+    try fixture.settle();
+    try testing.expectEqual(started, try fixture.decisions("rollout_start", "service web"));
+    // The old replicas are stopped and the count made up at the new incarnation's spec.
+    const now = try fixture.replicas();
+    try testing.expectEqual(@as(usize, 3), now.len);
+    for (now) |replica| {
+        try testing.expectEqual(@as(u64, 1), replica.rec.generation);
+        try testing.expectEqualStrings(next.image, replica.rec.image);
+    }
 }
 
 test "C3 slice 8: a user's apply before the automatic rollback commits wins (R8)" {

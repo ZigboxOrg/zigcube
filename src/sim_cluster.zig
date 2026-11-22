@@ -1200,12 +1200,13 @@ pub const Cluster = struct {
     fn report_c3(c: *const Cluster, report: anytype) void {
         const tally = &c.c3_tally;
         report.print("sim-c3 R1 retirements={d} doubted={d} R2 surges={d} R3 versions={d} " ++
-            "R4 paused={d} R5 rollbacks={d} completed={d} R6 history={d} R7 settled={d} " ++
-            "R8 auto={d}; pauses={d} resumes={d}\n", .{
-            tally.retirements_judged,    tally.retirements_doubted, tally.surges_judged,
-            tally.versions_judged,       tally.paused_judged,       tally.rollbacks_judged,
-            tally.rollbacks_completed,   tally.history_judged,      tally.rollouts_settled,
-            tally.auto_rollbacks_judged, c.rollout_pauses,          c.rollout_resumes,
+            "R4 paused={d} first={d} foreign={d} R5 rollbacks={d} completed={d} R6 history={d} " ++
+            "R7 settled={d} R8 auto={d}; pauses={d} resumes={d}\n", .{
+            tally.retirements_judged, tally.retirements_doubted, tally.surges_judged,
+            tally.versions_judged,    tally.paused_judged,       tally.paused_first_generation,
+            tally.foreign_removed,    tally.rollbacks_judged,    tally.rollbacks_completed,
+            tally.history_judged,     tally.rollouts_settled,    tally.auto_rollbacks_judged,
+            c.rollout_pauses,         c.rollout_resumes,
         });
     }
 
