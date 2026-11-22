@@ -37,10 +37,13 @@ const c1_teeth = @import("c1_teeth.zig");
 const constants = @import("constants.zig");
 const controller = @import("controller.zig");
 const evidence = @import("evidence.zig");
+const history = @import("history.zig");
 const retention = @import("retention.zig");
 const scheduler = @import("scheduler.zig");
 const pull_retention = @import("pull_retention.zig");
 const records = @import("records.zig");
+const rollout_controller = @import("rollout_controller.zig");
+const rollout_plan = @import("rollout_plan.zig");
 const store = @import("store.zig");
 
 const Allocator = std.mem.Allocator;
@@ -79,6 +82,7 @@ pub const watch_prefixes = [_][]const u8{
     records.prefix_assigned,
     records.prefix_replica_numbers,
     records.prefix_node_status,
+    records.prefix_rollouts,
 };
 
 comptime {
@@ -86,20 +90,35 @@ comptime {
     assert(decision + batch_replicas_max * (decision + 1) + 1 <= constants.store_txn_ops_max);
     // The operations no longer bind (the decision's own compare does, below): one more replica
     // would fit them but not the compares.
-    // The service, the counter and the service decision's summary; per replica its key, its
-    // assignment and its decision's summary; and per lost node, once however many of its
-    // replicas the batch removes, the node's status and its `/nodes` record.
+    // The service, the service's rollout (seam b, `expect_rollout`) and the service decision's
+    // summary; per replica removed its key, its assignment and its decision's summary; per
+    // replica created its decision's summary, and the counter once; and per lost node, once
+    // however many of its replicas the batch removes, the node's status and its `/nodes` record.
     const fixed = 2 + controller.decision_compares;
+    const counter = 1;
     const per_replica = 2 + controller.decision_compares;
+    const per_created = controller.decision_compares;
     const per_judged_node = 2;
-    assert(fixed + batch_replicas_max * per_replica + judged_nodes_batch_max * per_judged_node <=
-        constants.store_txn_compares_max);
-    // One more lost node would not fit, so the limit is what the store allows, not slack.
-    assert(fixed + batch_replicas_max * per_replica +
-        (judged_nodes_batch_max + 1) * per_judged_node > constants.store_txn_compares_max);
-    assert(fixed + (batch_replicas_max + 1) * per_replica +
-        judged_nodes_batch_max * per_judged_node > constants.store_txn_compares_max);
+    // A replacement removes `removed` dead replicas (each on a lost node, at worst) and creates
+    // at most the rest of the batch. Its worst case, two removals on two lost nodes, is exactly
+    // the limit: one more lost node or one more replica would not fit.
+    var worst: u32 = 0;
+    for (0..batch_replicas_max + 1) |index| {
+        const removed: u32 = index;
+        const created: u32 = batch_replicas_max - removed;
+        const nodes: u32 = @min(removed, judged_nodes_batch_max);
+        var compares: u32 = fixed + removed * per_replica + nodes * per_judged_node;
+        if (created > 0) compares += counter + created * per_created;
+        worst = @max(worst, compares);
+    }
+    assert(worst == constants.store_txn_compares_max);
+    assert(worst == fixed + batch_replicas_max * per_replica +
+        judged_nodes_batch_max * per_judged_node);
     assert(judged_nodes_batch_max <= batch_replicas_max);
+    // A rollout step: the fixed compares and the counter; per replica created or retired its
+    // key, its assignment or its report, and its decision's summary. `expect_floor` adds what
+    // still fits (checked as it goes).
+    assert(fixed + counter + batch_replicas_max * per_replica <= constants.store_txn_compares_max);
     const per_hold = controller.decision_compares + 2 + per_judged_node;
     assert(hold_batch_max * per_hold <= constants.store_txn_compares_max);
 }
@@ -157,6 +176,8 @@ const Item = struct {
     observed: ?*const Entry(records.Observed),
     class: Class,
     running: bool,
+    /// Not reported stopped and not on a lost node: it counts toward the surge bound.
+    live: bool = true,
     number: u32,
     /// The status of the lost node the replica is placed on, once its grace has passed.
     lost: ?*const Entry(records.NodeStatus) = null,
@@ -172,11 +193,50 @@ const ServicePlan = struct {
     held: u32 = 0,
     dead: u32 = 0,
     stale: u32 = 0,
+    /// Of `held`, stale replicas a halted rollout holds (`hold_stale`): the rollout has not
+    /// finished with them, so the surge it paused at is kept as for `stale` ones.
+    held_stale: u32 = 0,
 
     fn slice(plan: *const ServicePlan) []const Item {
         return plan.items[0..plan.count];
     }
 };
+
+const RolloutEntry = Entry(records.Rollout);
+
+/// What a service's rollout allows this pass (`Run.roll_of`).
+const Roll = struct {
+    policy: rollout_plan.Policy,
+    /// The rollout of the service's generation, if there is one.
+    rollout: ?RolloutEntry = null,
+    /// Replicas that count toward the surge bound: live replicas of the service and reports
+    /// of replicas being retired that are not yet stopped.
+    live: u32 = 0,
+    /// Replicas reported running on a ready node (R1's count).
+    up: u32 = 0,
+    /// Replicas that may be created before the surge bound: unbounded with no rollout.
+    room: u32 = std.math.maxInt(u32),
+    /// The rollout starts and retires replicas (progressing or rolling back), or there is none.
+    starts: bool = true,
+    /// The rollout is paused: nothing new starts.
+    paused: bool = false,
+    /// The rollout failed (its rollback not yet begun, or refused, ZC-E0128): no replica of
+    /// the service's generation, the failed one, is created while an older replica is left to
+    /// copy (`replacement_templates`, `scale_up`).
+    failed: bool = false,
+    /// `/rollouts/<service>` and its revision as read (0: absent). Every write of the service's
+    /// replicas compares it (`expect_rollout`): what the write does rests on the rollout's phase
+    /// (starts, replacements, the surge kept while halted), so a pause, a failure or a new
+    /// rollout that lands between the read and the commit fails the commit (c3.md, seam b).
+    rollout_key: []const u8 = "",
+    rollout_revision: u64 = 0,
+};
+
+/// Compares the service's `/rollouts` record as `roll_of` read it (absent: revision 0).
+fn expect_rollout(batch: *Batch, roll: *const Roll) void {
+    assert(roll.rollout_key.len > 0);
+    batch.expect(roll.rollout_key, roll.rollout_revision);
+}
 
 const Run = struct {
     rc: *ReplicaController,
@@ -220,11 +280,25 @@ const Run = struct {
         if (try run.seed_counter(service)) return;
         var plan: ServicePlan = .{};
         try run.classify(service, &plan);
+        // A rollout record that does not decode halts this service only (ZC-E0301 is the rollout
+        // pass's to report): every write of its replicas rests on what the rollout allows.
+        const roll_read = try run.roll_of(service, &plan);
+        if (roll_read) |*roll| hold_stale(run, &plan, roll);
         if (!try run.hold_pass(service, &plan)) return;
-        if (plan.dead + plan.stale > 0) return run.replace(service, &plan);
-        const keep = plan.live + plan.held;
-        if (keep < service.rec.replicas) return run.scale_up(service, keep);
-        if (keep > service.rec.replicas) return run.scale_down(service, &plan);
+        const roll = roll_read orelse return;
+        if (plan.dead > 0) return run.replace(service, &plan, &roll);
+        if (plan.stale > 0 and roll.starts) return run.roll_out(service, &plan, &roll);
+        // A halted rollout (failed or paused) keeps its stale replicas, which then count as
+        // any other toward what the service asks for, and the new ones it surged: up to
+        // `max_surge` more than that stay, or a pause would undo the step it paused at. Stale
+        // replicas it holds (`hold_stale`) count as stale here: without them, a pause at a surge
+        // whose every remaining old replica is held would scale down to `replicas`, removing
+        // the held ones with a `scale_down` no one asked for.
+        const keep = plan.live + plan.held + plan.stale;
+        const halted = plan.stale + plan.held_stale > 0 and roll.rollout != null;
+        const wanted = service.rec.replicas + if (halted) roll.policy.max_surge else 0;
+        if (keep < service.rec.replicas) return run.scale_up(service, &plan, keep, &roll);
+        if (keep > wanted) return run.scale_down(service, &plan, &roll, wanted);
     }
 
     // ---- Reading ----
@@ -251,15 +325,18 @@ const Run = struct {
                 .number = number,
             };
             item.class = classify_one(&replica.rec, &service.rec, observed);
-            if (item.class == .live or item.class == .held) {
+            item.live = rollout_controller.live_report(run.snap, &replica.rec);
+            // A stale replica is refused too: a halted rollout (failed or paused) keeps its stale
+            // replicas, and one on a node registered exclusive would stay there for good (P1).
+            if (item.class != .dead) {
                 item.refused = run.refused_placement(replica.rec.id);
                 if (item.refused != null) item.class = .dead;
             }
-            if (item.class == .live) {
+            if (item.class == .live or item.class == .stale) {
                 item.lost = run.lost_placement(replica.rec.id);
                 if (item.lost != null) item.class = .dead;
             }
-            item.running = if (observed) |found| found.rec.status == .running else false;
+            item.running = running_healthy(&replica.rec, observed, item.class == .stale);
             plan.items[plan.count] = item;
             plan.count += 1;
         }
@@ -281,17 +358,7 @@ const Run = struct {
     fn admissible(run: *Run, found: ?*const Entry(records.Observed)) ?*const Entry(
         records.Observed,
     ) {
-        const entry = found orelse return null;
-        const tenure = entry.rec.tenure orelse return entry;
-        const node = run.snap.node_entry(entry.rec.node) orelse return null;
-        if (node.kv.mod_revision != tenure) return null;
-        if (entry.rec.assignment) |epoch| {
-            const placed = run.snap.assigned_of(entry.rec.replica) orelse return null;
-            if (placed.kv.mod_revision != epoch) return null;
-        }
-        const status = run.snap.status_of(entry.rec.node) orelse return null;
-        if (status.rec.state != .ready) return null;
-        return entry;
+        return admissible_in(run.snap, found);
     }
 
     /// The `/nodes` record of the node `replica` is placed on, if its labels refuse a replica of a
@@ -395,29 +462,54 @@ const Run = struct {
 
     // ---- Replacing ----
 
-    /// Removes up to a batch of dead and stale replicas and creates their replacements.
-    fn replace(run: *Run, service: *const ServiceEntry, plan: *const ServicePlan) Error!void {
-        var removed: [batch_replicas_max]*const Item = undefined;
-        var removed_count: u32 = 0;
-        var lost_nodes: [judged_nodes_batch_max][]const u8 = undefined;
-        var lost_nodes_count: u32 = 0;
-        for (plan.slice()) |*item| {
-            if (item.class != .dead and item.class != .stale) continue;
-            if (removed_count == batch_replicas_max) break;
-            if (judged_node(item)) |node| {
-                if (!note_node(lost_nodes[0..], &lost_nodes_count, node)) continue;
-            }
-            removed[removed_count] = item;
-            removed_count += 1;
-        }
+    /// Removes up to a batch of dead replicas and creates their replacements. Stale replicas are
+    /// the rollout's (`roll_out`). While a service has stale replicas or its rollout is halted
+    /// (paused or failed), a replacement is repair, not rollout progress: each removal that the
+    /// service's count needs back is replaced in the same transaction, one for one, so a
+    /// transaction removes only as many as it can also replace (`removals_max`). With no room
+    /// for a replacement (R2), the dead replicas are removed unreplaced, never kept waiting for
+    /// room (P1: a refused one must leave its node within the bound, and a container that fills
+    /// the room may stop only once its node is judged lost); `scale_up` makes the count up once
+    /// room frees (a halted rollout's at an older generation), as an active rollout's starts do.
+    /// A replica of the service's generation is replaced whatever the rollout's phase but
+    /// `failed` (R4) (`scale_up` restores that count), a stale one at the service's generation
+    /// unless the rollout is halted, then at its own, and neither past the surge bound (R2)
+    /// (docs/decisions/2026-11-21-c3-stale-replica-on-exclusive-node.md).
+    fn replace(
+        run: *Run,
+        service: *const ServiceEntry,
+        plan: *const ServicePlan,
+        roll: *const Roll,
+    ) Error!void {
         const keep = plan.live + plan.held;
         const wanted = service.rec.replicas;
         const missing = if (wanted > keep) wanted - keep else 0;
-        const creations = @min(batch_replicas_max - removed_count, missing);
+        // A replica that failed on its own is replaced, of either generation, without waiting
+        // for the rollout's budget (c3.md): only the surge bound applies. Stale replicas still
+        // missing are the rollout's to start, and a paused rollout starts nothing more (R4).
+        // Halted (paused or failed), a replacement is repair: the stale replicas may all be
+        // among the dead, so `stale` alone does not say a halted rollout would leave them owed.
+        const paired = plan.stale > 0 or !roll.starts;
+        const replaceable = @min(missing, roll.room);
+        const removed_max = if (paired) removals_max(replaceable) else batch_replicas_max;
+        var removed: [batch_replicas_max]*const Item = undefined;
+        const removed_count = dead_to_remove(plan, removed[0..removed_max]);
+        var creations = @min(batch_replicas_max - removed_count, missing);
+        if (paired) creations = @min(creations, removed_count);
+        creations = @min(creations, roll.room);
+        if (paired) assert(creations == @min(removed_count, @min(missing, roll.room)));
+        var templates: [batch_replicas_max]?*const records.Replica = @splat(null);
+        creations = replacement_templates(
+            service,
+            roll,
+            removed[0..removed_count],
+            templates[0..creations],
+        );
         if (!run.budget()) return;
 
         var batch: Batch = .{};
         batch.expect(service.kv.key, service.kv.mod_revision);
+        expect_rollout(&batch, roll);
         var first_dead: ?DecisionId = null;
         for (removed[0..removed_count]) |item| {
             if (item.class != .dead) continue;
@@ -440,11 +532,285 @@ const Run = struct {
             else
                 null,
         }, &batch);
-        for (removed[0..removed_count]) |item| {
-            if (item.class == .stale) try run.remove_stale(&batch, item, &decision, service);
+        try run.create_replicas_from(&batch, service, &decision, templates[0..creations]);
+        _ = try run.finish(&batch);
+    }
+
+    /// The dead replicas one `replace` pass removes, into `removed` (its length is the pass's
+    /// limit), and how many: at most one per judged node. Those whose container may still run
+    /// (refused on a node registered exclusive) go first: each holds a place in the surge bound
+    /// (R2) until its removal is committed and its node stops it.
+    fn dead_to_remove(plan: *const ServicePlan, removed: []*const Item) u32 {
+        assert(removed.len > 0);
+        assert(removed.len <= batch_replicas_max);
+        var removed_count: u32 = 0;
+        var lost_nodes: [judged_nodes_batch_max][]const u8 = undefined;
+        var lost_nodes_count: u32 = 0;
+        for ([_]bool{ true, false }) |live| {
+            for (plan.slice()) |*item| {
+                if (item.class != .dead or item.live != live) continue;
+                // A dead replica costs nothing to remove (it serves nothing), during a rollout
+                // too: what bounds the batch is the creations (`room`, R2) and the compares.
+                if (removed_count == removed.len) break;
+                if (judged_node(item)) |node| {
+                    if (!note_node(lost_nodes[0..], &lost_nodes_count, node)) continue;
+                }
+                removed[removed_count] = item;
+                removed_count += 1;
+            }
+        }
+        assert(removed_count > 0);
+        assert(removed_count <= removed.len);
+        return removed_count;
+    }
+
+    /// The template of each replacement `replace` creates, in `templates` (one slot per
+    /// creation the bounds allow), and how many it fills. While the rollout is halted (paused or
+    /// failed), a replacement of an older replica runs that replica's generation and spec (R4).
+    /// Otherwise (the rollout active or complete, or before a rollout of the service's
+    /// generation begins, `roll_of`'s defaults) it runs the service's: then `stale` bounds it by
+    /// the dead. A complete rollout starts nothing, but copying an old replica there would leave
+    /// one beside it for good, and one whose start failed through the user's fault (not held
+    /// there, `hold_stale`) would be copied, fail and be copied again without end. A failed
+    /// rollout creates no replica of its generation: a removed replica of it is not replaced
+    /// here, and `scale_up` fills the count from an older one.
+    fn replacement_templates(
+        service: *const ServiceEntry,
+        roll: *const Roll,
+        removed: []const *const Item,
+        templates: []?*const records.Replica,
+    ) u32 {
+        assert(templates.len <= batch_replicas_max);
+        const halted = roll.paused or roll.failed;
+        if (halted) assert(!roll.starts);
+        var count: u32 = 0;
+        for (0..templates.len) |index| {
+            var template: ?*const records.Replica = null;
+            if (index < removed.len) {
+                const replica = &removed[index].replica.rec;
+                if (halted and replica.generation < service.rec.generation) {
+                    template = replica;
+                }
+            }
+            if (template == null and roll.failed) continue;
+            templates[count] = template;
+            count += 1;
+        }
+        assert(count <= templates.len);
+        return count;
+    }
+
+    // ---- Rolling out (C3 slice 7) ----
+
+    /// The service's rollout as this pass reads it (`/rollouts/<service>` at the snapshot's
+    /// revision), if it is one of this incarnation and generation, and what it allows. Null if
+    /// the record does not decode.
+    fn roll_of(run: *Run, service: *const ServiceEntry, plan: *const ServicePlan) Error!?Roll {
+        var roll: Roll = .{ .policy = service.rec.rollout_policy() };
+        var live = rollout_controller.stopping_orphans(run.snap, service.rec.name);
+        for (plan.slice()) |item| {
+            // Every replica whose container may still run counts toward the surge bound (R2),
+            // whatever its class: a dead replica refused on a node registered exclusive runs
+            // until its removal is committed and its node stops it (then `stopping_orphans`
+            // counts it), so its replacement waits for room as any other creation does.
+            if (item.live) live += 1;
+            if (item.class == .dead or item.class == .held) continue;
+            if (item.running and item.lost == null) roll.up += 1;
+        }
+        roll.live = live;
+        const key = records.rollout_key(service.rec.name);
+        const ctx = run.ctx;
+        const got = try ctx.store.get(ctx.arena, key.slice(), run.snap.revision, ctx.diag);
+        roll.rollout_key = try controller.key_copy(ctx, &key);
+        roll.rollout_revision = if (got.kv) |found| found.mod_revision else 0;
+        const kv = got.kv orelse return roll;
+        const rec = records.read(records.Rollout, run.ctx.arena, kv, run.ctx.diag) catch |err| {
+            if (err != error.Malformed) return err;
+            ctx.diag.reset();
+            return null;
+        };
+        if (!records.rollout_of(&rec, service.kv.create_revision)) return roll;
+        if (rec.to != service.rec.generation) return roll;
+        roll.rollout = .{ .kv = kv, .rec = rec };
+        const live_max = service.rec.replicas + roll.policy.max_surge;
+        roll.room = live_max -| live;
+        roll.starts = rollout_plan.active(rec.phase) or c1_teeth.rollout_pause;
+        roll.paused = rec.phase == .paused and !c1_teeth.rollout_pause;
+        roll.failed = rec.phase == .failed and !c1_teeth.rollout_pause;
+        if (roll.failed) assert(!roll.starts);
+        if (roll.paused) assert(!roll.failed);
+        return roll;
+    }
+
+    /// Spends the rollout's budget on the service's stale replicas: starts new ones within
+    /// `budget.start` (less what the counter moved since the budget was computed) and retires old
+    /// ones within `budget.retire` (a running one) and `budget.retire_unready` (one that is not
+    /// running), less what was retired since; one that is not live costs nothing. A running one is
+    /// retired only while the replicas running stay at `replicas - max_unavailable` or above
+    /// (R1). Nothing happens without a rollout of the service's generation whose budget was
+    /// computed on the service as it is, or while the rollout is paused or failed (R4).
+    fn roll_out(
+        run: *Run,
+        service: *const ServiceEntry,
+        plan: *const ServicePlan,
+        roll: *const Roll,
+    ) Error!void {
+        const rollout = roll.rollout orelse return;
+        if (!roll.starts) return;
+        if (service.kv.mod_revision > rollout.rec.budget_revision) return;
+        const counter = try run.counter_of(service.rec.name);
+        const keep = plan.live + plan.held;
+        const missing = service.rec.replicas -| keep;
+        var creations = @min(@min(run.starts_left(&rollout, counter), missing), roll.room);
+        creations = @min(creations, batch_replicas_max);
+        var retired: [batch_replicas_max]*const Item = undefined;
+        const retired_count = run.choose_retired(
+            service,
+            plan,
+            roll,
+            started_since(&rollout, counter),
+            retired[0 .. batch_replicas_max - creations],
+        );
+        if (creations + retired_count == 0) return;
+        if (!run.budget()) return;
+        var batch: Batch = .{};
+        batch.expect(service.kv.key, service.kv.mod_revision);
+        if (!c1_teeth.rollout_budget) expect_rollout(&batch, roll);
+        const why = if (retired_count > 0)
+            try run.replace_reason(service, plan, retired[0..retired_count], keep)
+        else
+            try controller.format(run.ctx, "the rollout of {s} to generation {d} may start " ++
+                "{d} new {s}", .{
+                service.rec.name, service.rec.generation,
+                creations,        plural(creations, "replica", "replicas"),
+            });
+        const decision = try controller.put_decision(run.ctx, &run.rc.source, .{
+            .actor = actor,
+            .action = "replace_replica",
+            .subject = .{ .kind = .service, .name = service.rec.name },
+            .reason = why,
+            .cause = rollout_cause(&rollout.rec, service),
+        }, &batch);
+        for (retired[0..retired_count]) |item| {
+            try run.remove_stale(&batch, item, &decision, service);
         }
         try run.create_replicas(&batch, service, &decision, creations);
+        try run.expect_floor(&batch, service, plan, roll, retired[0..retired_count]);
         _ = try run.finish(&batch);
+    }
+
+    /// Puts in the read set what a retirement of a running replica rests on (R1): the reports of
+    /// `replicas - max_unavailable` of the running replicas it keeps, and their nodes' status, so
+    /// one that stops or whose node is lost before the commit makes the transaction fail and the
+    /// next pass count again. While the compare budget holds them all, the floor is exact. A
+    /// larger service gets as many as fit (docs/decisions/2026-11-14-c3-slice7-controller.md).
+    fn expect_floor(
+        run: *Run,
+        batch: *Batch,
+        service: *const ServiceEntry,
+        plan: *const ServicePlan,
+        roll: *const Roll,
+        retired: []const *const Item,
+    ) Error!void {
+        if (c1_teeth.rollout_budget) return;
+        if (roll.policy.strategy != .rolling) return;
+        for (retired) |item| {
+            if (item.running and item.lost == null) break;
+        } else return;
+        var left = service.rec.replicas -| roll.policy.max_unavailable;
+        for (plan.slice()) |*item| {
+            if (left == 0) return;
+            if (item.class == .dead or item.class == .held) continue;
+            if (!item.running or item.lost != null) continue;
+            if (std.mem.indexOfScalar(*const Item, retired, item) != null) continue;
+            const observed = item.observed orelse continue;
+            const node = observed.rec.node;
+            const status = run.snap.status_of(node);
+            const known = status == null or in_read_set(batch, status.?.kv.key);
+            const cost: u32 = if (known) 1 else 2;
+            if (batch.compares_count + cost > constants.store_txn_compares_max) return;
+            batch.expect(observed.kv.key, observed.kv.mod_revision);
+            if (!known) batch.expect(status.?.kv.key, status.?.kv.mod_revision);
+            left -= 1;
+        }
+    }
+
+    fn in_read_set(batch: *const Batch, key: []const u8) bool {
+        for (batch.compares[0..batch.compares_count]) |compare| {
+            if (std.mem.eql(u8, compare.key, key)) return true;
+        }
+        return false;
+    }
+
+    /// New replicas the budget still allows: `budget.start` less the numbers the counter handed
+    /// out since the budget was computed (any creation since then is counted against it).
+    fn starts_left(run: *Run, rollout: *const RolloutEntry, counter: ?NumberEntry) u32 {
+        _ = run;
+        const start = rollout.rec.budget.start;
+        if (c1_teeth.rollout_budget) return start;
+        const now: ?u64 = if (counter) |found| found.rec.next else null;
+        const then = rollout.rec.budget_next orelse return if (now == null) start else 0;
+        const used = (now orelse then) -| then;
+        return @intCast(@as(u64, start) -| used);
+    }
+
+    /// Whether a replica of the service was created since the rollout's budget was computed
+    /// (the counter moved): a start of the rollout's, or a replacement of a dead replica.
+    fn started_since(rollout: *const RolloutEntry, counter: ?NumberEntry) bool {
+        const now: ?u64 = if (counter) |found| found.rec.next else null;
+        return !std.meta.eql(now, rollout.rec.budget_next);
+    }
+
+    /// Picks the stale replicas to retire in this transaction into `out`; returns how many.
+    /// `budget.retire` was computed on the replicas ready then: once a replica was created since
+    /// (it replaced one that counted, and is not ready), no running replica is retired on it
+    /// until the rollout controller counts again (R1 is about ready replicas, the floor here
+    /// about running ones).
+    fn choose_retired(
+        run: *Run,
+        service: *const ServiceEntry,
+        plan: *const ServicePlan,
+        roll: *const Roll,
+        started: bool,
+        out: []*const Item,
+    ) u32 {
+        _ = run;
+        const rollout = &roll.rollout.?.rec;
+        const used = rollout.budget_old -| plan.stale;
+        var ready_left = if (started) 0 else rollout.budget.retire -| used;
+        var unready_left = (rollout.budget.retire + rollout.budget.retire_unready) -| used;
+        const ready_min = service.rec.replicas -| roll.policy.max_unavailable;
+        const rolling = roll.policy.strategy == .rolling;
+        var up = roll.up;
+        var count: u32 = 0;
+        // The cheapest first: not live, then live and not running, then running.
+        for ([_]u8{ 0, 1, 2 }) |cost| {
+            for (plan.slice()) |*item| {
+                if (count == out.len) return count;
+                if (item.class != .stale) continue;
+                const running = item.running and item.lost == null;
+                const item_cost: u8 = if (!item.live) 0 else if (!running) 1 else 2;
+                if (item_cost != cost) continue;
+                if (c1_teeth.rollout_budget) {
+                    out[count] = item;
+                    count += 1;
+                    continue;
+                }
+                if (cost == 1 and unready_left == 0) continue;
+                if (cost == 2) {
+                    if (ready_left == 0) continue;
+                    if (rolling and up -| 1 < ready_min) continue;
+                    up -|= 1;
+                }
+                if (cost > 0) {
+                    unready_left -|= 1;
+                    ready_left -|= 1;
+                }
+                out[count] = item;
+                count += 1;
+            }
+        }
+        return count;
     }
 
     /// Counts `node` among the nodes whose status the batch compares. False if it is a new one and
@@ -667,6 +1033,14 @@ const Run = struct {
                 replica.rec.id, replica.rec.generation, service.rec.name, service.rec.generation,
             });
         try run.stop_replica(batch, replica, reason, because);
+        // The retirement was chosen by whether the replica was running (`choose_retired`): its
+        // report is in the read set, so one that came up meanwhile is not retired unready (R1).
+        if (item.observed) |observed| {
+            batch.expect(observed.kv.key, observed.kv.mod_revision);
+        } else if (run.snap.node_of(replica.rec.id)) |node| {
+            const key = records.observed_key(node, replica.rec.id);
+            batch.expect(try controller.key_copy(run.ctx, &key), 0);
+        }
     }
 
     fn stop_replica(
@@ -699,22 +1073,26 @@ const Run = struct {
         because: *const DecisionId,
         count: u32,
     ) Error!void {
-        if (count == 0) return;
+        var templates: [batch_replicas_max]?*const records.Replica = @splat(null);
+        return run.create_replicas_from(batch, service, because, templates[0..count]);
+    }
+
+    /// As `create_replicas`, one replica per entry of `templates`: a null entry runs the
+    /// service's generation, a replica the generation and spec of that (older) replica.
+    fn create_replicas_from(
+        run: *Run,
+        batch: *Batch,
+        service: *const Entry(records.Service),
+        because: *const DecisionId,
+        templates: []const ?*const records.Replica,
+    ) Error!void {
+        if (templates.len == 0) return;
         const counter = try run.counter_of(service.rec.name);
         var next = if (counter) |found| found.rec.next else run.first_number(service);
-        for (0..count) |_| {
+        for (templates) |template| {
             if (next > constants.replica_number_max) return run.numbers_used_up(service);
             const id = try controller.format(run.ctx, "{s}-{d}", .{ service.rec.name, next });
-            const reason = try controller.format(run.ctx, "creating {s} (generation {d}) for " ++
-                "service {s}", .{ id, service.rec.generation, service.rec.name });
-            _ = try controller.put_decision(run.ctx, &run.rc.source, .{
-                .actor = actor,
-                .action = "create_replica",
-                .subject = .{ .kind = .replica, .name = id },
-                .reason = reason,
-                .cause = controller.cause_decision(because),
-            }, batch);
-            const replica: records.Replica = .{
+            var replica: records.Replica = .{
                 .id = id,
                 .service = service.rec.name,
                 .generation = service.rec.generation,
@@ -723,7 +1101,22 @@ const Run = struct {
                 .env = service.rec.env,
                 .limits = service.rec.limits,
                 .source = service.rec.source,
+                .health = service.rec.health,
             };
+            if (template) |older| {
+                assert(older.generation < service.rec.generation);
+                replica = older.*;
+                replica.id = id;
+            }
+            const reason = try controller.format(run.ctx, "creating {s} (generation {d}) for " ++
+                "service {s}", .{ id, replica.generation, service.rec.name });
+            _ = try controller.put_decision(run.ctx, &run.rc.source, .{
+                .actor = actor,
+                .action = "create_replica",
+                .subject = .{ .kind = .replica, .name = id },
+                .reason = reason,
+                .cause = controller.cause_decision(because),
+            }, batch);
             const key = records.replica_key(service.rec.name, id);
             const value = try records.encode(run.ctx.arena, replica, run.ctx.diag);
             batch.put(try controller.key_copy(run.ctx, &key), value);
@@ -805,13 +1198,41 @@ const Run = struct {
         return error.NoCapacity;
     }
 
-    fn scale_up(run: *Run, service: *const Entry(records.Service), keep: u32) Error!void {
+    /// Creates the replicas the service lacks: past the surge bound only once the replicas
+    /// being retired are observed stopped (R2). While its rollout is halted (paused or failed),
+    /// they run an older generation: a paused rollout starts nothing of its new generation (R4),
+    /// and this is the repair of replicas removed while the surge left no room to replace them;
+    /// a failed rollout creates nothing of the failed one. The template is the newest older
+    /// generation a stale replica runs, else, with every old replica gone, the rollout's `from`
+    /// as `/history` holds it (`history_template`). Only when neither is left (a first
+    /// generation, or its history trimmed) does the count win, at the service's generation:
+    /// leaving the service short fails the halted convergence checks (sim_c0's
+    /// `halted_converged`, sim_cluster's convergence step). The supervisor's decision, in
+    /// docs/decisions/2026-11-21-c3-stale-replica-on-exclusive-node.md.
+    fn scale_up(
+        run: *Run,
+        service: *const Entry(records.Service),
+        plan: *const ServicePlan,
+        keep: u32,
+        roll: *const Roll,
+    ) Error!void {
         const wanted = service.rec.replicas;
         assert(keep < wanted);
-        const creations = @min(batch_replicas_max, wanted - keep);
+        assert(plan.dead == 0);
+        const creations = @min(@min(batch_replicas_max, wanted - keep), roll.room);
+        if (creations == 0) return;
         if (!run.budget()) return;
+        var stored: records.Replica = undefined;
+        var read: ?history.Stored = null;
+        var template: ?*const records.Replica = null;
+        if (roll.failed or roll.paused) {
+            template = newest_older(plan, service) orelse
+                try run.history_template(service, roll, &stored, &read);
+        }
         var batch: Batch = .{};
         batch.expect(service.kv.key, service.kv.mod_revision);
+        expect_rollout(&batch, roll);
+        if (read) |entry| batch.expect(entry.key, entry.mod_revision);
         const reason = try controller.format(run.ctx, "service {s} wants {d} {s} and {d} exist", .{
             service.rec.name, wanted, plural(wanted, "replica", "replicas"), keep,
         });
@@ -823,15 +1244,70 @@ const Run = struct {
             .cause = desired_cause(service),
             .cause_evidence = try evidence.service(run.ctx, &service.rec),
         }, &batch);
-        try run.create_replicas(&batch, service, &decision, creations);
+        const templates: [batch_replicas_max]?*const records.Replica = @splat(template);
+        try run.create_replicas_from(&batch, service, &decision, templates[0..creations]);
         _ = try run.finish(&batch);
+    }
+
+    /// The spec of the halted rollout's `from` generation as `/history` holds it, written to
+    /// `out`, or null when there is none to copy (a first generation, or its record trimmed).
+    /// The record's key and revision go to `read`, for the caller's batch to compare (the
+    /// read-set rule; a record is never changed, so only a trim fails the compare).
+    fn history_template(
+        run: *Run,
+        service: *const ServiceEntry,
+        roll: *const Roll,
+        out: *records.Replica,
+        read: *?history.Stored,
+    ) Error!?*const records.Replica {
+        const rollout = roll.rollout orelse return null;
+        const from = rollout.rec.from;
+        if (from == 0 or from >= service.rec.generation) return null;
+        const ctx = run.ctx;
+        const usable = try history.usable(ctx, service.rec.name, .{
+            .create_revision = service.kv.create_revision,
+            .generation = service.rec.generation,
+        });
+        for (usable) |entry| {
+            if (entry.generation != from) continue;
+            const got = try ctx.store.get(ctx.arena, entry.key, null, ctx.diag);
+            const kv = got.kv orelse return null;
+            const record = records.read(records.History, ctx.arena, kv, ctx.diag) catch |err| {
+                if (err != error.Malformed) return err;
+                ctx.diag.reset();
+                return null;
+            };
+            if (record.generation != from) return null;
+            out.* = .{
+                .id = "",
+                .service = service.rec.name,
+                .generation = record.generation,
+                .image = record.image,
+                .command = record.command,
+                .env = record.env,
+                .limits = record.limits,
+                .source = record.source,
+                .health = record.health,
+            };
+            read.* = .{ .generation = from, .key = kv.key, .mod_revision = kv.mod_revision };
+            return out;
+        }
+        return null;
     }
 
     // ---- Removing ----
 
-    fn scale_down(run: *Run, service: *const ServiceEntry, plan: *const ServicePlan) Error!void {
-        const wanted = service.rec.replicas;
-        const keep = plan.live + plan.held;
+    /// Removes replicas until `wanted` are left: the service's count, or up to `max_surge` more
+    /// while its rollout is halted.
+    fn scale_down(
+        run: *Run,
+        service: *const ServiceEntry,
+        plan: *const ServicePlan,
+        roll: *const Roll,
+        wanted: u32,
+    ) Error!void {
+        assert(wanted >= service.rec.replicas);
+        const keep = plan.live + plan.held + plan.stale;
         assert(keep > wanted);
         var victims: [constants.replicas_per_service_max]Item = undefined;
         var count: u32 = 0;
@@ -845,14 +1321,16 @@ const Run = struct {
 
         var batch: Batch = .{};
         batch.expect(service.kv.key, service.kv.mod_revision);
+        expect_rollout(&batch, roll);
         var names: std.ArrayList(u8) = .empty;
         for (victims[0..taken], 0..) |item, index| {
             if (index > 0) names.appendSlice(run.ctx.arena, ", ") catch return nomem(run.ctx);
             names.appendSlice(run.ctx.arena, item.replica.rec.id) catch return nomem(run.ctx);
         }
+        const asked = service.rec.replicas;
         const reason = try controller.format(run.ctx, "service {s} wants {d} {s} and {d} " ++
             "exist; removing {s}", .{
-            service.rec.name, wanted, plural(wanted, "replica", "replicas"), keep, names.items,
+            service.rec.name, asked, plural(asked, "replica", "replicas"), keep, names.items,
         });
         const decision = try controller.put_decision(run.ctx, &run.rc.source, .{
             .actor = actor,
@@ -919,6 +1397,50 @@ const Run = struct {
 
 // ---- Pure helpers ------------------------------------------------------------------------------
 
+/// `found` if a controller may act on it (authority.md section 3), else null: see
+/// `Run.admissible`. The rollout controller judges readiness on the same reports.
+pub fn admissible_in(
+    snap: *const Snapshot,
+    found: ?*const Entry(records.Observed),
+) ?*const Entry(records.Observed) {
+    const entry = found orelse return null;
+    const tenure = entry.rec.tenure orelse return entry;
+    const node = snap.node_entry(entry.rec.node) orelse return null;
+    if (node.kv.mod_revision != tenure) return null;
+    if (entry.rec.assignment) |epoch| {
+        const placed = snap.assigned_of(entry.rec.replica) orelse return null;
+        if (placed.kv.mod_revision != epoch) return null;
+    }
+    const status = snap.status_of(entry.rec.node) orelse return null;
+    if (status.rec.state != .ready) return null;
+    return entry;
+}
+
+/// Whether the report says the replica runs and, if it has a health check, is healthy: the
+/// rollout controller's "running" (`rollout_controller.update`), so the two agree on which old
+/// replicas are ready (retired within `budget.retire`, counted by the R1 floor) and which are not
+/// (`budget.retire_unready`): an unhealthy replica of a failed rollout is not ready. A `stale`
+/// (old) replica whose health is `unknown` counts as running: an agent restart reports every
+/// replica `unknown` until it probes again, and that must not make old replicas free to retire
+/// (docs/decisions/2026-11-15-c3-rollout-health-gate.md). Counting it running is the cautious
+/// side here: it is retired only within `budget.retire` and above the floor. The rollout
+/// controller's `update` counts an old `unknown` replica running too, even one never healthy, so
+/// the two agree and a rollback over checks that never settle still ends.
+fn running_healthy(
+    replica: *const records.Replica,
+    observed: ?*const Entry(records.Observed),
+    stale: bool,
+) bool {
+    const found = observed orelse return false;
+    if (found.rec.status != .running) return false;
+    if (replica.health == null) return true;
+    return switch (records.observed_health(&found.rec)) {
+        .healthy => true,
+        .unknown => stale,
+        .unhealthy => false,
+    };
+}
+
 fn by_number(context: void, first: Item, second: Item) bool {
     _ = context;
     return first.number < second.number;
@@ -948,24 +1470,60 @@ fn judged_node(item: *const Item) ?[]const u8 {
     return observed.rec.node;
 }
 
+/// While the rollout is halted (paused or failed), a stale replica whose start failed through
+/// the user's fault is held, as a current one is: its replacement would copy its own spec
+/// (`replacement_templates`, R4) and fail the same way, and the replace, fail, replace loop
+/// would write decisions without end (sim-c0 fuzz seed 44959403353: a failed rollout whose
+/// `from` generation had a digest no node holds). An active or complete rollout replaces it with
+/// the service's generation, so there it stays dead.
+///
+/// A stopped replica is dead in `classify_one`, before `classify` judges its node, so the node is
+/// judged here, as `classify` judges a held current one: one on a node registered `exclusive`
+/// stays dead and is removed through that node (P1), and one whose report has no tenure (C0) on a
+/// node judged lost stays dead too (a C1 report is not admissible from a node that is not
+/// `ready`, so it never gets this far).
+fn hold_stale(run: *Run, plan: *ServicePlan, roll: *const Roll) void {
+    // Only a halted rollout: a complete one starts nothing either, but a stale replica left
+    // beside it (a scale to 0 at the new generation, sim-cluster seed 385) is no step the
+    // rollout paused at, and held it would never leave. There it stays dead and is replaced at
+    // the service's generation (`replacement_templates`).
+    if (!roll.paused and !roll.failed) return;
+    for (plan.items[0..plan.count]) |*item| {
+        if (item.class != .dead) continue;
+        if (item.refused != null or item.lost != null) continue;
+        const observed = item.observed orelse continue;
+        if (!user_fault(&observed.rec)) continue;
+        item.refused = run.refused_placement(item.replica.rec.id);
+        if (item.refused != null) continue;
+        item.lost = run.lost_placement(item.replica.rec.id);
+        if (item.lost != null) continue;
+        item.class = .held;
+        plan.dead -= 1;
+        plan.held += 1;
+        plan.held_stale += 1;
+    }
+}
+
 fn classify_one(
     replica: *const records.Replica,
     service: *const records.Service,
     observed: ?*const Entry(records.Observed),
 ) Class {
-    if (replica.generation < service.generation) return .stale;
     // A service deleted and applied again between two steps starts over at generation 1, so a
     // replica of the old one can be ahead of the new service or equal to it (docs/keys.md): only
     // what it runs says whether it is current.
-    if (!records.replica_runs_service(replica, service)) return .stale;
-    const found = observed orelse return .live;
-    if (found.rec.status != .stopped) return .live;
-    if (user_fault(&found.rec)) return .held;
+    const current = replica.generation >= service.generation and
+        records.replica_runs_service(replica, service);
+    const stopped = if (observed) |found| found.rec.status == .stopped else false;
+    // A stale replica that stopped on its own is dead: it is replaced at once, without waiting
+    // for the rollout's budget (c3.md). Only a current one is held for its user's fault.
+    if (!stopped) return if (current) .live else .stale;
+    if (current and user_fault(&observed.?.rec)) return .held;
     return .dead;
 }
 
 /// A start that failed through the user's fault: the diagnostic the runtime gave says `user`.
-fn user_fault(observed: *const records.Observed) bool {
+pub fn user_fault(observed: *const records.Observed) bool {
     const exit = observed.exit orelse return false;
     if (exit.kind != .start_failed) return false;
     const raw = observed.diagnostic orelse return false;
@@ -996,6 +1554,12 @@ fn exit_evidence(ctx: *const Context, exit: records.Exit) Error![]const u8 {
     );
 }
 
+/// The cause of a step of a rollout: the rollout's last decision, else the service.
+fn rollout_cause(rollout: *const records.Rollout, service: *const ServiceEntry) records.Cause {
+    if (rollout.cause_decision.len == 0) return desired_cause(service);
+    return .{ .kind = .decision, .id = rollout.cause_decision };
+}
+
 fn desired_cause(service: *const Entry(records.Service)) records.Cause {
     return .{ .kind = .desired, .key = service.kv.key, .revision = service.kv.mod_revision };
 }
@@ -1009,6 +1573,42 @@ fn stale_behind(plan: *const ServicePlan, service: *const Entry(records.Service)
     }
     assert(behind <= plan.stale);
     return behind;
+}
+
+/// The stale replica of the newest generation older than the service's (the lowest number among
+/// equals), the template of a halted rollout's scale-up; null if there is none.
+fn newest_older(
+    plan: *const ServicePlan,
+    service: *const Entry(records.Service),
+) ?*const records.Replica {
+    var newest: ?*const records.Replica = null;
+    for (plan.slice()) |*item| {
+        if (item.class != .stale) continue;
+        const replica = &item.replica.rec;
+        if (replica.generation >= service.rec.generation) continue;
+        if (newest) |found| {
+            if (replica.generation <= found.generation) continue;
+        }
+        newest = replica;
+    }
+    if (newest) |found| assert(found.generation < service.rec.generation);
+    return newest;
+}
+
+/// How many dead replicas one transaction may remove when each is replaced in it, one for one,
+/// up to `replaceable` replacements: the most whose removals and replacements together fit a
+/// batch. At least one, so a dead replica is always removed. 0 replaceable gives a whole batch,
+/// right when nothing is missing, and when the surge bound leaves no room: then none is
+/// replaced in the transaction, and `scale_up` makes the count up once room frees.
+fn removals_max(replaceable: u32) u32 {
+    var removals: u32 = batch_replicas_max;
+    while (removals > 1) : (removals -= 1) {
+        if (removals + @min(removals, replaceable) <= batch_replicas_max) break;
+    }
+    assert(removals >= 1);
+    assert(removals <= batch_replicas_max);
+    if (replaceable == 0) assert(removals == batch_replicas_max);
+    return removals;
 }
 
 fn plural(count: u32, one: []const u8, many: []const u8) []const u8 {
