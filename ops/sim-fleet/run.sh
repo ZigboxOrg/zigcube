@@ -1,17 +1,18 @@
 #!/bin/sh
 # The simulation fleet's loop (ops/sim-fleet/README.md): follow the tip of main (and of each
-# branch in SIM_FLEET_SOAK_REFS), rebuild a branch when it moves, run three producers over fresh
-# seeds in parallel batches (`sim_cluster`, `sim_cluster --c1` and `sim_swarm`; the kinds
-# `sim-cluster`, `sim-c1`, `sim-swarm`) on one branch's build per round, and hand each round
-# (every batch, plus a record of each crashed seed) to `sim_fleet ingest`, once per kind. Every
-# SIM_FLEET_CANARY_ONE_IN rounds a fourth worker runs the teeth canary, a fault-on runner that
-# must fail. With SIM_FLEET_PROFILE=auto, one round in SIM_FLEET_BIAS_ONE_IN runs each cluster
-# kind under the one fault profile `sim_fleet bias` names: the one that best reaches what the
-# commit's seeds have reached least (coverage feedback, docs/core.md). The first round of each
-# UTC day also runs `zig build test-store-faults` on its commit (store_faults_day). Settings come
-# from the environment (the unit reads /etc/sim-fleet/fleet.env). The token is a file; this
-# script never prints it. So is the heartbeat URL (heartbeat): it is read only by `sim_fleet
-# heartbeat`, from its file, and never printed or put on a command line.
+# branch in SIM_FLEET_SOAK_REFS), rebuild a branch when it moves, run four producers over fresh
+# seeds in parallel batches (`sim_cluster`, `sim_cluster --c1`, `sim_cluster --c4` and
+# `sim_swarm`; the kinds `sim-cluster`, `sim-c1`, `sim-c4`, `sim-swarm`) on one branch's build per
+# round, and hand each round (every batch, plus a record of each crashed seed) to `sim_fleet
+# ingest`, once per kind. Every SIM_FLEET_CANARY_ONE_IN rounds a fifth worker runs the teeth
+# canary, a fault-on runner that must fail. With SIM_FLEET_PROFILE=auto, one round in
+# SIM_FLEET_BIAS_ONE_IN runs each cluster kind under the one fault profile `sim_fleet bias` names:
+# the one that best reaches what the commit's seeds have reached least (coverage feedback,
+# docs/core.md). The first round of each UTC day also runs `zig build test-store-faults` on its
+# commit (store_faults_day). Settings come from the environment (the unit reads
+# /etc/sim-fleet/fleet.env). The token is a file; this script never prints it. So is the
+# heartbeat URL (heartbeat): it is read only by `sim_fleet heartbeat`, from its file, and never
+# printed or put on a command line.
 #
 # The checkout this script runs from (the service checkout) never moves: each branch is built in
 # a git worktree of its own ($STATE/refs/<id>/src, build_commit), and a soaked commit contributes
@@ -57,11 +58,14 @@ main() {
     # 50000 keep its core about as busy as 100 cluster seeds keep theirs.
     : "${SIM_FLEET_BATCH_CLUSTER:=$SIM_FLEET_BATCH}"
     : "${SIM_FLEET_BATCH_C1:=$SIM_FLEET_BATCH}"
+    : "${SIM_FLEET_BATCH_C4:=$SIM_FLEET_BATCH}"
     : "${SIM_FLEET_BATCH_SWARM:=50000}"
-    # Parallel workers per kind (one core each): 1 + 1 + 1 leaves a core of a 4 vCPU host for the
-    # reporter, git and builds. A kind set to 0 is not run.
+    # Parallel workers per kind (one core each). A kind set to 0 is not run. sim-c4 defaults to 0
+    # (Review B of #263): three kinds then leave a core of a 4 vCPU host for the reporter, git and
+    # builds; set it to 1 (and another kind to 0) to run sim-c4 on such a host.
     : "${SIM_FLEET_WORKERS_CLUSTER:=1}"
     : "${SIM_FLEET_WORKERS_C1:=1}"
+    : "${SIM_FLEET_WORKERS_C4:=0}"
     : "${SIM_FLEET_WORKERS_SWARM:=1}"
     : "${SIM_FLEET_CACHE_MB:=8192}"
     # The teeth canary: 1 round in this many also runs the next fault-on runner of the cycle
@@ -111,7 +115,7 @@ main() {
         ;;
     esac
     if [ -n "${SIM_FLEET_WORKERS:-}" ]; then
-        log "SIM_FLEET_WORKERS is ignored: set SIM_FLEET_WORKERS_CLUSTER, _C1 and _SWARM"
+        log "SIM_FLEET_WORKERS is ignored: set SIM_FLEET_WORKERS_CLUSTER, _C1, _C4 and _SWARM"
     fi
     token_file="${SIM_FLEET_TOKEN_FILE:-${CREDENTIALS_DIRECTORY:+$CREDENTIALS_DIRECTORY/token}}"
     if [ -z "$SIM_FLEET_DRY_RUN" ] && [ -z "$token_file" ]; then
@@ -142,7 +146,7 @@ main() {
         heartbeat_file=""
     fi
     STATE=$SIM_FLEET_STATE_DIR
-    KINDS="sim-cluster sim-c1 sim-swarm"
+    KINDS="sim-cluster sim-c1 sim-c4 sim-swarm"
     mkdir -p "$STATE/bin" "$STATE/crashes"
     # One loop per state directory: two would race on the state file and the checkout.
     exec 9>"$STATE/lock"
@@ -445,7 +449,10 @@ kind_flags() {
     esac
     if [ "$1" = sim-canary ] && [ -n "$canary_ops" ]; then
         # A fixed range runs the world its tooth was found in: the runner's default profile.
-        echo "--c1"
+        case "$(kind_sim "$1")" in
+        sim-c4) echo "--c4" ;;
+        *) echo "--c1" ;;
+        esac
         return 0
     fi
     # The sim-c1 workers run B5's trust world (`--signed`, J12); a canary keeps the world its
@@ -454,6 +461,7 @@ kind_flags() {
     sim-c1) if [ "$1" = sim-c1 ]; then
         echo "--c1 --signed --profile=$profile"
     else echo "--c1 --profile=$profile"; fi ;;
+    sim-c4) echo "--c4 --profile=$profile" ;;
     *) echo "--profile=$profile" ;;
     esac
 }
@@ -482,6 +490,7 @@ kind_prefix() {
     case "$(kind_sim "$1")" in
     sim-swarm) echo sim-swarm ;;
     sim-c1) echo "sim-cluster --c1" ;;
+    sim-c4) echo "sim-cluster --c4" ;;
     *) echo sim-cluster ;;
     esac
 }
@@ -492,6 +501,7 @@ kind_batch() {
     sim-canary) echo "$canary_seeds" ;;
     sim-cluster) echo "$SIM_FLEET_BATCH_CLUSTER" ;;
     sim-c1) echo "$SIM_FLEET_BATCH_C1" ;;
+    sim-c4) echo "$SIM_FLEET_BATCH_C4" ;;
     *) echo "$SIM_FLEET_BATCH_SWARM" ;;
     esac
 }
@@ -506,13 +516,13 @@ kind_workers() {
     case "$1" in
     sim-cluster) echo "$SIM_FLEET_WORKERS_CLUSTER" ;;
     sim-c1) echo "$SIM_FLEET_WORKERS_C1" ;;
+    sim-c4) echo "$SIM_FLEET_WORKERS_C4" ;;
     *) echo "$SIM_FLEET_WORKERS_SWARM" ;;
     esac
 }
 
 # One round: for each kind, its workers run its producer over fresh seed ranges in parallel (one
-# core each; the default 1 + 1 + 1 leaves a core of a 4 vCPU host for the reporter, git and the
-# build), then one `sim_fleet ingest --kind K` per kind of what the round found. A producer exits
+# core each; the default 1 + 1 + 1 + 1 uses every core of a 4 vCPU host), then one `sim_fleet ingest --kind K` per kind of what the round found. A producer exits
 # 1 when seeds failed (that is the point); a run killed by a signal crashed, and its range is
 # replayed seed by seed. Workers are numbered across kinds; `$round/kind-W` names worker W's. A
 # kind whose producer the commit does not have is skipped (kind_built). The round is clean, and

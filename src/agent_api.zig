@@ -54,11 +54,13 @@ const records = @import("records.zig");
 const store = @import("store.zig");
 const writers = @import("writers.zig");
 const text_util = @import("text.zig");
+const mesh_plan = @import("mesh_plan.zig");
 
 const Context = controller.Context;
 const peer = @import("peer.zig");
 const peer_ca = @import("peer_ca.zig");
 const job_cert = @import("job_cert.zig");
+const service_cert = @import("service_cert.zig");
 const x509 = @import("x509.zig");
 
 /// The route failed and `ctx.diag` says why. Same set as `api.zig`'s, so `try` passes it up.
@@ -149,6 +151,7 @@ pub fn route(
     if (std.mem.eql(u8, what, "watch")) return call.watch();
     if (std.mem.eql(u8, what, "credential")) return call.credential();
     if (std.mem.eql(u8, what, "fetchers")) return call.fetchers();
+    if (std.mem.eql(u8, what, "mesh")) return call.mesh();
     return no_such(ctx, "/v1/agent/nodes/<node>/<that>");
 }
 
@@ -461,6 +464,11 @@ const Call = struct {
 
     fn replicas(call: Call) Failure!Reply {
         const ctx = call.ctx;
+        if (std.mem.eql(u8, call.method, "POST")) {
+            try call.only_known();
+            const id = call.parts.next() orelse return no_such(ctx, "that path");
+            return call.replica_certificate(id);
+        }
         try call.require_method("GET");
         try call.only_known();
         try call.no_more();
@@ -541,6 +549,28 @@ const Call = struct {
         assert(nodes.items.len <= given.items.len);
         const pair = try call.chain();
         return reply(ctx, .{ .revision = all.revision, .nodes = nodes.items, .chain = pair });
+    }
+
+    // ---- GET /v1/agent/nodes/{node}/mesh ----
+
+    /// The node's view of the mesh (C4 slice 4): every service, and the replicas whose rules on
+    /// this node depend on (`mesh_plan.input_for`), each with its readiness as the plan judges
+    /// it, at one revision. The agent plans from it as the server would (`mesh_plan.plan`).
+    fn mesh(call: Call) Failure!Reply {
+        const ctx = call.ctx;
+        try call.require_method("GET");
+        try call.only_known();
+        try call.no_more();
+        const snapshot = controller.read_snapshot(ctx) catch return propagate(ctx);
+        const all = mesh_plan.input_of(ctx.arena, &snapshot) catch return no_memory(ctx);
+        const view = mesh_plan.input_for(ctx.arena, &all, call.node) catch return no_memory(ctx);
+        const pair = try call.chain();
+        return reply(ctx, .{
+            .revision = snapshot.revision,
+            .services = view.services,
+            .replicas = view.replicas,
+            .chain = pair,
+        });
     }
 
     // ---- GET /v1/agent/nodes/{node}/assigned ----
@@ -675,19 +705,68 @@ const Call = struct {
     /// Signs a relayed run's key: `spiffe://<cluster>/job/<name>`, the image digest, placement
     /// epoch and labels, valid until the run's last legitimate moment. `job_cert.decide` says
     /// whether this node may have it; a refusal is ZC-E0706. Not authenticated beyond that claim
-    /// check until B7 (docs/mtls.md, threat list).
+    /// check until B7 (docs/mtls.md, "Issuance").
     fn run_certificate(call: Call, name: []const u8) Failure!Reply {
+        const ctx = call.ctx;
+        try call.certificate_path("a run's certificate");
+        if (records.name_problem(name, constants.service_name_bytes_max) != null) {
+            return bad_request(ctx, "name", "is not a valid job name");
+        }
+        const ca = call.ca.?;
+        const asked = try call.certificate_ask(ca);
+        const subject = try call.certificate_subject(name, asked.ask);
+        return call.certificate_reply(ca, &.{
+            .cluster = call.cluster,
+            .path = .job,
+            .name = subject.name,
+            .subject_key = asked.subject_key,
+            .identity = subject.identity_of(),
+            .lifetime = subject.lifetime,
+        });
+    }
+
+    // ---- POST /v1/agent/nodes/{node}/replicas/{id}/certificate ----
+
+    /// Signs a service replica's key (C4 slice 3): `spiffe://<cluster>/service/<service>`, the
+    /// replica's digest and placement epoch, valid `workload_cert_ttl_ms`. `service_cert.decide`
+    /// says whether this node may have it; a refusal is ZC-E0706 with a cause that names the
+    /// service. Not authenticated beyond that claim check until B7 (docs/mtls.md, "Issuance"):
+    /// anyone who reaches the agent API can have a replica's certificate for a key of their own.
+    fn replica_certificate(call: Call, id: []const u8) Failure!Reply {
+        const ctx = call.ctx;
+        try call.certificate_path("a replica's certificate");
+        if (records.name_problem(id, constants.replica_id_bytes_max) != null) {
+            return bad_request(ctx, "id", "is not a valid replica id");
+        }
+        const ca = call.ca.?;
+        const asked = try call.certificate_ask(ca);
+        const subject = try call.replica_subject(id, asked.ask);
+        return call.certificate_reply(ca, &.{
+            .cluster = call.cluster,
+            .path = .service,
+            .name = subject.service,
+            .subject_key = asked.subject_key,
+            .identity = subject.identity_of(),
+            .lifetime = subject.lifetime,
+        });
+    }
+
+    /// The rest of a certificate's path is `certificate`, and this server can sign: it has a CA
+    /// and names its cluster.
+    fn certificate_path(call: Call, comptime what: []const u8) Failure!void {
         const ctx = call.ctx;
         const tail = call.parts.next() orelse return no_such(ctx, "that path");
         if (!std.mem.eql(u8, tail, "certificate")) return no_such(ctx, "that path");
         try call.no_more();
-        if (records.name_problem(name, constants.service_name_bytes_max) != null) {
-            return bad_request(ctx, "name", "is not a valid job name");
-        }
-        const ca = call.ca orelse return no_such(ctx, "a run's certificate: this server has no CA");
-        if (call.cluster.len == 0) {
-            return no_such(ctx, "a run's certificate: this server names no cluster");
-        }
+        if (call.ca == null) return no_such(ctx, what ++ ": this server has no CA");
+        if (call.cluster.len == 0) return no_such(ctx, what ++ ": this server names no cluster");
+    }
+
+    const Asked = struct { ask: job_cert.Ask, subject_key: [32]u8 };
+
+    /// The body of a certificate request, `{public_key, epoch, image_digest}`, and the CA's time.
+    fn certificate_ask(call: Call, ca: *const peer_ca.Ca) Failure!Asked {
+        const ctx = call.ctx;
         const limits: BodyLimits = .{
             .bytes_max = constants.peer_join_request_bytes_max,
             .ignore_unknown_fields = false,
@@ -696,26 +775,31 @@ const Call = struct {
         const subject_key = try hex32(ctx, "public_key", input.public_key);
         const digest = try hex32(ctx, "image_digest", input.image_digest);
         if (input.epoch == 0) return bad_request(ctx, "epoch", "must not be 0");
-        const now_ms = ca.wall.now_ms();
-        const subject = try call.certificate_subject(name, .{
-            .node = call.node,
-            .epoch = input.epoch,
-            .image_digest = digest,
-            .now_ms = now_ms,
-        });
-        var der: x509.Der = undefined;
-        ca.issue_job_certificate(&der, &.{
-            .cluster = call.cluster,
-            .name = subject.name,
+        return .{
+            .ask = .{
+                .node = call.node,
+                .epoch = input.epoch,
+                .image_digest = digest,
+                .now_ms = ca.wall.now_ms(),
+            },
             .subject_key = subject_key,
-            .identity = subject.identity_of(),
-            .lifetime = subject.lifetime,
-        }) catch |err| switch (err) {
+        };
+    }
+
+    /// Signs what the rule decided and replies `{certificate, not_before_ms, not_after_ms}`.
+    fn certificate_reply(
+        call: Call,
+        ca: *const peer_ca.Ca,
+        args: *const peer_ca.DecidedArgs,
+    ) Failure!Reply {
+        const ctx = call.ctx;
+        var der: x509.Der = undefined;
+        ca.issue_decided_certificate(&der, args) catch |err| switch (err) {
             error.BadKey => return bad_request(ctx, "public_key", "is not an Ed25519 public key"),
             else => {
                 ctx.diag.raise(peer_ca.code_of(err));
-                ctx.diag.cause("the certificate for job {s} could not be made: {s}", .{
-                    name, peer_ca.reason(err),
+                ctx.diag.cause("the certificate for {s} {s} could not be made: {s}", .{
+                    @tagName(args.path), args.name, peer_ca.reason(err),
                 });
                 return error.Failed;
             },
@@ -723,9 +807,33 @@ const Call = struct {
         return reply(ctx, .{
             .certificate = std.fmt.allocPrint(ctx.arena, "{x}", .{der.slice()}) catch
                 return no_memory(ctx),
-            .not_before_ms = subject.lifetime.not_before_ms,
-            .not_after_ms = subject.lifetime.not_after_ms,
+            .not_before_ms = args.lifetime.not_before_ms,
+            .not_after_ms = args.lifetime.not_after_ms,
         });
+    }
+
+    /// `service_cert.look_up` (this node's assignment of the replica, then the replica it names)
+    /// at one revision, and `service_cert.decide` over it. The lookup is the node gate: it reads
+    /// only this node's key.
+    fn replica_subject(
+        call: Call,
+        id: []const u8,
+        ask: job_cert.Ask,
+    ) Failure!service_cert.Subject {
+        const ctx = call.ctx;
+        const head = ctx.store.status(ctx.diag) catch return propagate(ctx);
+        const found = service_cert.look_up(
+            ctx.store,
+            ctx.arena,
+            call.node,
+            id,
+            head.revision,
+            ctx.diag,
+        ) catch return propagate(ctx);
+        const service = if (found.assignment) |assignment| assignment.service else "";
+        const ttl_ms = constants.workload_cert_ttl_ms;
+        return service_cert.decide(found, ask, ttl_ms) catch |refusal|
+            refused_replica_certificate(ctx, id, service, refusal);
     }
 
     /// The job, its status, this node's claim and the run's assignment, read at one revision,
@@ -1127,7 +1235,7 @@ const Call = struct {
     fn check_put(call: Call, put: *const ObservedPut, tenure: u64) Failure!void {
         const ctx = call.ctx;
         const rec = &put.value;
-        if (records.name_problem(rec.replica, constants.node_name_bytes_max) != null) {
+        if (records.name_problem(rec.replica, constants.replica_id_bytes_max) != null) {
             return bad_request(ctx, "puts", "a record names a replica that is not a valid name");
         }
         if (!std.mem.eql(u8, rec.node, call.node)) {
@@ -1152,7 +1260,7 @@ const Call = struct {
             return bad_request(ctx, "deletes", "a key is not under this node's observed");
         }
         const rest = key[prefix.len..];
-        if (records.name_problem(rest, constants.node_name_bytes_max) != null) {
+        if (records.name_problem(rest, constants.replica_id_bytes_max) != null) {
             return bad_request(ctx, "deletes", "a key does not end in a replica id");
         }
     }
@@ -1575,6 +1683,34 @@ fn refused_certificate(ctx: *const Context, name: []const u8, refusal: job_cert.
     // No claim yet, or a claim not yet reported running: the run may still get there, so the
     // agent asks again (503) rather than marking it refused (docs/api.md).
     ctx.diag.settling = refusal == error.no_claim or refusal == error.not_started;
+    return error.Failed;
+}
+
+/// ZC-E0706 for a service replica: the cause names the service when the assignment does, and
+/// is `service_cert.reason`. A refusal is final for that ask: the agent asks again only with a
+/// newer epoch or digest (docs/api.md).
+fn refused_replica_certificate(
+    ctx: *const Context,
+    id: []const u8,
+    service: []const u8,
+    refusal: service_cert.Refusal,
+) Failure {
+    assert(ctx.diag.code == null);
+    ctx.diag.raise(.E0706);
+    if (service.len > 0) {
+        ctx.diag.cause("the server refused a certificate for replica {s} of service {s}: {s}", .{
+            id, service, service_cert.reason(refusal),
+        });
+    } else {
+        ctx.diag.cause("the server refused a certificate for replica {s}: {s}", .{
+            id, service_cert.reason(refusal),
+        });
+    }
+    if (refusal == error.short_pin) {
+        ctx.diag.fix(.{ .sentence = "pin the full 64-hex digest" });
+    } else {
+        ctx.diag.fix(.{ .sentence = "none needed if the replica moved or was replaced" });
+    }
     return error.Failed;
 }
 

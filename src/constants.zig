@@ -120,11 +120,61 @@ pub const node_name_bytes_max: u32 = 63;
 /// Replica ids are `<service>-<n>` with `n` under a billion, so an id is at most 58 bytes and fits
 /// the container-name rule of 63.
 pub const replica_number_max: u32 = 999_999_999;
+/// The longest replica id a key or a request may name: the container-name rule of 63, the bound
+/// `records.replica_key` has always checked (a name, like a node's). It is the id's own bound, not
+/// the service's: `<service>-<n>` is longer than its service.
+pub const replica_id_bytes_max: u32 = 63;
 pub const services_max: u32 = 256;
 pub const replicas_max: u32 = runtime_handles_max;
 pub const nodes_max: u32 = 64;
 /// Records one reconcile pass reads: a service holds at most this many replicas.
 pub const replicas_per_service_max: u32 = 128;
+// ---- The mesh (C4, docs/briefs/c4.md; bounds approved by the owner, O9) ----------------------
+
+/// Mesh addresses are `127.77.<hi>.<lo>`, `n = hi * 256 + lo` from 1 to 65,534: the block
+/// `127.77.0.0/16` without its first and last address. All of `127.0.0.0/8` is loopback on Linux,
+/// so binding one needs no configuration.
+pub const mesh_block_first_octet: u8 = 127;
+pub const mesh_block_second_octet: u8 = 77;
+pub const mesh_address_min: u16 = 1;
+pub const mesh_address_max: u16 = 65_534;
+/// "127.77.255.254": the longest address text.
+pub const mesh_address_text_bytes_max: u32 = 14;
+/// A deleted service's address is reused only after the decision-retention window for a gone
+/// subject (24 hours), and only once no replica of the old service remains.
+pub const mesh_address_quarantine_ms: u64 = decision_gone_age_ms_max;
+/// Addresses one allocation looks at once the counter has wrapped, before the apply is refused
+/// (ZC-E0207). Each is one read of the store in the apply.
+pub const mesh_address_probes_max: u32 = store_list_limit_max;
+/// Grants one service's `.allow` holds (ZC-E0135 past it). Approved by the supervisor, 2026-11-13.
+pub const service_allow_max: u32 = 64;
+/// The default range of mesh ports an agent hands its replicas (`--mesh-ports`): one each.
+pub const mesh_ports_default_first: u16 = 30_000;
+pub const mesh_ports_default_last: u16 = 30_999;
+/// A replica's endpoint in `/observed`: `<node address>:<port>`.
+pub const mesh_endpoint_bytes_max: u32 = 256 + ":65535".len;
+/// The lifetime of a service replica's certificate (C4 slice 3, owner answer O8): the supervisor
+/// renews at half of it with a fresh key; one not renewed by its `not_after` takes the replica
+/// off the mesh (ZC-W0703) but does not stop it.
+pub const workload_cert_ttl_ms: u64 = 60 * 60 * 1000;
+/// After a grant's removal, how long a supervisor may keep a connection on it open once it has
+/// received rules without the grant (M2; owner answer O9). sim-c4 judges it from C4 slice 5.
+pub const mesh_revoke_ms: u64 = 1000;
+
+comptime {
+    assert(mesh_address_min > 0);
+    assert(mesh_address_max == 256 * 256 - 2);
+    // Far above the cluster bound: addresses do not run out while services exist.
+    assert(mesh_address_max > services_max);
+    assert(mesh_address_probes_max > services_max);
+    assert(service_allow_max <= services_max);
+    // Every replica a node may hold gets a port of the default range (the brief, O9).
+    assert(mesh_ports_default_last - mesh_ports_default_first + 1 >= agent_node_replicas_max);
+    assert(workload_cert_ttl_ms <= x509_leaf_ttl_ms_max);
+    // X.509 times are whole seconds, and half of the lifetime is a whole second too.
+    assert(workload_cert_ttl_ms % 2000 == 0);
+}
+
 /// Generations of a service `/history` keeps (owner,
 /// docs/decisions/2026-11-05-c3-owner-answers.md): an apply that adds one past it deletes the
 /// oldest. Rolling back to a deleted one is ZC-E0128.
@@ -351,6 +401,10 @@ pub const fixtures_bytes_max: u32 = 16 * 1024;
 pub const fake_start_timeout_ms: u32 = 10 * 1000;
 /// The pause between looks while `start` waits and while `events` waits.
 pub const fake_poll_ms: u32 = 10;
+/// How often a fake runtime's supervisor reads its mesh rules again with no `SIGUSR2` (one
+/// that came before its handler stood, or after an agent restart), and tries again to bind a
+/// listener that failed (C4 slice 4). Internal to the fake runtime.
+pub const fake_mesh_poll_ms: u32 = 250;
 /// Containers kept in the state directory, running or not. A start past this drops the oldest
 /// stopped one first; with none to drop it is ZC-E0502.
 pub const fake_containers_max: u32 = runtime_handles_max;
@@ -951,6 +1005,7 @@ comptime {
     assert(rollout_grace_ms_max <= rollout_deadline_ms_max);
     assert(rollout_deadline_ms_max == job_deadline_ms_max);
     assert(service_name_bytes_max + 1 + 9 <= 63); // "<service>-<n>" fits a container name.
+    assert(service_name_bytes_max + 1 + 9 <= replica_id_bytes_max);
     assert(retention_batch_pairs * 2 <= store_txn_ops_max);
     assert(why_steps_max <= retention_pinned_max);
     assert(retention_scratch_bytes <= request_arena_bytes_max / 4);
