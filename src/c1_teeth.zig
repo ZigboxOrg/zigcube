@@ -203,10 +203,50 @@ pub const job_runs_unread = declared("c1_teeth_job_runs_unread");
 pub const fence_stop_teeth = declared("c1_teeth_fence_stop");
 pub const fence_stop_teeth_ms: u64 = if (fence_stop_teeth) 8_000 else 0;
 
+/// C4 slice 3's M3 tooth: service certificate issuance (`service_cert.decide`) does not compare
+/// the ask's placement epoch with the replica's current assignment, so a node certifies a replica
+/// under an epoch the store has moved past (must break M3).
+pub const mesh_issue_stale = declared("c1_teeth_mesh_issue_stale");
+
+/// C4 slice 3's M6 tooth: a node that starts a replica of a new digest keeps the key of the
+/// replica it replaces, as a supervisor that did not make a new key would (must break M6).
+pub const mesh_reuse_key = declared("c1_teeth_mesh_reuse_key");
+
+/// C4 slice 3 fixes: the node gate's tooth. Issuance (`service_cert.look_up`) takes the replica's
+/// assignment on any node, not the asking node's own key, so a node certifies a replica another
+/// node runs (must break M3).
+pub const mesh_issue_any_node = declared("c1_teeth_mesh_issue_any_node");
+
+/// C4 slice 3 fixes: a service replica's supervisor renews only when its certificate has expired,
+/// not at half-life (must break M3r).
+pub const mesh_renew_late = declared("c1_teeth_mesh_renew_late");
+
+/// C4 slice 5, M1's tooth (`sim_mesh_conns.zig`): the destination supervisor skips its accept
+/// check.
+pub const mesh_no_dst_check = declared("c1_teeth_mesh_no_dst_check");
+
+/// C4 slice 5, M2's tooth: supervisors leave open connections open when a grant goes.
+pub const mesh_revoke_late = declared("c1_teeth_mesh_revoke_late");
+
+/// C4 slice 5, M4's tooth: `mesh_plan.plan` makes unready replicas endpoints
+/// (`mesh_plan.Faults.route_unready`).
+pub const mesh_route_unready = declared("c1_teeth_mesh_route_unready");
+
+/// C4 fixups of #263 (Review B), the tooth of closing on rules: `mesh_plan.rules_of` hands each
+/// replica every accept it was ever given, so a supervisor keeps accepting, and keeps open the
+/// connections it alone holds, after their grant is gone (M1 against the destination's view, or
+/// M2, must fail).
+pub const mesh_stale_accept = declared("c1_teeth_mesh_stale_accept");
+
+/// The C4 teeth run in a mesh world (`sim_cluster --c4`).
+pub const mesh_world = mesh_no_dst_check or mesh_revoke_late or mesh_route_unready or
+    mesh_stale_accept;
+
 /// The teeth whose fault needs the `strong` world (state-directory wipes, unplaceable jobs, relayed
 /// jobs).
 pub const strong_world = job_unclaimed or job_wipe or evict_world or relay_leak or relay_dropped or
-    job_cert_stale or job_cert_long or relay_conn_leak or job_cert_image or relay_stop_leak;
+    job_cert_stale or job_cert_long or relay_conn_leak or job_cert_image or relay_stop_leak or
+    mesh_issue_stale or mesh_reuse_key or mesh_issue_any_node or mesh_renew_late or mesh_world;
 
 /// The agent starts every run its node's trust policy refuses: `trust_refusal` judges
 /// nothing (must break J12: no run its node's policy refuses ever starts; B5 slice 3). Needs the
@@ -234,7 +274,8 @@ pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_co
     job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped or job_reuse or
     job_cert_stale or job_cert_long or relay_conn_leak or job_cert_image or relay_stop_leak or
     job_untrusted or placement_exclusive or relabel_kept or job_pass_break or
-    job_runs_unread or job_reuse_assigned or register_unchecked or soak_leak;
+    job_runs_unread or job_reuse_assigned or register_unchecked or soak_leak or
+    mesh_issue_stale or mesh_reuse_key or mesh_issue_any_node or mesh_renew_late or mesh_world;
 
 /// The replica controller spends the rollout budget on the plan it read, without comparing the
 /// counter or the rollout record, and ignores `max_unavailable` (C3 slice 7; must break R1).
@@ -326,4 +367,12 @@ const runners = [_][2][]const u8{
     .{ "c1_teeth_rollout_stuck", "sim_c1_teeth_rollout_stuck" },
     .{ "c1_teeth_rollout_incarnation", "sim_c1_teeth_rollout_incarnation" },
     .{ "c1_teeth_rollout_template", "sim_c1_teeth_rollout_template" },
+    .{ "c1_teeth_mesh_issue_stale", "sim_c1_teeth_mesh_issue_stale" },
+    .{ "c1_teeth_mesh_reuse_key", "sim_c1_teeth_mesh_reuse_key" },
+    .{ "c1_teeth_mesh_issue_any_node", "sim_c1_teeth_mesh_issue_any_node" },
+    .{ "c1_teeth_mesh_renew_late", "sim_c1_teeth_mesh_renew_late" },
+    .{ "c1_teeth_mesh_no_dst_check", "sim_c4_teeth_mesh_no_dst_check" },
+    .{ "c1_teeth_mesh_revoke_late", "sim_c4_teeth_mesh_revoke_late" },
+    .{ "c1_teeth_mesh_route_unready", "sim_c4_teeth_mesh_route_unready" },
+    .{ "c1_teeth_mesh_stale_accept", "sim_c4_teeth_mesh_stale_accept" },
 };

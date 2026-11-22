@@ -28,6 +28,9 @@ pub const Service = struct {
     /// The health check and the rollout policy (C3, docs/keys.md); the API checks them.
     health: ?records.Health = null,
     rollout: ?records.RolloutPolicy = null,
+    /// C4: the services that may connect to this one through the mesh, and on which port
+    /// (docs/cli.md); apply checks it (ZC-E0135).
+    allow: []const records.Grant = &.{},
 };
 
 /// Reads and parses `path`. The strings of the result live in `env.arena`.
@@ -164,6 +167,7 @@ pub fn body_json(
         .health = service.health,
         .rollout = service.rollout,
         .applied_by = applied_by,
+        .allow = if (service.allow.len > 0) service.allow else null,
     };
     return std.json.Stringify.valueAlloc(arena, body, .{ .emit_null_optional_fields = false });
 }
@@ -217,6 +221,29 @@ test "a service file's source goes into the body, and is left out when there is 
     try testing.expectEqualStrings(
         "{\"name\":\"a\",\"image\":\"b3:1\",\"replicas\":1,\"command\":[\"x\"],\"env\":[]," ++
             "\"limits\":{},\"source\":\"ghcr.io/o/r@sha256:00\",\"applied_by\":\"me\"}",
+        body,
+    );
+}
+
+test "a service file's allow goes into the body, and is left out when empty" {
+    // Goal: C4's `.allow` reaches the API as written. Method: parse a file with two grants and
+    // check the JSON member; the tests above cover a file without one.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var report: Report = undefined;
+    report.reset();
+    const file =
+        \\.{ .name = "db", .image = "b3:1", .replicas = 1, .command = .{"x"},
+        \\   .allow = .{ .{ .from = "web", .port = 5432 }, .{ .from = "batch", .port = 5432 } } }
+    ;
+    const service = try parse(arena, file, "db.zon", &report);
+    try testing.expectEqual(@as(usize, 2), service.allow.len);
+    const body = try body_json(arena, service, "me");
+    try testing.expectEqualStrings(
+        "{\"name\":\"db\",\"image\":\"b3:1\",\"replicas\":1,\"command\":[\"x\"],\"env\":[]," ++
+            "\"limits\":{},\"applied_by\":\"me\",\"allow\":[{\"from\":\"web\",\"port\":5432}," ++
+            "{\"from\":\"batch\",\"port\":5432}]}",
         body,
     );
 }

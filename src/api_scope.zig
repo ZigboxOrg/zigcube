@@ -10,9 +10,10 @@
 //! - A client of scope `jobs` may create, read, cancel and watch jobs: `/v1/jobs` and below, and
 //!   `GET /v1/why/job/<name>`. Nothing else.
 //! - A client of scope `admin`, and the loopback `--insecure-listen` listener, may call
-//!   everything but two paths: `POST /v1/agent/nodes/<name>/credential`, which issues a node
-//!   certificate, and `POST /v1/agent/nodes/<name>/runs/<job>/certificate`, which issues a job's,
-//!   are the node's own (and `local`'s). No client certificate may call them, admin included:
+//!   everything but three paths: `POST /v1/agent/nodes/<name>/credential`, which issues a node
+//!   certificate, and `POST /v1/agent/nodes/<name>/runs/<job>/certificate` and
+//!   `.../replicas/<id>/certificate`, which issue a job's and a service replica's (C4), are the
+//!   node's own (and `local`'s). No client certificate may call them, admin included:
 //!   there is no admin bootstrap (decisions/2026-11-13-node-cert-bootstrap.md), and an admin
 //!   must not mint a job's identity for a key of its own (0.5.2 review).
 //! - Any node's certificate may also read the peers' summaries, the swarm fetch's discovery:
@@ -143,17 +144,20 @@ fn need_of(method: []const u8, path: []const u8, query: []const u8) Need {
     return .admin;
 }
 
-/// Whether `tail` is `/runs/<job>/certificate`: it signs a job's identity
-/// (`spiffe://<cluster>/job/<job>`) for any key it is given, so, like `/credential`, it is the
-/// node's own and no client's (0.5.2 review).
+/// Whether `tail` is `/runs/<job>/certificate` or `/replicas/<id>/certificate`: each signs an
+/// identity (a job's, or a service replica's, C4 slice 3) for any key it is given, so, like
+/// `/credential`, it is the node's own and no client's (0.5.2 review).
 fn run_certificate(tail: []const u8) bool {
-    const runs = "/runs/";
+    return signs_under(tail, "/runs/") or signs_under(tail, "/replicas/");
+}
+
+fn signs_under(tail: []const u8, collection: []const u8) bool {
     const certificate = "/certificate";
-    if (!std.mem.startsWith(u8, tail, runs)) return false;
+    if (!std.mem.startsWith(u8, tail, collection)) return false;
     if (!std.mem.endsWith(u8, tail, certificate)) return false;
-    if (tail.len <= runs.len + certificate.len) return false;
-    const job = tail[runs.len .. tail.len - certificate.len];
-    return std.mem.indexOfScalar(u8, job, '/') == null;
+    if (tail.len <= collection.len + certificate.len) return false;
+    const name = tail[collection.len .. tail.len - certificate.len];
+    return std.mem.indexOfScalar(u8, name, '/') == null;
 }
 
 /// Whether `query` is a read of `/node-store/` and nothing more: `prefix` once, exactly
@@ -383,4 +387,13 @@ test "teeth: without the prefix check a node reads the services' specs" {
 
 comptime {
     assert(std.enums.values(Scope).len == 2);
+}
+
+test "need_of: a replica's certificate is the node's own, like a run's (C4)" {
+    const own = need_of("POST", "/v1/agent/nodes/node1/replicas/web-1/certificate", "");
+    try testing.expectEqualStrings("node1", own.node_only);
+    const empty = need_of("POST", "/v1/agent/nodes/node1/replicas//certificate", "");
+    try testing.expectEqualStrings("node1", empty.node);
+    const nested = need_of("POST", "/v1/agent/nodes/node1/replicas/a/b/certificate", "");
+    try testing.expectEqualStrings("node1", nested.node);
 }

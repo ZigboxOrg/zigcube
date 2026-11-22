@@ -100,6 +100,10 @@ check $PR x "" "src/harness_tls.zig" TTTTTTTTTTTTTTTTT
 # runs everything, one to the simulator alone runs the code jobs.
 check $PR x "" "src/fencing.zig" TTTTTTTTTTTTTTTTT
 check $PR x "" "src/sim_cluster.zig src/sim_c1_teeth_oldrule_main.zig" TFFFFFFFFFFFFFFFF
+# sim-c4 runs in the sim job, which every code change runs: the mesh model and a C4 tooth's root
+# run no demo; the agent's mesh is the agent, so everything runs.
+check $PR x "" "src/sim_mesh_conns.zig src/sim_c4_teeth_mesh_stale_accept_main.zig" TFFFFFFFFFFFFFFFF
+check $PR x "" "src/agent_mesh.zig" TTTTTTTTTTTTTTTTT
 check $PR x "" "src/testing/fault_proxy.zig" TTTTTTTTTTTTTTTTT
 check $PR x "" "src/brand_new_file.zig" TTTTTTTTTTTTTTTTT
 check $PR x "" "newdir/file.txt" TTTTTTTTTTTTTTTTT

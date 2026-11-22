@@ -133,6 +133,23 @@ const Container = struct {
     cert: ?Cert = null,
     /// The clock reading (simulation ms) before which the supervisor does not ask again.
     cert_ask_ms: u64 = 0,
+    /// C4 slice 3: a service replica's mesh key (0: none made yet) and the certificate its
+    /// supervisor holds for it (sim_mesh_certs.zig); both live in the supervisor's memory, so they
+    /// go with the container. A renewal makes a new key.
+    mesh_key: u64 = 0,
+    mesh_cert: ?MeshCert = null,
+    mesh_ask_ms: u64 = 0,
+    /// The certificate expired unrenewed: the replica is off the mesh (ZC-W0703) until a renewal.
+    mesh_down: bool = false,
+    /// M3r (sim_mesh_certs.zig): the simulation time since which this replica, connected and
+    /// certifiable after the heal, has held no certificate before half-life; null otherwise.
+    mesh_due_ms: ?u64 = null,
+    /// C4 slice 4: the mesh port its supervisor took (`Spec.mesh`), null without one; the hash
+    /// of the rules it holds (`runtime.mesh_rules_hash`) and how many updates replaced them. The
+    /// simulated supervisor opens no socket: what it holds is these.
+    mesh_port: ?u16 = null,
+    mesh_rules_hash: u64 = 0,
+    mesh_updates: u32 = 0,
     /// Relayed connections open now through the relay, each on the run's certificate. Every
     /// ending closes them with the listener (`end`).
     conns: u32 = 0,
@@ -152,6 +169,9 @@ pub const relay_cancel_ms_max: u64 = 2 * constants.relay_poll_ms;
 
 /// A run's certificate as its supervisor keeps it: the placement epoch it names and its end.
 pub const Cert = struct { epoch: u64, not_after_ms: u64 };
+
+/// A replica's mesh certificate as its supervisor keeps it.
+pub const MeshCert = struct { epoch: u64, key: u64, not_before_ms: u64, not_after_ms: u64 };
 
 const Change = struct {
     handle: runtime.Handle,
@@ -176,6 +196,16 @@ pub const SimRuntime = struct {
     /// Health checks begun and refused at begin so far (the report's tally of the probe seam).
     probes_begun: u32 = 0,
     probes_refused: u32 = 0,
+    /// Called when a container's supervisor takes mesh rules (a `start` with `Spec.mesh`, or a
+    /// `mesh_update`), and with null rules when a start gives a name none: sim-c4's model of the
+    /// data path (`sim_mesh_conns.zig`) keeps what each supervisor holds.
+    on_mesh: ?*const fn (
+        context: *anyopaque,
+        name: []const u8,
+        labels: []const runtime.Label,
+        rules: ?*const runtime.MeshRules,
+    ) void = null,
+    on_mesh_context: *anyopaque = undefined,
     /// Listeners opened and closed so far (the report's tally of the relay model).
     relays_opened: u32 = 0,
     relays_closed: u32 = 0,
@@ -204,7 +234,37 @@ pub const SimRuntime = struct {
         .events = events_impl,
         .probe_begin = probe_begin_impl,
         .probe_poll = probe_poll_impl,
+        .mesh_update = mesh_update_impl,
     };
+
+    /// The mesh a container's supervisor holds: its port and the hash of its rules; null if the
+    /// container is unknown or has no mesh.
+    pub const MeshView = struct { port: u16, hash: u64, updates: u32 };
+
+    pub fn mesh_of(self: *SimRuntime, name: []const u8) ?MeshView {
+        const container = self.find(name) orelse return null;
+        const port = container.mesh_port orelse return null;
+        const hash = container.mesh_rules_hash;
+        return .{ .port = port, .hash = hash, .updates = container.mesh_updates };
+    }
+
+    /// Records the rules' hash at once, as the supervisor would apply them soon after. No tick:
+    /// a send of rules moves nothing else in the world.
+    fn mesh_update_impl(
+        context: *anyopaque,
+        handle: runtime.Handle,
+        rules: *const runtime.MeshRules,
+        diag: *Diag,
+    ) runtime.Error!void {
+        const self = from(context);
+        const container = self.find(handle.name()) orelse return not_found(diag, handle);
+        if (container.phase == .stopped) return;
+        if (container.mesh_port == null) return;
+        container.mesh_rules_hash = runtime.mesh_rules_hash(rules);
+        container.mesh_updates += 1;
+        const hook = self.on_mesh orelse return;
+        hook(self.on_mesh_context, container.name, container.labels, rules);
+    }
 
     /// Initialises in place. `fixtures` is borrowed: it must outlive the runtime.
     pub fn init(
@@ -563,6 +623,10 @@ pub const SimRuntime = struct {
             return no_memory(diag);
         };
         self.relays_opened += @intFromBool(spec.relay.len > 0);
+        if (self.on_mesh) |hook| {
+            const rules: ?*const runtime.MeshRules = if (spec.mesh) |*mesh| &mesh.rules else null;
+            hook(self.on_mesh_context, spec.name, spec.labels, rules);
+        }
         return .{ .started = runtime.Handle.init(spec.name) };
     }
 
@@ -600,6 +664,8 @@ pub const SimRuntime = struct {
             .ignores_stop = false,
             .relay_wanted = spec.relay.len > 0,
             .relay_open = spec.relay.len > 0,
+            .mesh_port = if (spec.mesh) |mesh| mesh.port else null,
+            .mesh_rules_hash = if (spec.mesh) |*mesh| runtime.mesh_rules_hash(&mesh.rules) else 0,
         };
     }
 
@@ -931,6 +997,45 @@ test "a digest in the fixtures starts, and one that is not fails with ZBX-E0410"
         failure.last_cause().?,
     );
     try testing.expectEqual(@as(u32, 1), sim.running_count());
+}
+
+test "mesh: a container started with a mesh holds its rules' hash; updates replace it" {
+    // Goal: the seam as the simulated supervisor serves it. A container without a mesh ignores
+    // rules, a stopped one too, and an unknown name is NotFound.
+    var manual: ManualClock = .{ .ms = 5 };
+    var sim: SimRuntime = undefined;
+    sim.init(testing.allocator, manual.clock(), 7, &default_fixtures);
+    defer sim.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    const rt = sim.interface();
+    const open: []const runtime.MeshAccept = &.{.{ .from = "web", .port = 80, .open = true }};
+    const shut: []const runtime.MeshAccept = &.{.{ .from = "web", .port = 80, .open = false }};
+    const first: runtime.MeshRules = .{ .accepts = open };
+    const second: runtime.MeshRules = .{ .accepts = shut };
+    const labels = labels_of.one("db-1");
+    var spec = spec_for("db-1", "b3:51aa9c03", &labels);
+    spec.mesh = .{ .port = 30_001, .rules = first };
+    const handle = (try rt.start(&spec, &diag)).started;
+    try testing.expectEqual(@as(u16, 30_001), sim.mesh_of("db-1").?.port);
+    try testing.expectEqual(runtime.mesh_rules_hash(&first), sim.mesh_of("db-1").?.hash);
+    try rt.mesh_update(handle, &second, &diag);
+    try testing.expectEqual(runtime.mesh_rules_hash(&second), sim.mesh_of("db-1").?.hash);
+    try testing.expectEqual(@as(u32, 1), sim.mesh_of("db-1").?.updates);
+
+    const plain_labels = labels_of.one("hello-1");
+    const plain = spec_for("hello-1", "b3:51aa9c03", &plain_labels);
+    const plain_handle = (try rt.start(&plain, &diag)).started;
+    try rt.mesh_update(plain_handle, &second, &diag);
+    try testing.expect(sim.mesh_of("hello-1") == null);
+
+    try rt.stop(handle, 1000, &diag);
+    try rt.mesh_update(handle, &first, &diag);
+    try testing.expectEqual(runtime.mesh_rules_hash(&second), sim.mesh_of("db-1").?.hash);
+    try testing.expectError(
+        error.NotFound,
+        rt.mesh_update(runtime.Handle.init("nobody-1"), &first, &diag),
+    );
 }
 
 test "faults end a container the way a real one ends, and list says how" {

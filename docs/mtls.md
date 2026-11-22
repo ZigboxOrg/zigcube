@@ -172,7 +172,8 @@ included, gets 403 `ZC-E0822` there (an admin cannot mint a node's identity thro
 `ca issue-node` on the server host is the only bootstrap). `POST
 /v1/agent/nodes/<name>/runs/<job>/certificate`, which signs a job's identity for the key it is
 given, is node `<name>`'s own the same way: an admin client must not mint a job's identity for a
-key of its own (0.5.2 review). A node renews and registers only on
+key of its own (0.5.2 review). `POST /v1/agent/nodes/<name>/replicas/<id>/certificate`, which
+signs a service replica's identity (C4 slice 3), is node `<name>`'s own for the same reason. A node renews and registers only on
 the lease of its own registration: a keepalive of another node's lease is `ZC-E0205`, and a
 registration on a lease another node is registered on is `ZC-E0104` (`agent_api.zig`).
 
@@ -634,7 +635,32 @@ Threats this does not answer yet:
 - **Issuance is unauthenticated until B7.** Anyone who can reach the server's agent API and names
   a node, a running relayed job, its epoch and digest gets a certificate for a key of their own.
   The server checks the claim (`job_cert.decide`), not who asks. Listen on a private address.
+  The same holds for a service replica's certificate (C4 slice 3,
+  `POST /v1/agent/nodes/{node}/replicas/{id}/certificate`, `service_cert.decide`): naming a node,
+  a replica assigned to it, the placement epoch and the digest is enough. So until B7
+  authenticates issuance, no mesh peer may trust a `/service/` certificate as proof that its
+  holder is the replica it names: the mesh slices that accept them (C4 slices 4 and 5) are
+  blocked on B7 for anything beyond a test cluster on a private network
+  (docs/decisions/2026-11-14-c4-service-cert-rulings.md, ruling 6).
 - The Zigbox runtime's relay still dials plain TCP (B4 slice 4).
+
+## Threats the service mesh adds (C4)
+
+C4 (docs/briefs/c4.md) puts a workload certificate's key in each service replica's supervisor and
+has supervisors serve the node's network for their replicas. Slice 1 records these threats; the
+slice named after each builds the defence, and its tests are the evidence.
+
+| # | Threat | Defence | Slice |
+| --- | --- | --- | --- |
+| T1 | A container connects to a service it has no grant for | The container is `--net none`; its only sockets to other workloads are the listeners its supervisor makes for current grants. The destination supervisor checks the grant again (ZC-E0707) | 2, 4, 7 |
+| T2 | A compromised or lying source node widens access (claims a grant, a service or a port) | The destination checks chain, `/service/<S>`, the grant `S → D:P` and the port in SNI against its own view; the source node is not trusted | 3, 6 |
+| T3 | A revoked grant keeps working | Both ends close the listeners and open connections of a grant within `mesh_revoke_ms` of seeing it go; either end alone refuses | 4, 6 |
+| T4 | A replica's key leaks to the workload or to disk | The supervisor makes the key in memory and never writes or passes it on; the workload sees only plaintext on loopback | 3 |
+| T5 | **A supervisor is a new trust edge (G10).** A compromised supervisor holds one replica's key and serves the node's network for it | It can act as that one replica, under its grants, until its certificate expires or its epoch moves on; no daemon holds more than one replica's key, and a node-wide ingress is ruled out for that reason | 3 |
+| T6 | A certificate is used after its replica is replaced or its node fenced | Issuance only for the node holding the current assignment at the current epoch (ZC-E0706); certificates are short and renewed (ZC-W0703 when not), so one issued before a replacement or fence works until it expires: the destination does not yet check the epoch (epoch enforcement is C7) | 3 |
+| T7 | A deleted service's address is taken by a new service while old replicas still answer on it | An address is not reused while a replica of the old service remains, nor within 24 hours of the delete (docs/keys.md, "Mesh addresses") | 1 |
+| T8 | A grant names a service that does not exist yet, and a later service of that name inherits it | Accepted by design: a grant names a service, not an incarnation; `zcube why grant` shows it, and ZC-W0704 warns of a grant to a service that does not exist | 2 |
+| T9 | Plaintext crosses the node's network | Every workload connection goes through two supervisors over TLS 1.3, on one node too; there is no unencrypted same-node path | 6 |
 
 ## Diagnostics
 

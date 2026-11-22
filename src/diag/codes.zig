@@ -59,6 +59,7 @@ pub const Code = enum(u8) {
     E0132,
     E0133,
     E0134,
+    E0135,
     E0201,
     E0202,
     E0203,
@@ -125,6 +126,13 @@ pub const Code = enum(u8) {
     E0706,
     W0701,
     W0702,
+    E0707,
+    E0708,
+    E0709,
+    E0710,
+    E0711,
+    W0703,
+    W0704,
     E0801,
     E0802,
     E0803,
@@ -736,6 +744,22 @@ pub const registry = [_]Entry{
         ,
     },
     .{
+        .code = .E0135,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a service's allow list has a bad entry",
+        .explanation =
+        \\A service's `allow` lists the services that may connect to it and the port
+        \\each may use. The server refused this one before storing anything: an entry
+        \\names a port of 0 or above 65535, names the service itself, repeats an
+        \\earlier entry, names a service that could not exist, or the list is longer
+        \\than 64 entries. The cause line names the entry.
+        \\
+        \\Fix the entry and apply again. A grant to a service that does not exist yet
+        \\is allowed: only its name must be valid.
+        ,
+    },
+    .{
         .code = .E0201,
         .severity = .@"error",
         .blame = .external,
@@ -843,12 +867,17 @@ pub const registry = [_]Entry{
         .explanation =
         \\The store is full in a dimension it bounds on purpose: all watch slots
         \\are in use, all lease slots are in use, the memory set aside for the
-        \\request was not enough for the result, or a record would take more
-        \\bytes than the store keeps in one value (the cause gives both sizes).
+        \\request was not enough for the result, a record would take more bytes
+        \\than the store keeps in one value (the cause gives both sizes), or no
+        \\mesh address is free for a new service (127.77.0.0/16: every address a
+        \\create tried is held, by a service or by one deleted within a day or
+        \\whose replicas remain).
         \\
         \\Close watches that are no longer needed, or ask for smaller pages. For
-        \\an oversized record, shorten its largest field. If the limit is too low
-        \\for the fleet, raise it in the server's configuration.
+        \\an oversized record, shorten its largest field. For mesh addresses,
+        \\delete services that are no longer used, or wait a day for deleted ones
+        \\to be released. These bounds are fixed in this release; none is a
+        \\setting.
         ,
     },
     .{
@@ -1371,6 +1400,12 @@ pub const registry = [_]Entry{
         \\cause line says what was refused and why. The agent did not start and
         \\changed nothing.
         \\
+        \\The mesh port range (--mesh-ports A-B) must hold at least 512 ports, as
+        \\many as the agent can run containers, so that it cannot run out. It is
+        \\refused when the agent advertises no address for peers (--peer-advertise),
+        \\since its replicas then get no mesh, and when it holds the --peer-listen
+        \\port.
+        \\
         \\Run zcube-agent --help for the flags and the file's fields.
         ,
     },
@@ -1826,25 +1861,34 @@ pub const registry = [_]Entry{
         .code = .E0706,
         .severity = .@"error",
         .blame = .environment,
-        .summary = "the server refused a relayed run's certificate",
+        .summary = "the server refused a workload certificate",
         .explanation =
-        \\A relayed job's supervisor made a key for the run, and the agent asked the
-        \\server to sign it. The server signs only for the node that holds the job's
-        \\current claim, at the claim's placement epoch, for an image that matches
-        \\the job's, while the run has not ended. It refused: the cause says which
-        \\check failed (not this node's claim, a stale epoch, the run has ended, a
-        \\different image).
+        \\A relayed job's or a service replica's supervisor made a key, and the agent
+        \\asked the server to sign it. For a relayed run the server signs only for
+        \\the node that holds the job's current claim, at the claim's placement
+        \\epoch, for an image that matches the job's, while the run has not ended.
+        \\For a service replica (`/service/<name>`) it signs only for the node the
+        \\replica is assigned to, at the assignment's epoch, for the digest the
+        \\replica runs. It refused: the cause names the run, or the replica and its
+        \\service, and which check failed (not this node's, a stale epoch, the run
+        \\has ended or the replica is gone, a different image). A service
+        \\that pins its image by a short `b3:` digest is always refused,
+        \\since a certificate names the full digest: pin the full 64-hex
+        \\digest.
         \\
-        \\The relay stays closed: the job's connections to it are closed without
-        \\reaching the upstream, and the line is in the job's `relay.log`. This is
-        \\what a run that lost its claim (the node was cut off, the job was placed
-        \\elsewhere, or it was cancelled) should see, and needs no action. If it
-        \\repeats for a run that is still this node's, check `zcube job status` for
-        \\the claim and compare the agent's and the server's versions.
+        \\A relay stays closed: the job's connections to it are closed without
+        \\reaching the upstream, and the line is in the job's `relay.log`. A replica
+        \\gets no new mesh certificate; it keeps running, and when the one it holds
+        \\expires it is off the mesh (ZC-W0703). This is what a run or replica that
+        \\moved (the node was cut off, it was placed elsewhere, cancelled or
+        \\replaced) should see, and needs no action. If it repeats for one that is
+        \\still this node's, check `zcube job status` or `zcube why replica`, and
+        \\compare the agent's and the server's versions.
         \\
-        \\Two causes are not final: no node has claimed the run yet, or the claim has
-        \\not started it. The server then answers 503, not 409, and the agent asks
-        \\again by itself; it marks the run refused only on a 409.
+        \\For a run, two causes are not final: no node has claimed it yet,
+        \\or the claim has not started it. The server then answers 503, not
+        \\409, and the agent asks again by itself; it marks the run refused
+        \\only on a 409.
         ,
     },
     .{
@@ -1874,6 +1918,112 @@ pub const registry = [_]Entry{
         \\
         \\Open a new connection to go on. A job that needs a connection quiet for
         \\longer than five minutes should send something now and then.
+        ,
+    },
+    .{
+        .code = .E0707,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "no grant allows this connection",
+        .explanation =
+        \\A replica connected to another service on the mesh, and the destination's
+        \\`allow` list has no entry for the source service and that port. The
+        \\connection was closed before any byte reached the destination. Grants are
+        \\checked at both ends; either one refuses on its own.
+        \\
+        \\If the connection should be allowed, add `{ .from = "SOURCE", .port = N }`
+        \\to the destination's `allow` and apply it. zcube why grant SOURCE DEST:PORT
+        \\shows what the destination allows now and who changed it last.
+        ,
+    },
+    .{
+        .code = .E0708,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "a mesh peer's certificate was refused",
+        .explanation =
+        \\A mesh connection's peer showed a certificate this end did not accept: it is
+        \\not signed by this cluster's workload issuer, is not a service certificate,
+        \\names no service, has expired or is not valid yet. The cause line says
+        \\which. The connection was closed.
+        \\
+        \\A certificate that has expired or is not valid yet usually means a node's
+        \\clock is wrong: check time sync on both nodes. Any other reason means the
+        \\peer is not a replica of this cluster, which is a bug if both ends are.
+        ,
+    },
+    .{
+        .code = .E0709,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a granted service has no ready replica",
+        .explanation =
+        \\A replica connected to a service it is allowed to reach, and no replica of
+        \\that service is ready: none runs, none has passed its readiness check, or
+        \\none has published a mesh endpoint yet. The connection was closed.
+        \\
+        \\Check the destination with zcube why service NAME. The connection may be
+        \\opened again; it succeeds once a replica of the destination is ready.
+        ,
+    },
+    .{
+        .code = .E0710,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "a mesh port could not be bound on this node",
+        .explanation =
+        \\The agent gives each replica a port from the node's mesh port range for the
+        \\connections other replicas make to it. No port of the range could be bound:
+        \\other programs on the node hold them. The replica does not start: an
+        \\unbindable port is a start failure, never a replica without a mesh.
+        \\
+        \\Find what holds the ports (ss -ltn) and stop it, or give the agent another
+        \\range. The agent retries the start on its own.
+        ,
+    },
+    .{
+        .code = .E0711,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the mesh could not make a socket in the container",
+        .explanation =
+        \\To carry a replica's mesh connections the agent makes a listening socket in
+        \\the container's own network namespace. The runtime refused it, so the
+        \\replica has no mesh: connections it makes to other services, and theirs
+        \\to it, fail.
+        \\
+        \\The cause line names the runtime's error. Check that the node's runtime is
+        \\the release the agent expects; the agent and the runtime are upgraded
+        \\together.
+        ,
+    },
+    .{
+        .code = .W0703,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "a replica's mesh certificate could not be renewed",
+        .explanation =
+        \\The agent renews each replica's mesh certificate at half its lifetime, and
+        \\the server did not issue a new one: it was unreachable, or refused. The
+        \\replica keeps running. When its certificate expires it is taken off the
+        \\mesh until a renewal succeeds; the agent keeps trying.
+        \\
+        \\Check that the node reaches the server. A refusal names its own code in
+        \\the cause line.
+        ,
+    },
+    .{
+        .code = .W0704,
+        .severity = .warning,
+        .blame = .user,
+        .summary = "a grant names a service that does not exist",
+        .explanation =
+        \\A service's `allow` names a source service that is not stored. The grant
+        \\was kept, so services may be applied in any order; it takes effect when a
+        \\service of that name is created.
+        \\
+        \\If the name is a typo, correct it and apply again: a grant to a missing
+        \\service would let whoever creates that name connect.
         ,
     },
     .{

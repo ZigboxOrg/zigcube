@@ -239,6 +239,13 @@ export const ZC_CODES = [
     "explanation": "Every job is submitted with a submit-by time, at most an hour ahead. This\nPOST arrived after it, so the job was not created. The deadline exists so\nthat a retry of a POST can always find the job the first one made: an ended\njob is kept for at least as long as a submit window.\n\nSubmit again with a new submit-by time. If the job was created by an\nearlier attempt, zcube job get NAME shows it; do not assume it did not run."
   },
   {
+    "code": "ZC-E0135",
+    "severity": "error",
+    "blame": "user",
+    "summary": "a service's allow list has a bad entry",
+    "explanation": "A service's `allow` lists the services that may connect to it and the port\neach may use. The server refused this one before storing anything: an entry\nnames a port of 0 or above 65535, names the service itself, repeats an\nearlier entry, names a service that could not exist, or the list is longer\nthan 64 entries. The cause line names the entry.\n\nFix the entry and apply again. A grant to a service that does not exist yet\nis allowed: only its name must be valid."
+  },
+  {
     "code": "ZC-E0201",
     "severity": "error",
     "blame": "external",
@@ -285,7 +292,7 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "environment",
     "summary": "the store has no free capacity for this",
-    "explanation": "The store is full in a dimension it bounds on purpose: all watch slots\nare in use, all lease slots are in use, the memory set aside for the\nrequest was not enough for the result, or a record would take more\nbytes than the store keeps in one value (the cause gives both sizes).\n\nClose watches that are no longer needed, or ask for smaller pages. For\nan oversized record, shorten its largest field. If the limit is too low\nfor the fleet, raise it in the server's configuration."
+    "explanation": "The store is full in a dimension it bounds on purpose: all watch slots\nare in use, all lease slots are in use, the memory set aside for the\nrequest was not enough for the result, a record would take more bytes\nthan the store keeps in one value (the cause gives both sizes), or no\nmesh address is free for a new service (127.77.0.0/16: every address a\ncreate tried is held, by a service or by one deleted within a day or\nwhose replicas remain).\n\nClose watches that are no longer needed, or ask for smaller pages. For\nan oversized record, shorten its largest field. For mesh addresses,\ndelete services that are no longer used, or wait a day for deleted ones\nto be released. These bounds are fixed in this release; none is a\nsetting."
   },
   {
     "code": "ZC-E0208",
@@ -488,7 +495,7 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "user",
     "summary": "the agent's configuration can't be used",
-    "explanation": "A flag or a setting in the agent's ZON file is missing, unknown or out of\nrange, the node's labels are malformed or given by --label and by the\nfile's .labels differently, the labels differ from those the node\nregistered with while its lease in --state-dir is live, or a file it\nnames (the image fixtures, the --trust-policy file) cannot be read or\nused. The --trust-policy file, and every directory on its path (a\nsymbolic link's own directory and those of its target included), must\nbe owned by root or the agent's user and writable by neither group nor\nothers (a directory with the sticky bit, as /tmp, may be, and then\nevery entry the path passes in it, a link included, must be owned by\nroot or the agent's user, must be neither a mount point nor on\nanother mount than the directory, and, unless it is a directory, must\nhave no other name (hard link)). Without --ca (or .ca in the file)\nthe agent speaks plain HTTP, so --server must then be a loopback\naddress (127.0.0.0/8 or [::1]): the server serves plain HTTP on\nloopback only, and a node must not take its work unauthenticated over\na network; give --ca, --cert and --key to reach any other address over\nTLS (zcube-agent fetch keeps the same rule for its --server). The\ncause line says what was refused and why. The agent did not start and\nchanged nothing.\n\nRun zcube-agent --help for the flags and the file's fields."
+    "explanation": "A flag or a setting in the agent's ZON file is missing, unknown or out of\nrange, the node's labels are malformed or given by --label and by the\nfile's .labels differently, the labels differ from those the node\nregistered with while its lease in --state-dir is live, or a file it\nnames (the image fixtures, the --trust-policy file) cannot be read or\nused. The --trust-policy file, and every directory on its path (a\nsymbolic link's own directory and those of its target included), must\nbe owned by root or the agent's user and writable by neither group nor\nothers (a directory with the sticky bit, as /tmp, may be, and then\nevery entry the path passes in it, a link included, must be owned by\nroot or the agent's user, must be neither a mount point nor on\nanother mount than the directory, and, unless it is a directory, must\nhave no other name (hard link)). Without --ca (or .ca in the file)\nthe agent speaks plain HTTP, so --server must then be a loopback\naddress (127.0.0.0/8 or [::1]): the server serves plain HTTP on\nloopback only, and a node must not take its work unauthenticated over\na network; give --ca, --cert and --key to reach any other address over\nTLS (zcube-agent fetch keeps the same rule for its --server). The\ncause line says what was refused and why. The agent did not start and\nchanged nothing.\n\nThe mesh port range (--mesh-ports A-B) must hold at least 512 ports, as\nmany as the agent can run containers, so that it cannot run out. It is\nrefused when the agent advertises no address for peers (--peer-advertise),\nsince its replicas then get no mesh, and when it holds the --peer-listen\nport.\n\nRun zcube-agent --help for the flags and the file's fields."
   },
   {
     "code": "ZC-E0506",
@@ -683,8 +690,8 @@ export const ZC_CODES = [
     "code": "ZC-E0706",
     "severity": "error",
     "blame": "environment",
-    "summary": "the server refused a relayed run's certificate",
-    "explanation": "A relayed job's supervisor made a key for the run, and the agent asked the\nserver to sign it. The server signs only for the node that holds the job's\ncurrent claim, at the claim's placement epoch, for an image that matches\nthe job's, while the run has not ended. It refused: the cause says which\ncheck failed (not this node's claim, a stale epoch, the run has ended, a\ndifferent image).\n\nThe relay stays closed: the job's connections to it are closed without\nreaching the upstream, and the line is in the job's `relay.log`. This is\nwhat a run that lost its claim (the node was cut off, the job was placed\nelsewhere, or it was cancelled) should see, and needs no action. If it\nrepeats for a run that is still this node's, check `zcube job status` for\nthe claim and compare the agent's and the server's versions.\n\nTwo causes are not final: no node has claimed the run yet, or the claim has\nnot started it. The server then answers 503, not 409, and the agent asks\nagain by itself; it marks the run refused only on a 409."
+    "summary": "the server refused a workload certificate",
+    "explanation": "A relayed job's or a service replica's supervisor made a key, and the agent\nasked the server to sign it. For a relayed run the server signs only for\nthe node that holds the job's current claim, at the claim's placement\nepoch, for an image that matches the job's, while the run has not ended.\nFor a service replica (`/service/<name>`) it signs only for the node the\nreplica is assigned to, at the assignment's epoch, for the digest the\nreplica runs. It refused: the cause names the run, or the replica and its\nservice, and which check failed (not this node's, a stale epoch, the run\nhas ended or the replica is gone, a different image). A service\nthat pins its image by a short `b3:` digest is always refused,\nsince a certificate names the full digest: pin the full 64-hex\ndigest.\n\nA relay stays closed: the job's connections to it are closed without\nreaching the upstream, and the line is in the job's `relay.log`. A replica\ngets no new mesh certificate; it keeps running, and when the one it holds\nexpires it is off the mesh (ZC-W0703). This is what a run or replica that\nmoved (the node was cut off, it was placed elsewhere, cancelled or\nreplaced) should see, and needs no action. If it repeats for one that is\nstill this node's, check `zcube job status` or `zcube why replica`, and\ncompare the agent's and the server's versions.\n\nFor a run, two causes are not final: no node has claimed it yet,\nor the claim has not started it. The server then answers 503, not\n409, and the agent asks again by itself; it marks the run refused\nonly on a 409."
   },
   {
     "code": "ZC-W0701",
@@ -699,6 +706,55 @@ export const ZC_CODES = [
     "blame": "user",
     "summary": "a relayed connection reached its byte or idle bound",
     "explanation": "A connection through a job's relay was closed by the relay itself: it had\ncarried 1 GiB in one direction, or neither side had sent a byte for five\nminutes. The cause line says which. The job's other connections are not\naffected.\n\nOpen a new connection to go on. A job that needs a connection quiet for\nlonger than five minutes should send something now and then."
+  },
+  {
+    "code": "ZC-E0707",
+    "severity": "error",
+    "blame": "user",
+    "summary": "no grant allows this connection",
+    "explanation": "A replica connected to another service on the mesh, and the destination's\n`allow` list has no entry for the source service and that port. The\nconnection was closed before any byte reached the destination. Grants are\nchecked at both ends; either one refuses on its own.\n\nIf the connection should be allowed, add `{ .from = \"SOURCE\", .port = N }`\nto the destination's `allow` and apply it. zcube why grant SOURCE DEST:PORT\nshows what the destination allows now and who changed it last."
+  },
+  {
+    "code": "ZC-E0708",
+    "severity": "error",
+    "blame": "environment",
+    "summary": "a mesh peer's certificate was refused",
+    "explanation": "A mesh connection's peer showed a certificate this end did not accept: it is\nnot signed by this cluster's workload issuer, is not a service certificate,\nnames no service, has expired or is not valid yet. The cause line says\nwhich. The connection was closed.\n\nA certificate that has expired or is not valid yet usually means a node's\nclock is wrong: check time sync on both nodes. Any other reason means the\npeer is not a replica of this cluster, which is a bug if both ends are."
+  },
+  {
+    "code": "ZC-E0709",
+    "severity": "error",
+    "blame": "user",
+    "summary": "a granted service has no ready replica",
+    "explanation": "A replica connected to a service it is allowed to reach, and no replica of\nthat service is ready: none runs, none has passed its readiness check, or\nnone has published a mesh endpoint yet. The connection was closed.\n\nCheck the destination with zcube why service NAME. The connection may be\nopened again; it succeeds once a replica of the destination is ready."
+  },
+  {
+    "code": "ZC-E0710",
+    "severity": "error",
+    "blame": "environment",
+    "summary": "a mesh port could not be bound on this node",
+    "explanation": "The agent gives each replica a port from the node's mesh port range for the\nconnections other replicas make to it. No port of the range could be bound:\nother programs on the node hold them. The replica does not start: an\nunbindable port is a start failure, never a replica without a mesh.\n\nFind what holds the ports (ss -ltn) and stop it, or give the agent another\nrange. The agent retries the start on its own."
+  },
+  {
+    "code": "ZC-E0711",
+    "severity": "error",
+    "blame": "environment",
+    "summary": "the mesh could not make a socket in the container",
+    "explanation": "To carry a replica's mesh connections the agent makes a listening socket in\nthe container's own network namespace. The runtime refused it, so the\nreplica has no mesh: connections it makes to other services, and theirs\nto it, fail.\n\nThe cause line names the runtime's error. Check that the node's runtime is\nthe release the agent expects; the agent and the runtime are upgraded\ntogether."
+  },
+  {
+    "code": "ZC-W0703",
+    "severity": "warning",
+    "blame": "environment",
+    "summary": "a replica's mesh certificate could not be renewed",
+    "explanation": "The agent renews each replica's mesh certificate at half its lifetime, and\nthe server did not issue a new one: it was unreachable, or refused. The\nreplica keeps running. When its certificate expires it is taken off the\nmesh until a renewal succeeds; the agent keeps trying.\n\nCheck that the node reaches the server. A refusal names its own code in\nthe cause line."
+  },
+  {
+    "code": "ZC-W0704",
+    "severity": "warning",
+    "blame": "user",
+    "summary": "a grant names a service that does not exist",
+    "explanation": "A service's `allow` names a source service that is not stored. The grant\nwas kept, so services may be applied in any order; it takes effect when a\nservice of that name is created.\n\nIf the name is a typo, correct it and apply again: a grant to a missing\nservice would let whoever creates that name connect."
   },
   {
     "code": "ZC-E0801",

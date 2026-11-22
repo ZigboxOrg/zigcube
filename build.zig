@@ -1960,16 +1960,19 @@ fn add_sim_steps(b: *std.Build, options: SimStepOptions) void {
     add_sim_fleet_step(b, sim);
     add_sim_teeth_step(b, sim);
     add_sim_c1_steps(b, sim);
+    add_sim_c4_steps(b, sim);
     add_sim_swarm_teeth_step(b, sim);
     add_sim_canary_step(b);
 }
 
 /// `zig build sim-canary-exe` installs every fault-on runner the fleet's teeth canary runs
-/// (`ops/sim-fleet/run.sh`, `canary_pick`): `sim_teeth`, `sim_swarm_teeth` and the six
-/// `sim_c1_teeth_*`, and `share/sim-fleet/canaries.txt`, the manifest `run.sh` reads them from.
+/// (`ops/sim-fleet/run.sh`, `canary_pick`): `sim_teeth`, `sim_swarm_teeth`, the `sim_c1_teeth_*`
+/// and `sim_c4_teeth_*`, and `share/sim-fleet/canaries.txt`, the manifest `run.sh` reads them from.
 fn add_sim_canary_step(b: *std.Build) void {
     const canary = b.step("sim-canary-exe", "Install the fault-on runners of the fleet's canary");
-    const names = [_][]const u8{ "sim-teeth-exe", "sim-swarm-teeth-exe", "sim-c1-teeth-exe" };
+    const names = [_][]const u8{
+        "sim-teeth-exe", "sim-swarm-teeth-exe", "sim-c1-teeth-exe", "sim-c4-teeth-exe",
+    };
     for (names) |name| canary.dependOn(&b.top_level_steps.get(name).?.step);
     const files = b.addWriteFiles();
     const manifest = files.add("canaries.txt", canary_manifest(b));
@@ -2001,6 +2004,11 @@ fn canary_manifest(b: *std.Build) []const u8 {
                 text, entry.name, seed, entry.ops, entry.symptom,
             });
         }
+    }
+    for (c4_teeth_roots) |entry| {
+        text = b.fmt("{s}sim_c4_teeth_{s} sim-c4 {d} {s}\n", .{
+            text, entry.name, entry.canary_seeds, entry.symptom,
+        });
     }
     return b.fmt("{s}sim_swarm_teeth sim-swarm {d} {s}\n", .{
         text, canary_seeds_swarm_teeth, canary_symptom_swarm_teeth,
@@ -2339,6 +2347,40 @@ const c1_teeth_roots = [_]struct {
         .any_symptom = true,
     },
     .{
+        .name = "mesh_issue_stale",
+        .root = "src/sim_c1_teeth_mesh_issue_stale_main.zig",
+        // M3 (C4 slice 3): the issuer does not compare the ask's epoch, and a forged ask for an
+        // earlier epoch of a service replica gets a certificate. Strong world, plain runs too.
+        .symptom = "M3: a certificate was issued for a stale epoch",
+        .canary_seeds = 20,
+        .plain_symptom = "M3: a certificate was issued for a stale epoch",
+    },
+    .{
+        .name = "mesh_reuse_key",
+        .root = "src/sim_c1_teeth_mesh_reuse_key_main.zig",
+        // M6: a new replica takes the key last made for its service on its node.
+        .symptom = "M6: a key was certified for two",
+        .canary_seeds = 20,
+        .plain_symptom = "M6: a key was certified for two",
+    },
+    .{
+        .name = "mesh_issue_any_node",
+        .root = "src/sim_c1_teeth_mesh_issue_any_node_main.zig",
+        // M3's node clause (C4 slice 3 fixes): the issuer looks the assignment up on any node,
+        // and a forged ask in another node's name gets a certificate.
+        .symptom = "M3: a certificate was issued for a replica not assigned to the node",
+        .canary_seeds = 20,
+        .plain_symptom = "M3: a certificate was issued for a replica not assigned to the node",
+    },
+    .{
+        .name = "mesh_renew_late",
+        .root = "src/sim_c1_teeth_mesh_renew_late_main.zig",
+        // M3r (C4 slice 3 fixes): supervisors renew only at expiry, not at half-life.
+        .symptom = "M3r",
+        .canary_seeds = 20,
+        .plain_symptom = "M3r",
+    },
+    .{
         .name = "job_reuse",
         .root = "src/sim_c1_teeth_job_reuse_main.zig",
         // J11 (a run that exited without a node starting it); the reuse world
@@ -2654,6 +2696,101 @@ fn add_c1_comparison(
 /// A tooth's operations argument: its `ops`, or `auto` for an `auto_shape` tooth.
 fn teeth_ops_text(b: *std.Build, entry: anytype) []const u8 {
     return if (entry.auto_shape) "auto" else b.fmt("{d}", .{entry.ops});
+}
+
+/// The negative tests of sim-c4 (C4 slice 5, docs/briefs/c4.md "Simulation and fault checks"):
+/// each root declares one mesh tooth (`src/c1_teeth.zig`) and runs with `--c4`; the run must fail
+/// with the check it breaks. `canary_seeds` is the fleet's range of fresh seeds at drawn shapes.
+/// M3, M3r and M6 are C4 slice 3's teeth, in `c1_teeth_roots`; M5's comes with slice 6.
+const c4_teeth_roots = [_]struct {
+    name: []const u8,
+    root: []const u8,
+    symptom: []const u8,
+    canary_seeds: u32,
+    /// The last seed `sim-c4-teeth-NAME` runs, from 1 (it stops at the first that fails).
+    seeds: u32 = teeth_seeds_max,
+}{
+    .{
+        .name = "mesh_no_dst_check",
+        .root = "src/sim_c4_teeth_mesh_no_dst_check_main.zig",
+        .symptom = "M1",
+        .canary_seeds = 20,
+    },
+    .{
+        .name = "mesh_revoke_late",
+        .root = "src/sim_c4_teeth_mesh_revoke_late_main.zig",
+        .symptom = "M2",
+        .canary_seeds = 40,
+    },
+    .{
+        .name = "mesh_route_unready",
+        .root = "src/sim_c4_teeth_mesh_route_unready_main.zig",
+        .symptom = "M4",
+        .canary_seeds = 20,
+    },
+    .{
+        .name = "mesh_stale_accept",
+        .root = "src/sim_c4_teeth_mesh_stale_accept_main.zig",
+        .symptom = "M1|M2|M4",
+        .canary_seeds = 20,
+    },
+};
+
+/// `zig build sim-c4 [-Dseed=N] [-Dops=N]`: sim-c1 with the mesh (`--c4`: services connect, and
+/// M1, M2 and M4 are checked; `src/sim_mesh_conns.zig`), natively and as WebAssembly, the reports
+/// compared byte for byte. The runner is `sim_cluster` (`sim-c1-exe`). `sim-c4-teeth` runs its
+/// negative tests, each of which passes only if its check fires.
+fn add_sim_c4_steps(b: *std.Build, sim: SimStepOptions) void {
+    const exe = b.addExecutable(.{
+        .name = "sim_cluster",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/sim_cluster_main.zig"),
+            .target = sim.target,
+            .optimize = sim.optimize,
+            .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
+        }),
+    });
+    const seed_text = b.fmt("{d}", .{sim.seed orelse 1});
+    const ops_text = ops_argument(b, sim);
+    const run = b.addRunArtifact(exe);
+    run.addArgs(&.{ seed_text, ops_text, "0", "--c4" });
+    run.addArg(b.fmt("--profile={s}", .{sim.profile}));
+    const native_report = run.captureStdOut(.{});
+    const step = b.step("sim-c4", "Run sim-c4 natively and as WASM, and compare (-Dseed=N)");
+    for (v8_modes) |mode| {
+        const node = b.addSystemCommand(&.{ "node", "--no-warnings", mode });
+        node.addFileArg(b.path("tools/wasm_check.mjs"));
+        node.addArg("--sim-c4");
+        node.addFileArg(sim.library.getEmittedBin());
+        node.addArgs(&.{ seed_text, ops_text, "0", "true", sim.profile });
+        node.addFileArg(native_report);
+        step.dependOn(&node.step);
+    }
+    const teeth = b.step("sim-c4-teeth", "Run the sim-c4 negative tests; each must fire its check");
+    const teeth_exes = b.step("sim-c4-teeth-exe", "Install the fault-on sim-c4 runners");
+    for (c4_teeth_roots) |entry| {
+        const teeth_exe = b.addExecutable(.{
+            .name = b.fmt("sim_c4_teeth_{s}", .{entry.name}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(entry.root),
+                .target = sim.target,
+                .optimize = .ReleaseSafe,
+                .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
+            }),
+        });
+        const teeth_run = b.addRunArtifact(teeth_exe);
+        teeth_run.addArgs(&.{
+            "--seeds",                                       b.fmt("1..{d}", .{entry.seeds}),
+            b.fmt("{d}", .{c1_teeth_operations}),            "--c4",
+            b.fmt("--expect-symptom={s}", .{entry.symptom}), "--expect-fail",
+        });
+        teeth.dependOn(&teeth_run.step);
+        const own = b.step(b.fmt("sim-c4-teeth-{s}", .{entry.name}), "One sim-c4 negative test");
+        own.dependOn(&teeth_run.step);
+        const own_install = b.addInstallArtifact(teeth_exe, .{});
+        own.dependOn(&own_install.step);
+        teeth_exes.dependOn(&own_install.step);
+    }
 }
 
 /// Each more known hit of a sparse tooth (`also_seeds`), run alone with `--c1` (`--c3` for a

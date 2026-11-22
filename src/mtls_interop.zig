@@ -17,7 +17,7 @@
 //!   - server-sent events delivered as they arrive, and a stream across a KeyUpdate;
 //!   - the workload-certificate row (B4 slice 4): the real relay (`relay.zig`), secured with the
 //!     run's key, its job certificate (`spiffe://<cluster>/job/<name>`, issued by
-//!     `peer_ca.Ca.issue_job_certificate`) written as `relay.crt` the way the agent writes it.
+//!     `peer_ca.Ca.issue_decided_certificate`) written as `relay.crt` the way the agent writes it.
 //!     The harness connects to the relay's loopback port as the job would. Accepted: a line
 //!     crosses both ways, the server read the job's SPIFFE id and extension exactly, and the job's
 //!     end reaches the server as `close_notify`. The JDK server pins the job's id (allow-list),
@@ -129,7 +129,7 @@ const Pki = struct {
     }
 
     /// A relayed run's certificate for the relay's key, through the server's own issuance
-    /// (`peer_ca.Ca.issue_job_certificate`, which `POST .../runs/{name}/certificate` calls).
+    /// (`peer_ca.Ca.issue_decided_certificate`, which `POST .../runs/{name}/certificate` calls).
     fn issue_job(
         pki: *const Pki,
         out: *x509.Der,
@@ -139,8 +139,9 @@ const Pki = struct {
     ) !void {
         var clock: ManualClock = .{ .ms = pki.now };
         const ca: peer_ca.Ca = .{ .key = signer, .revoked = .{}, .wall = clock.clock() };
-        try ca.issue_job_certificate(out, &.{
+        try ca.issue_decided_certificate(out, &.{
             .cluster = cluster,
+            .path = .job,
             .name = name,
             .subject_key = pki.relay_key.public_key.toBytes(),
             .identity = identity,

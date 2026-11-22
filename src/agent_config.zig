@@ -40,14 +40,15 @@ pub const usage =
     \\usage: zcube-agent [--config FILE] [--node NAME] [--server HOST:PORT] [--state-dir DIR]
     \\                   [--cpu-millis N] [--memory-bytes N] [--images FILE] [--address TEXT]
     \\                   [--images-dir DIR] [--peer-listen HOST:PORT] [--peer-advertise HOST:PORT]
-    \\                   [--registry HOST:PORT] [--runtime fake|zigbox] [--trust-policy FILE]
-    \\                   [--label KEY=VALUE]... [--verbose]
+    \\                   [--registry HOST:PORT] [--mesh-ports A-B] [--runtime fake|zigbox]
+    \\                   [--trust-policy FILE] [--label KEY=VALUE]... [--verbose]
     \\                   [--ca FILE [--cert FILE --key FILE] [--tls-name NAME]]
     \\       zcube-agent --version | --help
     \\
     \\  --config FILE      a ZON file with .node, .server, .state_dir, .cpu_millis, .memory_bytes,
-    \\                     .runtime, .images, .address, .images_dir, .peer_listen, .peer_advertise
-    \\                     .registry, .trust_policy, .labels, .ca, .cert, .key and .tls_name
+    \\                     .runtime, .images, .address, .images_dir, .peer_listen, .peer_advertise,
+    \\                     .registry, .mesh_ports, .trust_policy, .labels, .ca, .cert, .key
+    \\                     and .tls_name
     \\  --node NAME        this node's name (a lowercase hostname label)
     \\  --server ADDR      zcube-server's address, an IP address and a port
     \\  --state-dir DIR    where the agent keeps its containers (created if missing)
@@ -79,6 +80,9 @@ pub const usage =
     \\                     reserves the node for the jobs that require its own KEY. Labels in
     \\                     both the file and the flags must be the same. New labels need the
     \\                     node's lease to have ended (one lease ttl) or an emptied --state-dir
+    \\  --mesh-ports A-B   the ports this node gives its replicas' mesh listeners, at least 512
+    \\                     (default 30000-30999), without the --peer-listen port; the mesh runs
+    \\                     only with an address for peers, so a range without one is refused
     \\  --verbose          show the internal message of a bug
     \\
     \\Containers run as plain host processes under supervisors of their own, so stopping the agent
@@ -121,6 +125,10 @@ pub const Config = struct {
     trust: ?trust_file.Loaded = null,
     /// The API over TLS; null: plain HTTP.
     tls: ?Tls = null,
+    /// The ports the agent gives its replicas' mesh listeners (`--mesh-ports A-B`). The mesh is
+    /// on only when the node advertises an address for peers (`peer_advertise`): its host is the
+    /// host of every endpoint the node's replicas publish.
+    mesh_ports: MeshPorts = .{},
 };
 
 /// `--ca`, `--cert`, `--key` and `--tls-name`. `cert` and `key` come together or not at all;
@@ -130,6 +138,12 @@ pub const Tls = struct {
     cert: ?[]const u8,
     key: ?[]const u8,
     server_name: []const u8,
+};
+
+/// A range of ports, both ends included.
+pub const MeshPorts = struct {
+    first: u16 = constants.mesh_ports_default_first,
+    last: u16 = constants.mesh_ports_default_last,
 };
 
 pub const Command = union(enum) {
@@ -168,6 +182,7 @@ const File = struct {
     tls_name: ?[]const u8 = null,
     trust_policy: ?[]const u8 = null,
     labels: ?[]const []const u8 = null,
+    mesh_ports: ?[]const u8 = null,
 };
 
 /// The fixtures file: the digests the fake runtime has.
@@ -198,6 +213,7 @@ const Flags = struct {
     /// `--label`, in the order given; `labels_count` of them are set.
     labels: [constants.node_labels_max][]const u8 = undefined,
     labels_count: u32 = 0,
+    mesh_ports: ?[]const u8 = null,
     verbose: bool = false,
     version: bool = false,
     help: bool = false,
@@ -287,6 +303,7 @@ fn merge(arena: Allocator, io: std.Io, flags: Flags, file: File, diag: *Diag) Er
     const peer_listen = if (listen_text) |text| try parse_server(text, diag) else null;
     const advertise_text = flags.peer_advertise orelse file.peer_advertise;
     const peer_advertise = try peer_advertised(peer_listen, advertise_text, diag);
+    const mesh_text = flags.mesh_ports orelse file.mesh_ports;
     const registry = try registry_of(flags.registry orelse file.registry, images_dir, diag);
     const labels = try merged_labels(&flags, file, diag);
     const server = try parse_server(server_text, diag);
@@ -311,6 +328,7 @@ fn merge(arena: Allocator, io: std.Io, flags: Flags, file: File, diag: *Diag) Er
         .registry = registry,
         .tls = tls,
         .labels = try arena.dupe([]const u8, labels),
+        .mesh_ports = try mesh_ports_for(mesh_text, peer_listen, peer_advertise, diag),
     };
 }
 
@@ -463,6 +481,72 @@ fn absolute_in(arena: Allocator, cwd: []const u8, path: []const u8) Error![]cons
     return std.fs.path.join(arena, &.{ cwd, path }) catch error.OutOfMemory;
 }
 
+/// The mesh port range, refused when it cannot be used: the mesh runs only when the node
+/// advertises an address for peers (`agent_mesh.Config`), and a range that holds the chunk
+/// server's own port would hand that port to a replica.
+fn mesh_ports_for(
+    given: ?[]const u8,
+    peer_listen: ?IpAddress,
+    peer_advertise: ?IpAddress,
+    diag: *Diag,
+) Error!MeshPorts {
+    const ports = try mesh_ports_of(given, diag);
+    const text = given orelse return ports;
+    if (peer_advertise == null) {
+        return bad(
+            diag,
+            "--mesh-ports {s} is given, but the node advertises no address for peers, so its " ++
+                "replicas get no mesh",
+            .{text},
+            "give --peer-listen (and --peer-advertise when it listens on every address), " ++
+                "or leave --mesh-ports out",
+        );
+    }
+    const listen = peer_listen orelse return ports;
+    const port = listen.getPort();
+    if (port >= ports.first and port <= ports.last) {
+        return bad(
+            diag,
+            "the mesh port range {s} holds {d}, the --peer-listen port",
+            .{ text, port },
+            "give --mesh-ports a range without the --peer-listen port",
+        );
+    }
+    return ports;
+}
+
+const mesh_ports_fix = std.fmt.comptimePrint(
+    "give --mesh-ports a range of at least {d} ports, e.g. 30000-30999",
+    .{constants.runtime_handles_max},
+);
+
+/// `A-B`: two ports, A above 0 and at most B, at least `runtime_handles_max` of them; the default
+/// range without one.
+fn mesh_ports_of(given: ?[]const u8, diag: *Diag) Error!MeshPorts {
+    const text = given orelse return .{};
+    const fix = "give --mesh-ports A-B, two ports with A at most B, e.g. 30000-30999";
+    const dash = std.mem.indexOfScalar(u8, text, '-') orelse
+        return bad(diag, "the mesh port range {s} is not A-B", .{text}, fix);
+    const first = std.fmt.parseInt(u16, text[0..dash], 10) catch 0;
+    const last = std.fmt.parseInt(u16, text[dash + 1 ..], 10) catch 0;
+    if (first == 0 or last == 0 or first > last) {
+        return bad(diag, "the mesh port range {s} is not A-B", .{text}, fix);
+    }
+    // A replica the range has no port for fails to start (ZC-E0710) and is replaced at once, so a
+    // range the node's containers can spend churns
+    // (docs/decisions/2026-11-15-mesh-ports-minimum.md).
+    const size = @as(u32, last) - first + 1;
+    if (size < constants.runtime_handles_max) {
+        return bad(
+            diag,
+            "the mesh port range {s} holds {d} ports, fewer than the minimum of {d}",
+            .{ text, size, constants.runtime_handles_max },
+            mesh_ports_fix,
+        );
+    }
+    return .{ .first = first, .last = last };
+}
+
 /// The address to publish for peers: the advertised one, else the listen address if it names a
 /// host. Listening on every address (0.0.0.0, ::) with nothing to advertise is refused: the
 /// published address would be one no peer can connect to.
@@ -554,6 +638,8 @@ pub fn parse_flags(args: []const []const u8, diag: *Diag) Error!Flags {
             }
             flags.labels[flags.labels_count] = value;
             flags.labels_count += 1;
+        } else if (std.mem.eql(u8, arg, "--mesh-ports")) {
+            flags.mesh_ports = try value_of(args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--cpu-millis")) {
             flags.cpu_millis = try number_of(u32, args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--memory-bytes")) {
@@ -1070,6 +1156,105 @@ test "the chunk store and the peer address are read, and a peer address needs a 
     const serving = try load(arena, std.testing.io, &zigbox_node, &diag);
     try testing.expect(serving.run.images_dir == null);
     try testing.expectEqual(@as(u16, 7171), serving.run.peer_listen.?.getPort());
+}
+
+/// A node that advertises a peer address (`--peer-listen`), which a mesh port range needs.
+const mesh_base = [_][]const u8{
+    "--node",         "node1",   "--server",      "127.0.0.1:7070",
+    "--state-dir",    "/tmp",    "--cpu-millis",  "1000",
+    "--memory-bytes", "1000000", "--images",      "fixtures/images.zon",
+    "--images-dir",   "/tmp",    "--peer-listen", "127.0.0.1:7171",
+};
+
+test "a mesh port range is refused without a peer address, or holding the peer-listen port" {
+    // Goal: Review A of #263's NIT: a range the agent cannot use is refused at start-up (ZC-E0505)
+    // rather than ignored: without an advertised address the mesh is off, and a range that holds
+    // the chunk server's port would hand that port to a replica. Method: the range without any
+    // peer flag, then ranges holding the listen port (first, inside, last), then one beside it.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const bare = [_][]const u8{
+        "--node",         "node1",       "--server",     "127.0.0.1:7070",
+        "--state-dir",    "/tmp",        "--cpu-millis", "1000",
+        "--memory-bytes", "1000000",     "--images",     "fixtures/images.zon",
+        "--mesh-ports",   "31000-31511",
+    };
+    try expect_bad(load(arena, std.testing.io, &bare, &diag), &diag);
+    try testing.expectEqualStrings(
+        "--mesh-ports 31000-31511 is given, but the node advertises no address for peers, so " ++
+            "its replicas get no mesh",
+        diag.causes.slice()[0].slice(),
+    );
+    for ([_][]const u8{ "7171-7682", "7000-7999", "6660-7171" }) |text| {
+        const holding = mesh_base ++ [_][]const u8{ "--mesh-ports", text };
+        diag.reset();
+        try expect_bad(load(arena, std.testing.io, &holding, &diag), &diag);
+    }
+    try testing.expectEqualStrings(
+        "the mesh port range 6660-7171 holds 7171, the --peer-listen port",
+        diag.causes.slice()[0].slice(),
+    );
+    const beside = mesh_base ++ [_][]const u8{ "--mesh-ports", "7172-7683" };
+    diag.reset();
+    _ = try load(arena, std.testing.io, &beside, &diag);
+}
+
+test "the mesh port range is A-B with A above 0 and at most B, and defaults to 30000-30999" {
+    // Goal: --mesh-ports reaches the Config, and a range that is not one is refused. Method:
+    // load without it, with a good range, then with each bad shape.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const base = mesh_base;
+    const plain = try load(arena, std.testing.io, &base, &diag);
+    try testing.expectEqual(constants.mesh_ports_default_first, plain.run.mesh_ports.first);
+    try testing.expectEqual(constants.mesh_ports_default_last, plain.run.mesh_ports.last);
+    const ranged = base ++ [_][]const u8{ "--mesh-ports", "31000-31511" };
+    const loaded = try load(arena, std.testing.io, &ranged, &diag);
+    try testing.expectEqual(@as(u16, 31_000), loaded.run.mesh_ports.first);
+    try testing.expectEqual(@as(u16, 31_511), loaded.run.mesh_ports.last);
+    const top = base ++ [_][]const u8{ "--mesh-ports", "65024-65535" };
+    try testing.expectEqual(@as(u16, 65_535), (try load(arena, std.testing.io, &top, &diag))
+        .run.mesh_ports.last);
+    for ([_][]const u8{ "31000", "0-10", "20-10", "a-b", "1-70000", "-5", "5-" }) |text| {
+        const wrong = base ++ [_][]const u8{ "--mesh-ports", text };
+        diag.reset();
+        try expect_bad(load(arena, std.testing.io, &wrong, &diag), &diag);
+    }
+}
+
+test "a mesh port range narrower than runtime_handles_max is refused with size and minimum" {
+    // Goal: the supervisor's ruling on E0710's churn (docs/decisions/
+    // 2026-11-15-mesh-ports-minimum.md): a range the node's containers could spend is refused at
+    // start-up, in one cause line that names the range, its size and the minimum. Method: the
+    // narrowest accepted range, one port fewer, a single port, and the line of one refusal.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const base = mesh_base;
+    comptime assert(constants.runtime_handles_max == 512);
+    const least = base ++ [_][]const u8{ "--mesh-ports", "31000-31511" };
+    _ = try load(arena, std.testing.io, &least, &diag);
+    for ([_][]const u8{ "31000-31510", "31000-31000", "65535-65535" }) |text| {
+        const narrow = base ++ [_][]const u8{ "--mesh-ports", text };
+        diag.reset();
+        try expect_bad(load(arena, std.testing.io, &narrow, &diag), &diag);
+    }
+    diag.reset();
+    const ten = base ++ [_][]const u8{ "--mesh-ports", "31000-31009" };
+    try expect_bad(load(arena, std.testing.io, &ten, &diag), &diag);
+    try testing.expectEqual(@as(usize, 1), diag.causes.slice().len);
+    try testing.expectEqualStrings(
+        "the mesh port range 31000-31009 holds 10 ports, fewer than the minimum of 512",
+        diag.causes.slice()[0].slice(),
+    );
 }
 
 test "the published peer address is the advertised one, or a specified listen address" {

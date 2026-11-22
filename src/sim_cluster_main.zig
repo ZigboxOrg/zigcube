@@ -67,11 +67,11 @@ const symptom_spec = @import("symptom.zig");
 const usage_text = "usage: sim-cluster <seed> <operations|auto> [<nodes>] " ++
     "[--liveness=true|false] [--heal-at=N] [--profile=NAME|auto] [--lease-ttl-ms=N] " ++
     "[--replicas-pct=N] [--jobs=true|false] [--strong] [--signed] [--tenants] [--health] " ++
-    "[--late-registration] [--trace-steps]\n" ++
+    "[--mesh] [--c4] [--late-registration] [--trace-steps]\n" ++
     "       sim-cluster --seeds A..B <operations|auto> " ++
     "[<nodes>] [--liveness=true|false] [--shrink] [--profile=NAME|auto] [--lease-ttl-ms=N] " ++
     "[--replicas-pct=N] [--jobs=true|false] [--strong] [--signed] [--tenants] [--health] " ++
-    "[--late-registration] [--expect-fail] [--trace-steps]\n" ++
+    "[--mesh] [--c4] [--late-registration] [--expect-fail] [--trace-steps]\n" ++
     "       sim-cluster <seed> soak [<nodes>] (--soak-minutes=M | --soak-operations=N) " ++
     "[--soak-epoch=E] [--soak-bytes=B] [--profile=NAME] [--jobs=true|false] [--strong]\n";
 
@@ -223,6 +223,10 @@ fn parse_flag(parsed: *Args, arg: []const u8) bool {
     } else if (std.mem.eql(u8, arg, "--c3")) {
         parsed.options.c1 = true;
         parsed.options.c3 = true;
+    } else if (std.mem.eql(u8, arg, "--mesh")) {
+        parsed.options.mesh = true;
+    } else if (std.mem.eql(u8, arg, "--c4")) {
+        parsed.options.c4 = true;
     } else if (std.mem.eql(u8, arg, "--expect-symptom-any")) {
         parsed.expect_symptom_any = true;
     } else if (std.mem.startsWith(u8, arg, "--expect-symptom=")) {
@@ -377,10 +381,17 @@ fn print_replay(
 /// The flags of a replay line: every option the run had that is not the default.
 fn print_flags(out: *std.Io.Writer, options: sim_cluster.Options, heal_at: ?u32) !void {
     if (!options.liveness) try out.writeAll(" --liveness=false");
-    if (options.c3) try out.writeAll(" --c3") else if (options.c1) try out.writeAll(" --c1");
+    // `--c4` is `--c1 --strong --mesh`; the line names it alone.
+    if (options.c4) {
+        try out.writeAll(" --c4");
+        if (options.c3) try out.writeAll(" --c3");
+    } else if (options.c3) try out.writeAll(" --c3") else if (options.c1) try out.writeAll(" --c1");
     if (!options.jobs) try out.writeAll(" --jobs=false");
     // A tooth that needs the strong world implies it; the line says so anyway.
-    if (options.strong or c1_teeth.strong_world) try out.writeAll(" --strong");
+    const strong = options.strong or c1_teeth.strong_world;
+    if (strong and !options.c4) try out.writeAll(" --strong");
+    const mesh = options.mesh or c1_teeth.mesh_world;
+    if (mesh and !options.c4) try out.writeAll(" --mesh");
     if (options.signed) try out.writeAll(" --signed");
     if (options.tenants) try out.writeAll(" --tenants");
     if (options.health) try out.writeAll(" --health");
@@ -466,10 +477,7 @@ fn print_range_summary(
 ) !void {
     try reach.print(out);
     const total = parsed.last_seed - parsed.first_seed + 1;
-    // `--c1` says so: the fleet must not take a plain run for sim-c1 (src/sim_fleet_issue.zig).
-    const run_name: []const u8 = if (parsed.options.c3)
-        "sim-cluster --c3"
-    else if (parsed.options.c1) "sim-cluster --c1" else "sim-cluster";
+    const run_name = run_name_of(parsed);
     if (parsed.operations) |operations| {
         try out.print("{s}: seeds {d}..{d}, {d} operations: {d} of {d} failed\n", .{
             run_name, parsed.first_seed, parsed.last_seed, operations, failures, total,
@@ -480,6 +488,15 @@ fn print_range_summary(
             run_name, parsed.first_seed, parsed.last_seed, failures, total,
         });
     }
+}
+
+/// `--c1`, `--c3` and `--c4` say so: the fleet must not take a plain run for sim-c1 or sim-c4
+/// (src/sim_fleet_issue.zig).
+fn run_name_of(parsed: *const Args) []const u8 {
+    if (parsed.options.c4) return "sim-cluster --c4";
+    if (parsed.options.c3) return "sim-cluster --c3";
+    if (parsed.options.c1) return "sim-cluster --c1";
+    return "sim-cluster";
 }
 
 fn report_failure(

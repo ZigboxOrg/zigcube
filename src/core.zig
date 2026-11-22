@@ -17,6 +17,7 @@ pub const modules = .{
     @import("agent_client.zig"),
     @import("agent_jobs.zig"),
     @import("agent_health.zig"),
+    @import("agent_mesh.zig"),
     @import("agent_loop.zig"),
     @import("fencing.zig"),
     @import("agent_records.zig"),
@@ -30,7 +31,11 @@ pub const modules = .{
     @import("job_cert.zig"),
     @import("job_trust.zig"),
     @import("job_trust_fixture.zig"),
+    @import("service_cert.zig"),
     @import("apply.zig"),
+    @import("mesh_address.zig"),
+    @import("mesh_plan.zig"),
+    @import("why_grant.zig"),
     @import("history.zig"),
     @import("rollout_plan.zig"),
     @import("rollback.zig"),
@@ -73,6 +78,8 @@ pub const modules = .{
     @import("sim_c1.zig"),
     @import("sim_c3.zig"),
     @import("sim_certs.zig"),
+    @import("sim_mesh_certs.zig"),
+    @import("sim_mesh_conns.zig"),
     @import("evidence.zig"),
     @import("why_acceptance.zig"),
     @import("c1_teeth.zig"),
@@ -195,6 +202,7 @@ test {
     _ = @import("tls_wire_test.zig");
     _ = @import("replica_controller_test.zig");
     _ = @import("rollout_controller_test.zig");
+    _ = @import("mesh_address_test.zig");
     _ = @import("scheduler_test.zig");
     _ = @import("job_controller_test.zig");
     _ = @import("api_test.zig");

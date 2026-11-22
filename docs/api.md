@@ -216,6 +216,54 @@ terminal.
 - Unknown subject with no decisions: `404`, `ZC-E0101`. A deleted subject whose decisions
   survive (24 h, keys.md) answers `200` with `state.exists: false`.
 
+### `GET /v1/why/grant/{from}/{to}/{port}` (C4 slice 2)
+
+`zcube why grant` (alias `GET /v1/why/connection/...`): may service `from` connect to service
+`to` on `port`, and if so, to which replicas. Computed by `src/why_grant.zig` from one snapshot
+with the same compiler the agents' mesh plan uses (`src/mesh_plan.zig`), so the answer is the
+plan's, not a re-derivation.
+
+```json
+{ "v": 1, "revision": 41, "from": "batch", "to": "db", "port": 5432,
+  "verdict": "no_grant",
+  "text": "no grant batch → db:5432 (ZC-E0707); db allows: web → 5432 (added by alex@laptop at 2026-11-13 10:02:11Z)",
+  "diagnostic": { "code": "ZC-E0707", "…": "…" },
+  "allows": [ { "from": "web", "port": 5432,
+                "added": { "decision": "…-0007", "at_ms": 1763028131000, "by": "alex@laptop" } } ],
+  "endpoints": [],
+  "excluded": [] }
+```
+
+- `verdict` is the first of these that applies, in this order: `no_grant` (`to`'s `allow` has no
+  `{from, port}`, ZC-E0707), `no_source` (the grant names a service that does not exist,
+  ZC-W0704), `destination_has_no_address`, `source_has_no_address` (apply that service again),
+  `no_endpoint` (granted, and no replica of `to` is ready with a mesh endpoint, ZC-E0709); else
+  `granted`. `diagnostic` is present for the three coded verdicts. The two address verdicts carry
+  no code: since C4 slice 1 every apply gives the service a mesh address (a create with none free
+  is `503` ZC-E0207), so a service without one was written before C4 and its remedy, applying it
+  again, is the whole answer; the `text` says so, and a code would name no other fix. For `from` equal to `to` the
+  ZC-E0707 fix names ZC-E0135 (apply refuses a grant from a service to itself) instead of
+  suggesting one.
+- `allows` is `to`'s whole `allow` list; `added` names the newest kept `grant` decision that
+  added it. `removed` (present only for `no_grant`) names the newest kept decision that removed
+  the asked-for grant. Both are read at `revision`, and `by` is the decision's
+  `cause_evidence.applied_by` (who applied the service), else its `actor`.
+- `endpoints` are `to`'s replicas the source may be sent to, each `{replica, node, endpoint}`, in
+  ascending replica id. That is not the order any one source tries them: an agent's `pick` tries
+  its own node's endpoints first, then the others, each once, from a start rotated by a hash of
+  the connection (`Destination.pick`, `src/mesh_plan.zig`). `excluded` are `to`'s other replicas, in the same order, each `{replica, node,
+  exclusion, text}`: `node` is the node it is assigned to (or, for a draining copy, the node it
+  runs on), left out while it is unassigned; `exclusion` is `draining` (a copy left on a node it
+  moved from, or of a replica no longer wanted, which takes no new connection), `not_ready`, or
+  `no_endpoint` (ready, no endpoint published yet); `text` says which readiness rule failed.
+- A replica is ready when the node it is assigned to is `ready` (the node controller's verdict),
+  that node reports the replica at the node's current tenure and for its current assignment (the
+  replica controller's admission rules, authority.md §3), running at the replica's generation
+  and, with a health check, last reported healthy. `min_ready_ms` is not applied yet: C3's
+  readiness brings it.
+- `text` is the sentence the CLI prints. Unknown `to`: `404` ZC-E0101. A bad name or a port
+  outside 1 to 65535: `400` ZC-E0104.
+
 ### `GET /v1/stats/pull[?node=<name>][&limit=<n>]` (C2 slice 7)
 
 What pulls moved, by source: the `/pulls/` records of keys.md, newest `finished_at_ms` first.
@@ -367,12 +415,33 @@ The answer is the decision id and the one-line summary (api.md item 5), whether 
 - **`?dry_run=1`** computes the same answer and writes nothing: `dry_run` is `true`, and `revision`
   and `decision` are absent. A dry run needs the store to read the current service.
 - A write whose compare fails (someone else changed the service during the request) is read and
-  planned again up to three times, then refused with `409` and the new **`ZC-E0105`**.
+  planned again up to three times, then refused with `409` and the new **`ZC-E0105`**. Since C4
+  every create (and the first apply of a service written before C4) also compares the mesh address
+  counter, `/mesh-address-next` (docs/keys.md, "Mesh addresses"), so creates of *different*
+  services that run at the same moment can conflict too, and under enough of them one gets `409`
+  ZC-E0105 although nobody touched its service. Nothing was written: a client retries the same
+  apply.
 - Invalid input (a bad name, no command, too many replicas, container `limits` outside the
   runtime's bounds, a body that is not a service) is `400` and `ZC-E0104`. The bounds are a job's:
   `cpu_millis` 10 to 1,024,000 and `memory_bytes` 4 MiB to 2^40, and the cause names
   `limits.<member>`. Limits the stored service already has are not re-checked, so applying the same
   file again is `none`, not a refusal (docs/decisions/2026-11-08-service-apply-limits.md). A store that is down is `503` and `ZC-E0201`, as everywhere.
+- **`allow` (C4 slice 1)** says which services may connect to this one through the mesh, and on
+  which port: `"allow": [{"from": "web", "port": 5432}]`. It is optional and empty by default (no
+  grant: nothing may connect). At most `service_allow_max` (64) grants; each `from` is a service
+  name (it need not exist yet), never this service itself, and `port` is 1 to 65535; a pair listed
+  twice is refused. Anything else is `400` and **`ZC-E0135`**, its cause naming the grant by number
+  (`allow: grant 2: web on port 5432 is listed twice`). A change to `allow` alone does not bump
+  `generation`: it is recorded as a `grant` decision whose `change` says what was added and removed
+  (`web → 5432 added, batch → 80 removed`), next to the `apply` decision when the spec changed too.
+- **The mesh address.** Every service the API writes holds `mesh_address`, `127.77.<hi>.<lo>`,
+  given when the service is first written (or first re-applied, for a service written before C4)
+  and kept until it is deleted (`docs/keys.md`, "Mesh addresses"). The client never sends it (a
+  body with `mesh_address` is `ZC-E0104`, an unknown field). It appears with `allow` on
+  `/services/<name>` in the read endpoints. When every address is held (by services, or by deleted
+  ones whose replicas remain or that were deleted within a day), a create is `503` and
+  `ZC-E0207`; the service is not written, but the address counter moves on, so a retry probes
+  other numbers.
 
 ### `DELETE /v1/services/{name}[?applied_by=<name>]`
 
@@ -815,6 +884,8 @@ runs unchanged on the far side of HTTP:
 | `list(/job-runs/)`, filtered to the node's assignments (B1 slice 4) | `GET /v1/agent/nodes/{node}/runs` |
 | `get(/job-input/<name>)` | `GET /v1/agent/nodes/{node}/runs/{name}/input` |
 | (no store write: the CA signs a relayed run's key, B4) | `POST /v1/agent/nodes/{node}/runs/{name}/certificate` |
+| (no store write: the CA signs a service replica's key, C4 slice 3) | `POST /v1/agent/nodes/{node}/replicas/{id}/certificate` |
+| `list` of `/services/`, `/replicas/`, `/assigned/`, `/observed/` and `/nodes/` at one revision, narrowed to the node's view (C4 slice 4) | `GET /v1/agent/nodes/{node}/mesh` |
 | `list(/job-observed/<node>/)`; `txn` with one put there | `GET` / `POST /v1/agent/nodes/{node}/job-observed` |
 | (the wait between steps) | `GET /v1/agent/nodes/{node}/watch?from=&timeout=` |
 
@@ -1085,6 +1156,61 @@ run yet (also what a node without a claim of its own sees), and the claim has no
 marks the run refused for a 503; it asks only for runs it knows the server holds as `running`, so
 a 503 is a narrow race. The call writes no store key. Like every agent endpoint it is unauthenticated
 until B7 (docs/mtls.md, "Issuance").
+
+### `POST /v1/agent/nodes/{node}/replicas/{id}/certificate` (C4 slice 3)
+
+A service replica's workload certificate, B4's issuance applied to services. The body is the
+run certificate's, `{"public_key": "<64 hex>", "epoch": N, "image_digest": "<64 hex>"}` (the key
+the replica's supervisor made, the placement epoch the agent runs the replica under and the
+digest it started). The server reads `/assigned/{node}/{id}` and then `/replicas/<service>/{id}`
+(the assignment names the service) at one revision, and `service_cert.decide` checks that the
+replica exists, is assigned to `{node}` at exactly that epoch (the assignment's `mod_revision`),
+and that the digest is the full `b3:` digest the replica runs. Then the cluster CA signs
+`spiffe://<cluster>/service/<service>` with the digest and epoch (no labels: services have none),
+valid for `workload_cert_ttl_ms` (1 hour) from the server's clock, and answers as the run
+certificate does. The supervisor asks again at half-life with a new key; a certificate that
+expires unrenewed takes the replica off the mesh (ZC-W0703), not out of service.
+
+Refusals: `404` and `400` as for a run's certificate (`id` is checked as a name of up to 63
+bytes, `replica_id_bytes_max`: a replica id is its service's name and `-<n>`, so it is longer than
+any service name); **`409` ZC-E0706** for every other refusal, final for that ask: the cause names
+the replica, its service when the assignment names one, and the check that failed (not assigned
+here, which includes a job run's assignment and a record whose service the id does not belong to;
+a stale epoch; a deleted replica; another digest; or a service that pins its image by a short
+`b3:` digest, whose fix is to pin the full 64-hex digest: admission accepts a short pin, the mesh
+refuses it, docs/decisions/2026-11-14-c4-service-cert-rulings.md). Unlike a run's certificate, no
+cause is a 503: the paragraph above on causes that are not final is about runs only, and a replica
+the server has not yet assigned to `{node}` is refused like one assigned elsewhere (a supervisor asks
+only for a replica its node runs). A newer assignment or digest is a new ask. The call writes no
+store key, and is unauthenticated until B7 (docs/mtls.md, "Issuance").
+
+### `GET /v1/agent/nodes/{node}/mesh` (C4 slice 4)
+
+The node's view of the mesh, from one snapshot: every service (`name`, `mesh_address`, `allow`)
+and the replicas whose rules on this node depend on (`mesh_plan.input_for`: the node's own
+replicas and the replicas of every service they may reach), each with the readiness the plan
+judges and the endpoint its node published in `/observed`. The agent plans from it as the server
+would (`mesh_plan.plan`) and hands each local replica's supervisor its rules
+(`Runtime.mesh_update`, docs/agent.md, "The mesh").
+
+```json
+{ "revision": 512,
+  "services": [ {"name": "api", "mesh_address": "10.77.0.1",
+                 "allow": [{"from": "hello", "port": 8080}]},
+                {"name": "hello", "mesh_address": "10.77.0.2", "allow": []} ],
+  "replicas": [ {"id": "api-1", "service": "api", "node": "node2",
+                 "endpoint": "10.0.0.2:30000", "readiness": "ready", "draining": false},
+                {"id": "hello-1", "service": "hello", "node": "node1",
+                 "endpoint": "10.0.0.1:30000", "readiness": "ready", "draining": false} ],
+  "chain": { ... } }
+```
+
+`readiness` is one of `ready`, `not_assigned`, `not_reported`, `stale_report`, `node_not_ready`,
+`starting`, `stopped`, `not_healthy`. `GET` only; no query but `known`. The agent refuses an
+answer that breaks the plan's input rules (services in order of name, each replica's service
+listed) as a store failure (`ZC-E0213`) and gives its replicas empty rules until a read succeeds.
+The server reads the whole snapshot for each call; a grant or readiness change does not wake the
+agent's watch, so new rules reach a supervisor within the agent's step period.
 
 ### `GET /v1/agent/nodes/{node}/watch?from=&timeout=`
 
