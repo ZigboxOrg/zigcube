@@ -131,6 +131,9 @@ jobs:
       # zcube-server with the test-only registration barrier (#237), compiled, never shipped.
       - name: Build the registration barrier
         run: zig build register-barrier-build
+      # The trust policy's walk on macOS (src/trust_sys.zig), compiled for both Macs, no binary.
+      - name: Compile the trust policy's tests for macOS
+        run: zig build trust-macos
       - name: Unit and snapshot tests
         run: zig build test --summary all
       # The golden files of every ZC- code are checked by the tests above (and embedded at compile

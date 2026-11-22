@@ -54,7 +54,8 @@ its own `node.crt` once it has joined, else `--cert` and `--key`
 then `--server` must be a loopback address (127.0.0.0/8 or `[::1]`): the agent refuses any other
 at start-up (`ZC-E0505`), since the server serves plain HTTP on loopback only and a node would
 otherwise take its assignments unauthenticated
-([decision](decisions/2026-11-21-agent-plain-http-loopback-only.md)).
+([decision](decisions/2026-11-21-agent-plain-http-loopback-only.md)). `zcube-agent fetch` keeps
+the same rule for its own `--server`, which it reads peers and chunk filters from.
 
 **Node labels** (B6) are given by `--label KEY=VALUE`, once per label, or by `.labels` in the ZON
 file (`.labels = .{ "tenant=a", "exclusive=tenant" }`); at most `node_labels_max` (8), each at most
