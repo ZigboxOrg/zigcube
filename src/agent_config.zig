@@ -318,15 +318,25 @@ fn merge(arena: Allocator, io: std.Io, flags: Flags, file: File, diag: *Diag) Er
 /// alone (`--insecure-listen`, ZC-E0106), and a node that spoke it over a network would take
 /// assignments and post `relay.pub` unauthenticated (docs/decisions/2026-11-21-agent-plain-http-
 /// loopback-only.md). Loopback is the server's own rule, `server_config.is_loopback`.
-fn check_plain_server(server: IpAddress, text: []const u8, tls: bool, diag: *Diag) Error!void {
+/// `zcube-agent fetch` applies it to its own `--server` too.
+pub fn check_plain_server(
+    server: IpAddress,
+    text: []const u8,
+    tls: bool,
+    diag: *Diag,
+) Error!void {
+    assert(text.len > 0);
     if (tls) return;
     if (server_config.is_loopback(server)) return;
     const why = "--server {s} is not a loopback address, and without --ca the agent would " ++
         "talk plain HTTP to it";
-    return bad(diag, why, .{text}, "give --ca, --cert and --key (or .ca, .cert and .key in " ++
-        "the file) to reach the server's --listen over TLS; plain HTTP goes to 127.0.0.1 or " ++
-        "[::1] only");
+    return bad(diag, why, .{text}, plain_server_fix);
 }
+
+/// `is_loopback` takes all of 127.0.0.0/8 and [::1], so the fix says so.
+const plain_server_fix = "give --ca, --cert and --key (or .ca, .cert and .key in the file) " ++
+    "to reach the server's --listen over TLS; plain HTTP goes to a loopback address " ++
+    "(127.0.0.0/8 or [::1]) only";
 
 /// The registry to fetch images from, checked: it fetches into the chunk store, so it needs one.
 fn registry_of(registry: ?[]const u8, images_dir: ?[]const u8, diag: *Diag) Error!?[]const u8 {
@@ -1346,7 +1356,8 @@ const plain_refused_golden =
     "  cause  --server 10.0.2.2:7070 is not a loopback address, and without --ca the\n" ++
     "         agent would talk plain HTTP to it\n" ++
     "  fix    give --ca, --cert and --key (or .ca, .cert and .key in the file) to reach " ++
-    "the server's --listen over TLS; plain HTTP goes to 127.0.0.1 or [::1] only\n" ++
+    "the server's --listen over TLS; plain HTTP goes to a loopback address " ++
+    "(127.0.0.0/8 or [::1]) only\n" ++
     "  more   zcube explain E0505 · rerun with --verbose for the full cause chain\n" ++
     "  docs   https://zigbox.github.io/zigcube/errors/E0505.html\n";
 
