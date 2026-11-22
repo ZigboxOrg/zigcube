@@ -86,10 +86,10 @@ const Rig = struct {
         const io = rig.shared.io;
         const protection = io.swapCancelProtection(.blocked);
         defer _ = io.swapCancelProtection(protection);
-        var waits: u32 = 0;
+        // Real time, not a count of sleeps: a sleep may last longer than it asks for.
+        const started = std.Io.Clock.awake.now(io);
         while (!rig.released.load(.acquire)) {
-            assert(waits * poll_ms < stop_ms_max);
-            waits += 1;
+            assert(started.untilNow(io, .awake).toMilliseconds() < stop_ms_max);
             // Blocked above: no `Io` call returns `error.Canceled` until it is restored.
             io.sleep(.fromMilliseconds(1), .awake) catch unreachable;
         }
@@ -106,6 +106,14 @@ const Rig = struct {
         const rig: *Rig = @ptrCast(@alignCast(context));
         rig.hook(.tick);
         rig.hook(.tick_cancel_point);
+    }
+
+    /// Stops the watchdog when the test fails before its canceller runs. `give_up` first, so
+    /// that a cancel a swallowing hook takes is given back and this cancel returns.
+    fn abandon(rig: *Rig) void {
+        rig.give_up.store(true, .release);
+        rig.released.store(true, .release);
+        rig.future.cancel(rig.shared.io);
     }
 
     /// The stop's cancel, on a thread of its own so that the test can bound it.
@@ -143,16 +151,17 @@ fn stop_at(point: Point) !void {
         .tick = .{ .context = rig, .run = Rig.tick },
     };
     assert(rig.shared.connections() == 0);
-    rig.future = try testing.io.concurrent(http.Shared.watchdog, .{&rig.shared});
-    if (point != .sleep) {
-        // The hook runs at the first sweep, one `http_watchdog_ms` after the start.
-        if (!wait_for(&rig.entered, stop_ms_max)) {
-            rig.released.store(true, .release);
-            rig.future.cancel(testing.io);
-            return error.HookNeverEntered;
+    const canceller = canceller: {
+        rig.future = try testing.io.concurrent(http.Shared.watchdog, .{&rig.shared});
+        // Until the canceller runs, an error return must stop the watchdog before `rig` is
+        // freed. The block ends this `errdefer`'s reach: past it, the canceller owns the stop.
+        errdefer rig.abandon();
+        if (point != .sleep) {
+            // The hook runs at the first sweep, one `http_watchdog_ms` after the start.
+            if (!wait_for(&rig.entered, stop_ms_max)) return error.HookNeverEntered;
         }
-    }
-    const canceller = try std.Thread.spawn(.{}, Rig.cancel, .{rig});
+        break :canceller try std.Thread.spawn(.{}, Rig.cancel, .{rig});
+    };
     if (point == .sweep or point == .tick) {
         testing.io.sleep(.fromMilliseconds(hold_ms), .awake) catch {};
         rig.released.store(true, .release);
