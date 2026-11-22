@@ -903,6 +903,44 @@ test "a never-healthy replica of a failed rollout whose checks never settle is r
     try testing.expectEqual(records.RolloutPhase.complete, (try fixture.rollout()).phase);
 }
 
+test "an apply over a rollout retires its never-healthy replica before a healthy old one (R1)" {
+    // Goal: demo-c3 step 4d on PR #18 (fabd921e): an apply during a rollback retired a healthy
+    // replica while the rollback's surge replica, still `unknown` (never probed healthy), became
+    // old. Both controllers count a running stale `unknown` replica running (health gate
+    // decision), so the rollout controller counts it ready after `min_ready_ms` and allows one
+    // retirement; the replica controller retired the lowest-numbered running stale replica, a
+    // healthy one, and left two of three healthy under `max_unavailable` 0 (R1, the witness
+    // counts healthy replicas). Method: generation 1 healthy; generation 2 starts its surge
+    // replica, reported `unknown`; generation 3 is applied before it is healthy; after
+    // `min_ready_ms` the retirement must take the `unknown` replica and keep the three healthy.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    var checked = web;
+    checked.health = checked_health;
+    try fixture.apply(checked);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 3), try fixture.report_health(1, .running, .healthy));
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms);
+    try fixture.settle();
+    checked.image = "b3:9d20c4f1";
+    checked.request_id = "r-0002b1a";
+    try fixture.apply(checked);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 1), try fixture.report_health(2, .running, .unknown));
+    try fixture.settle();
+    checked.image = "b3:51aa9c03";
+    checked.request_id = "r-0002b1b";
+    try fixture.apply(checked);
+    try fixture.settle();
+    try testing.expectEqual(@as(u64, 3), (try fixture.service()).generation);
+    fixture.manual.advance(min_ready_ms);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
+    try testing.expectEqual(@as(u32, 0), try fixture.count_of(2));
+}
+
 test "a new replica unknown after healthy is not ready to the rollout controller" {
     // Goal: PR #261 re-review SHOULD, the rollout controller's half of the `unknown` rule
     // (`!(fresh and held_over)` in `view`). A new replica that ran healthy for `min_ready_ms`

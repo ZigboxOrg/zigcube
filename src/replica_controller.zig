@@ -802,13 +802,24 @@ const Run = struct {
         const rolling = roll.policy.strategy == .rolling;
         var up = roll.up;
         var count: u32 = 0;
-        // The cheapest first: not live, then live and not running, then running.
-        for ([_]u8{ 0, 1, 2 }) |cost| {
+        // The cheapest first: not live, then live and not running, then running with its health
+        // `unknown`, then running and healthy. A running `unknown` one counts toward
+        // `budget.retire` without being known healthy (`running_healthy`): retired before a
+        // healthy one, it spends the budget its own count gave, and the healthy replicas the
+        // floor rests on stay (R1, demo-c3 step 4d on fabd921e).
+        for ([_]u8{ 0, 1, 2, 3 }) |cost| {
             for (plan.slice()) |*item| {
                 if (count == out.len) return count;
                 if (item.class != .stale) continue;
                 const running = item.running and item.lost == null;
-                const item_cost: u8 = if (!item.live) 0 else if (!running) 1 else 2;
+                const item_cost: u8 = if (!item.live)
+                    0
+                else if (!running)
+                    1
+                else if (health_unknown(item))
+                    2
+                else
+                    3;
                 if (item_cost != cost) continue;
                 if (c1_teeth.rollout_budget) {
                     out[count] = item;
@@ -816,7 +827,7 @@ const Run = struct {
                     continue;
                 }
                 if (cost == 1 and unready_left == 0) continue;
-                if (cost == 2) {
+                if (cost >= 2) {
                     if (ready_left == 0) continue;
                     if (rolling and up -| 1 < ready_min) continue;
                     up -|= 1;
@@ -1494,7 +1505,8 @@ pub fn admissible_in(
 /// (old) replica whose health is `unknown` counts as running: an agent restart reports every
 /// replica `unknown` until it probes again, and that must not make old replicas free to retire
 /// (docs/decisions/2026-11-15-c3-rollout-health-gate.md). Counting it running is the cautious
-/// side here: it is retired only within `budget.retire` and above the floor. The rollout
+/// side here: it is retired only within `budget.retire` and above the floor, and before any
+/// healthy stale replica (`choose_retired`), so the budget it adds is spent on it. The rollout
 /// controller's `update` counts an old `unknown` replica running too, even one never healthy, so
 /// the two agree and a rollback over checks that never settle still ends.
 fn running_healthy(
@@ -1510,6 +1522,14 @@ fn running_healthy(
         .unknown => stale,
         .unhealthy => false,
     };
+}
+
+/// Whether a running item has a health check whose report says `unknown`: an agent restart's,
+/// or a replica never probed healthy (`running_healthy` counts either running when stale).
+fn health_unknown(item: *const Item) bool {
+    if (item.replica.rec.health == null) return false;
+    const observed = item.observed orelse return false;
+    return records.observed_health(&observed.rec) == .unknown;
 }
 
 fn by_number(context: void, first: Item, second: Item) bool {
