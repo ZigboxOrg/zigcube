@@ -1705,6 +1705,47 @@ test "a paused rollout's scale-up runs its from generation, never a newer stale 
     try testing.expectEqual(old + 1, try fixture.count_of(1));
 }
 
+test "replicas of a deleted incarnation start no rollout of the new one, nor count in it (#16)" {
+    // Goal: the rollout controller judges only the incarnation's own replicas, as the replica
+    // controller does (`earlier_incarnation`, PR #18 review SHOULD 1). Method: delete `web`
+    // halfway through its rollout to generation 2 and apply generation 2's manifest again (the
+    // new incarnation's generation 1), then run the rollout controller alone, before the replica
+    // controller stops the old replicas. Two old replicas run generation 1 (another image) and
+    // two run generation 2 (the same spec, one ready): before the fix the first two began a
+    // rollout of the new incarnation and the ready one counted as its new and ready replica.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    var next = web;
+    next.image = "b3:9d20c4f1";
+    next.request_id = "r-0002b11";
+    try fixture.roll_to(next);
+    _ = try fixture.report(2, .running);
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 2), try fixture.count_of(1));
+    try testing.expectEqual(@as(u32, 2), try fixture.count_of(2));
+    const started = try fixture.decisions("rollout_start", "service web");
+    const ctx = fixture.context();
+    const gone = try apply_mod.delete_service(&ctx, &fixture.api, web.name, "alex", "r-00000016");
+    try testing.expect(gone == .written);
+    next.request_id = "r-0002b16";
+    try fixture.apply(next);
+    try testing.expectEqual(@as(u64, 1), (try fixture.service()).generation);
+    try rollouts_only(&fixture);
+    try testing.expectEqual(started, try fixture.decisions("rollout_start", "service web"));
+    try fixture.settle();
+    try testing.expectEqual(started, try fixture.decisions("rollout_start", "service web"));
+    // The old replicas are stopped and the count made up at the new incarnation's spec.
+    const now = try fixture.replicas();
+    try testing.expectEqual(@as(usize, 3), now.len);
+    for (now) |replica| {
+        try testing.expectEqual(@as(u64, 1), replica.rec.generation);
+        try testing.expectEqualStrings(next.image, replica.rec.image);
+    }
+}
+
 test "C3 slice 8: a user's apply before the automatic rollback commits wins (R8)" {
     // Goal: the compare on the service key. Method: the user applies generation 3 inside the
     // rollback's transaction, after the handler read the service: the rollback must write

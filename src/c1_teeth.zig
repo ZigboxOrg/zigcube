@@ -255,9 +255,9 @@ pub const rollout_race = declared("c1_teeth_rollout_race");
 /// The rollout controller never carries out an automatic rollback it owes, nor records it refused
 /// (C3 slice 8; must break R7).
 pub const rollout_stuck = declared("c1_teeth_rollout_stuck");
-/// The replica controller takes every replica of a service's name for the service's, as before
-/// issue #16's fix: one left by an earlier incarnation (deleted and applied again) is counted,
-/// replaced and copied (must break R4).
+/// The replica and rollout controllers take every replica of a service's name for the
+/// service's, as before issue #16's fix: one left by an earlier incarnation (deleted and applied
+/// again) is counted, replaced and copied (must break R4).
 pub const rollout_incarnation = declared("c1_teeth_rollout_incarnation");
 /// A halted rollout's scale-up finds no `/history` record of its `from` generation
 /// (`history_template` returns null), so with no old replica left it creates the paused new

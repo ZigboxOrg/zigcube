@@ -199,7 +199,7 @@ pub const RolloutController = struct {
             const track = rc.track_of(replica.rec.id) orelse rc.track_add(replica.rec.id) orelse
                 continue;
             const service = snap.service_of(replica.rec.service);
-            const fresh = if (service) |found| is_new(&replica.rec, &found.rec) else true;
+            const fresh = if (service) |found| new_of(replica, found) else true;
             update(track, snap, replica, fresh, now);
         }
         assert(rc.tracks_count <= snap.replicas.len);
@@ -355,6 +355,14 @@ pub fn is_new(replica: *const records.Replica, service: *const records.Service) 
     return records.replica_runs_service(replica, service);
 }
 
+/// Whether `replica` is a new replica of this incarnation of `service`. One of an earlier
+/// incarnation (the service was deleted and applied again before the replica controller stopped
+/// it) is never new, whatever it runs: its readiness and deaths are not this rollout's (#16).
+fn new_of(replica: *const Entry(records.Replica), service: *const ServiceEntry) bool {
+    if (replica_controller.earlier_incarnation(replica, service)) return false;
+    return is_new(&replica.rec, &service.rec);
+}
+
 /// Whether a replica with this report (if any) on a node of this status counts as live.
 pub fn live_report(snap: *const Snapshot, replica: *const records.Replica) bool {
     if (node_lost(snap, replica.id)) return false;
@@ -403,6 +411,15 @@ const Run = struct {
         var result: View = .{};
         for (run.snap.replicas) |*replica| {
             if (!std.mem.eql(u8, replica.rec.service, service.rec.name)) continue;
+            if (replica_controller.earlier_incarnation(replica, service)) {
+                // The replica controller stops it (#16): while it lives it counts toward surge
+                // as stopping, as a stopping orphan does, and never as this rollout's.
+                if (live_report(run.snap, &replica.rec)) {
+                    result.mix.old_live += 1;
+                    result.mix.old_stopping += 1;
+                }
+                continue;
+            }
             const track = run.rc.track_of(replica.rec.id);
             const fresh = is_new(&replica.rec, &service.rec);
             if (!fresh) {
@@ -483,7 +500,7 @@ const Run = struct {
         }
         for (run.snap.replicas) |*replica| {
             if (!std.mem.eql(u8, replica.rec.service, service.rec.name)) continue;
-            if (!is_new(&replica.rec, &service.rec)) continue;
+            if (!new_of(replica, service)) continue;
             const track = run.rc.track_of(replica.rec.id) orelse continue;
             const died = track.died_at_ms orelse continue;
             if (track.counted) continue;

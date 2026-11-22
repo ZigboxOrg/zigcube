@@ -762,8 +762,8 @@ R6), and slice 8's `rollout_exact` (a rollback keeps the current image: R5), `ro
 controller remembers an owed rollback and carries it out a pass later on the service as it is
 then, without comparing the service revision its pass read: R8) and `rollout_stuck` (the
 controller never carries out an owed rollback: R7), and issue #16's `rollout_incarnation` (the
-replica controller takes a replica of an earlier incarnation for the service's, as before the
-fix: R4, "a replica of an earlier incarnation") and `rollout_template` (a halted rollout's
+replica and rollout controllers take a replica of an earlier incarnation for the service's, as
+before the fix: R4, "a replica of an earlier incarnation") and `rollout_template` (a halted rollout's
 scale-up finds no `/history` record of its `from`, so with no old replica left it starts the
 paused generation: R4, "a paused rollout started a replica of the new generation"). Those two
 are sparse and run drawn worlds (`auto`, `auto_shape` in `c1_teeth_roots`): `rollout_incarnation`

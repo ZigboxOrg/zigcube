@@ -40,9 +40,28 @@ the current incarnation has a newer key. Such a replica is:
   left the service gets nothing else, so every count the controller makes is of the current
   incarnation. Its container still counts toward the surge bound (R2) until it stops.
 
-This is the job rule of `docs/decisions/2026-11-18-job-incarnation.md` applied to replicas. The
-rollout controller is unchanged: its `view` still sees the old replicas until they are removed,
-which is at most a few passes.
+This is the job rule of `docs/decisions/2026-11-18-job-incarnation.md` applied to replicas.
+
+## The rollout controller (PR #18 review SHOULD 1)
+
+The first version of this slice left the rollout controller matching replicas by name, and said
+the window until the old replicas are removed was harmless. It was not: `view`, `count_deaths` and
+`observe` took an old replica whose generation is at least the new one's and whose spec is the
+same as new (`is_new`), which is the normal case when the same manifest is deleted and applied
+again. Old replicas of another spec counted as the new incarnation's old records, so a rollout of
+the new incarnation began over replicas it does not own, could step or complete on the old ready
+ones, and counted old deaths against `rollout_restarts_max`. Removal takes one pass per
+`batch_replicas_max` replicas, and a conflicted batch takes more.
+
+The rollout controller now uses the same test (`replica_controller.earlier_incarnation`, exported;
+no second copy): `observe` and `count_deaths` take no old-incarnation replica as new, and `view`
+counts one only as live and stopping (`old_live`, `old_stopping`) while its report says it runs,
+as it counts a stopping orphan, so the surge bound (R2) still covers its container. It is never an
+old record (it starts no rollout), never new, never ready. The unit test "replicas of a deleted
+incarnation start no rollout of the new one, nor count in it (#16)"
+(`src/rollout_controller_test.zig`) deletes `web` halfway through a rollout, applies the same
+manifest again and runs the rollout controller alone: before the fix it began a rollout of the
+new incarnation. The `sim-c3-teeth-incarnation` fault blinds both controllers.
 
 ## The template of a halted scale-up (PR review SHOULD 1)
 
@@ -83,13 +102,14 @@ keeps the count and R2/P1 without advancing a paused rollout." `docs/core.md` ("
   tooth had one).
 - Seeds 357, 162 and 19 are in `c1_regressions`. Each fails before the fix.
 
-## Note on an edited decision
+## A correction to an earlier decision
 
-On the supervisor's request this slice also corrected one sentence of
-`docs/decisions/2026-11-22-c3-halted-rollout-holds-user-fault.md` ("An active rollout still
-replaces it" became "An active or complete rollout still replaces it"). That goes against
-`docs/decisions/README.md` ("a decision is never edited once merged"). The supervisor asked for it
-explicitly, and the edit fixes a statement the code never matched.
+`docs/decisions/2026-11-22-c3-halted-rollout-holds-user-fault.md` says "An active rollout still
+replaces it, at the service's generation, so there it stays dead." That sentence is corrected
+here, and this file supersedes it on that point only: an active **or complete** rollout still
+replaces it, at the service's generation, so there it stays dead; only a halted (paused or failed)
+rollout holds it. The code never matched the narrower statement. The earlier file is left as
+merged (`docs/decisions/README.md`: a decision is never edited once merged).
 
-Where: `src/replica_controller.zig`, `src/sim_c3.zig`, `docs/core.md` ("sim-c3"), `build.zig`
-(`c1_teeth_roots`, `c1_regressions`).
+Where: `src/replica_controller.zig`, `src/rollout_controller.zig`, `src/sim_c3.zig`,
+`docs/core.md` ("sim-c3"), `build.zig` (`c1_teeth_roots`, `c1_regressions`).

@@ -1330,8 +1330,8 @@ const Run = struct {
     /// service was deleted and applied again before the orphan pass removed them. They are not
     /// this service's to count, replace or copy, whatever they run (issue #16): a dead one
     /// replaced here would come back at its old spec, and a held one would hold the new
-    /// incarnation. The removal rests on the service as read only (a delete never breaks R1 to
-    /// R4: they bound the incarnation's own replicas).
+    /// incarnation. The removal rests on the service and each replica as read (a delete never
+    /// breaks R1 to R4: they bound the incarnation's own replicas).
     fn remove_foreign(
         run: *Run,
         service: *const ServiceEntry,
@@ -1591,9 +1591,9 @@ fn hold_stale(run: *Run, plan: *ServicePlan, roll: *const Roll) void {
 /// created before was left by a service of the same name that was deleted and applied again
 /// before the orphan pass stopped it (issue #16). As the job rule
 /// (docs/decisions/2026-11-18-job-incarnation.md), it is never this service's.
-fn earlier_incarnation(replica: *const ReplicaEntry, service: *const ServiceEntry) bool {
-    // Test-only fault (sim-c3-teeth-incarnation): the controller takes every replica of the
-    // name for the service's, as before issue #16's fix.
+pub fn earlier_incarnation(replica: *const ReplicaEntry, service: *const ServiceEntry) bool {
+    // Test-only fault (sim-c3-teeth-incarnation): the replica and rollout controllers take
+    // every replica of the name for the service's, as before issue #16's fix.
     if (c1_teeth.rollout_incarnation) return false;
     return replica.kv.create_revision < service.kv.create_revision;
 }
