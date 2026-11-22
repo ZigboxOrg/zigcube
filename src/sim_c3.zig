@@ -244,10 +244,12 @@ fn step_problem(
     if (rollout.phase == .paused) {
         tally.paused_judged += 1;
         if (step.retired > 0) return "R4: a paused rollout retired a replica";
-        if (step.created > step.dead) return "R4: a paused rollout started a replica";
+        const repair = paused_scale_up(ctx, snap, service, request, &step);
+        if (step.created > step.dead and !repair) return "R4: a paused rollout started a replica";
         // A replacement runs the generation of the replica it replaces: an old replica replaced
-        // at the new spec is a start (TLA+ review, C3 slice 7).
-        if (step.created_new > step.dead_new) {
+        // at the new spec is a start (TLA+ review, C3 slice 7). A scale-up runs an old one while
+        // one is left to copy.
+        if (step.created_new > step.dead_new and !(repair and !has_older(snap, service))) {
             return "R4: a paused rollout started a replica of the new generation";
         }
         return null;
@@ -294,19 +296,39 @@ fn compared(request: store.TxnRequest, key: []const u8) bool {
     return false;
 }
 
-/// A user's scale-down (a `scale_down` decision on the service in the transaction) removes
-/// replicas of either generation, paused or not: the removals down to `replicas` are not the
-/// rollout's retirements. Any beyond are. The replicas counted are the controller's: every record
-/// but one that stopped for its host's reason (it is replaced, not kept), so a replica held for
-/// its user's fault and one on a node that is not ready but not yet past its lost grace count
-/// (docs/decisions/2026-11-14-c3-paused-scale-down.md; seeds 202 and 207).
-fn scaled_down(
+/// A paused rollout's scale-up (a `scale_up` decision on the service in the transaction that
+/// removes nothing) is failure replacement made up later: a dead replica the surge bound (R2)
+/// left no room to replace in its own transaction was removed unreplaced, since P1 cannot wait
+/// for room. It is no start while it brings the service no higher than `replicas`, counted as
+/// `scaled_down` counts (docs/decisions/2026-11-21-c3-stale-replica-on-exclusive-node.md).
+fn paused_scale_up(
     ctx: *const Context,
     snap: *const Snapshot,
     service: *const ServiceEntry,
     request: store.TxnRequest,
-    step: *Step,
-) void {
+    step: *const Step,
+) bool {
+    if (step.dead > 0 or step.retired > 0) return false;
+    if (!has_decision(ctx, service, request, "scale_up")) return false;
+    return counted(snap, service) + step.created <= service.rec.replicas;
+}
+
+/// Whether a replica of `service` runs an older spec than the service's.
+fn has_older(snap: *const Snapshot, service: *const ServiceEntry) bool {
+    for (snap.replicas) |*replica| {
+        if (!std.mem.eql(u8, replica.rec.service, service.rec.name)) continue;
+        if (!rollout_controller.is_new(&replica.rec, &service.rec)) return true;
+    }
+    return false;
+}
+
+/// Whether the transaction writes a decision `action` on `service`.
+fn has_decision(
+    ctx: *const Context,
+    service: *const ServiceEntry,
+    request: store.TxnRequest,
+    action: []const u8,
+) bool {
     for (request.on_success) |op| {
         const put = switch (op) {
             .put => |put| put,
@@ -323,11 +345,17 @@ fn scaled_down(
             ctx.diag.reset();
             continue;
         };
-        if (!std.mem.eql(u8, decision.action, "scale_down")) continue;
+        if (!std.mem.eql(u8, decision.action, action)) continue;
         if (decision.subject.kind != .service) continue;
-        if (!std.mem.eql(u8, decision.subject.name, service.rec.name)) continue;
-        break;
-    } else return;
+        if (std.mem.eql(u8, decision.subject.name, service.rec.name)) return true;
+    }
+    return false;
+}
+
+/// The replicas of `service` the controller keeps: every record but one that stopped for its
+/// host's reason (it is replaced, not kept), so a replica held for its user's fault and one on
+/// a node that is not ready but not yet past its lost grace count.
+fn counted(snap: *const Snapshot, service: *const ServiceEntry) u32 {
     var count: u32 = 0;
     for (snap.replicas) |*replica| {
         if (!std.mem.eql(u8, replica.rec.service, service.rec.name)) continue;
@@ -337,6 +365,24 @@ fn scaled_down(
         }
         count += 1;
     }
+    return count;
+}
+
+/// A user's scale-down (a `scale_down` decision on the service in the transaction) removes
+/// replicas of either generation, paused or not: the removals down to `replicas` are not the
+/// rollout's retirements. Any beyond are. The replicas counted are the controller's: every record
+/// but one that stopped for its host's reason (it is replaced, not kept), so a replica held for
+/// its user's fault and one on a node that is not ready but not yet past its lost grace count
+/// (docs/decisions/2026-11-14-c3-paused-scale-down.md; seeds 202 and 207).
+fn scaled_down(
+    ctx: *const Context,
+    snap: *const Snapshot,
+    service: *const ServiceEntry,
+    request: store.TxnRequest,
+    step: *Step,
+) void {
+    if (!has_decision(ctx, service, request, "scale_down")) return;
+    const count = counted(snap, service);
     const excess = @min(step.retired, count -| service.rec.replicas);
     step.retired -= excess;
     step.retired_running -|= excess;

@@ -104,9 +104,9 @@ classify() {
     src/demo_b1_state.zig | src/demo_b1_fleet.zig) want_one demo_b1; want_one demo_b3; want_one demo_b7; want_one demo_b5; want_one demo_b6; return ;;
     src/demo_b1*.zig) want_one demo_b1; return ;;
     src/demo_b6*.zig) want_one demo_b6; return ;;
-    # demo-c3 imports demo_c2_vms.zig (the rig) but not demo_c2_steps.zig.
+    # demo-c3 imports demo_c2_vms.zig (the rig) and demo_c2_steps.zig (`put_guest_tls`, since 0.6.0's agent rule).
     src/demo_c2_vms.zig) want_one demo_c2; want_one demo_b3; want_one demo_b5; want_one demo_c3; return ;;
-    src/demo_c2_steps.zig | src/demo_c2_check.zig) want_one demo_c2; want_one demo_b3; want_one demo_b5; return ;;
+    src/demo_c2_steps.zig | src/demo_c2_check.zig) want_one demo_c2; want_one demo_b3; want_one demo_b5; want_one demo_c3; return ;;
     src/demo_c2*.zig | ops/demo-c2/*) want_one demo_c2; return ;;
     src/demo_b3*.zig | src/demo_relay_tls.zig | ops/demo-b3/*) want_one demo_b3; return ;;
     src/demo_b4*.zig) want_one demo_b4; return ;;

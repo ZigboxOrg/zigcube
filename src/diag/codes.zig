@@ -260,8 +260,17 @@ pub const registry = [_]Entry{
         \\cannot be read, is not a policy zbx reads (the cause names its line,
         \\column and what is wrong), or could be rewritten by someone other than
         \\root or the server's user (it must be a regular file owned by one of
-        \\them, writable by neither group nor others). The cause line names the
-        \\setting.
+        \\them, writable by neither group nor others, and so must every
+        \\directory on its path, a symbolic link's own directory and those of
+        \\its target included, unless the directory has the sticky bit, as /tmp
+        \\does; in such a directory every entry the path passes, a link
+        \\included, must be owned by root or the server's user, must be
+        \\neither a mount point nor on another mount than the directory, and,
+        \\unless it is a directory, must have no other name (hard link)). A
+        \\path that goes on past a file, or that can't be resolved (a name on
+        \\it missing or unsearchable, its working directory unreadable, a link
+        \\unreadable, too long, or /proc not mounted), is refused too. The
+        \\cause line says why, then names the path.
         \\
         \\Nothing was started. Correct the setting and start the server again.
         ,
@@ -1375,12 +1384,21 @@ pub const registry = [_]Entry{
         \\file's .labels differently, the labels differ from those the node
         \\registered with while its lease in --state-dir is live, or a file it
         \\names (the image fixtures, the --trust-policy file) cannot be read or
-        \\used. Without --ca (or .ca in the file) the agent speaks plain HTTP,
-        \\so --server must then be a loopback address (127.0.0.0/8 or [::1]):
-        \\the server serves plain HTTP on loopback only, and a node must not
-        \\take its work unauthenticated over a network; give --ca, --cert and
-        \\--key to reach any other address over TLS. The cause line names the
-        \\setting. The agent did not start and changed nothing.
+        \\used. The --trust-policy file, and every directory on its path (a
+        \\symbolic link's own directory and those of its target included), must
+        \\be owned by root or the agent's user and writable by neither group nor
+        \\others (a directory with the sticky bit, as /tmp, may be, and then
+        \\every entry the path passes in it, a link included, must be owned by
+        \\root or the agent's user, must be neither a mount point nor on
+        \\another mount than the directory, and, unless it is a directory, must
+        \\have no other name (hard link)). Without --ca (or .ca in the file)
+        \\the agent speaks plain HTTP, so --server must then be a loopback
+        \\address (127.0.0.0/8 or [::1]): the server serves plain HTTP on
+        \\loopback only, and a node must not take its work unauthenticated over
+        \\a network; give --ca, --cert and --key to reach any other address over
+        \\TLS (zcube-agent fetch keeps the same rule for its --server). The
+        \\cause line says what was refused and why. The agent did not start and
+        \\changed nothing.
         \\
         \\The mesh port range (--mesh-ports A-B) must hold at least 512 ports, as
         \\many as the agent can run containers, so that it cannot run out. It is

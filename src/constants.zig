@@ -364,6 +364,9 @@ pub const server_retry_ms_max: u32 = 5000;
 pub const server_report_ms: u32 = 30 * 1000;
 pub const config_bytes_max: u32 = 16 * 1024;
 pub const config_path_bytes_max: u32 = 1024;
+/// Symbolic links followed while a trust policy's path is walked: Linux's own limit (MAXSYMLINKS),
+/// so a path the kernel would open is never refused for its links alone.
+pub const trust_policy_links_max: u32 = 40;
 pub const listen_bytes_max: u32 = 128;
 pub const store_spec_bytes_max: u32 = 1100;
 /// The controller loop and the accept loop may not wait on a clock-less store longer than this

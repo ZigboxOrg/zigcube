@@ -3,10 +3,12 @@
 # three guests (the rig of src/demo_c2_vms.zig), copies the binaries and this script in, and calls
 # it as root with one command at a time. The server runs on the host; this guest runs one
 # `zcube-agent --runtime zigbox` as root (as demo-c2's, ops/demo-c2/guest.sh), which reaches the
-# server at 10.0.2.2 (QEMU user-mode networking). The images are public Alpine tags pulled
-# through Google's mirror of Docker Hub; the agent pulls each the first time a replica needs it.
+# server's TLS listener at 10.0.2.2 (QEMU user-mode networking) with a node certificate. The
+# images are public Alpine tags pulled through Google's mirror of Docker Hub; the agent pulls each
+# the first time a replica needs it.
 #
-# Commands:  guest.sh setup-root | learn <reference> | agent <node> <server host:port>
+# Commands:  guest.sh setup-root | learn <reference>
+#            guest.sh agent <node> <server host:port> <tls dir>
 #            guest.sh containers | kill-agent | start-agent | logs
 #
 # Every command prints `ok: ...` for what it did, or `FAIL: ...` and exits 1 (`containers`
@@ -78,11 +80,18 @@ cmd_learn() {
     echo "tree $tree"
 }
 
+# The agent talks to the server's TLS listener with the CA, node certificate and key the demo put
+# in <tls dir> (ca.crt, node.crt, node.key): the server is not on this guest's loopback, and an
+# agent refuses plain HTTP to such a server (ZC-E0505).
 cmd_agent() {
-    [ $# -eq 2 ] || fail "usage: guest.sh agent <node> <server>"
+    [ $# -eq 3 ] || fail "usage: guest.sh agent <node> <server> <tls dir>"
+    for file in ca.crt node.crt node.key; do
+        [ -f "$3/$file" ] || fail "no $3/$file"
+    done
     mkdir -p "$STATE" "$LOG"
     echo "--runtime zigbox --node $1 --server $2 --state-dir $STATE --cpu-millis 2000" \
-        "--memory-bytes 1073741824 --verbose" >"$ARGS"
+        "--memory-bytes 1073741824 --verbose" \
+        "--ca $3/ca.crt --cert $3/node.crt --key $3/node.key" >"$ARGS"
     start_agent
     ok "zcube-agent --runtime zigbox --node $1 --server $2 (pid $(agent_pid))"
 }

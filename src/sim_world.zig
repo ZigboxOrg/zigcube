@@ -86,6 +86,9 @@ pub const SwitchedStore = struct {
     /// A list of keys under this prefix fails as a server that cannot be reached does (ZC-E0201);
     /// test-only, null in every simulation.
     down_list_prefix: ?[]const u8 = null,
+    /// A list of keys under its prefix takes `cost_ms` of the clock before it is answered, and
+    /// keeps the clock's time when the last one was sent; test-only, null in every simulation.
+    slow_list: ?SlowList = null,
     /// Runs once, just before the first transaction that puts a key under `prefix` is applied;
     /// it may write through the world's store (the transaction then meets that write). Test-only,
     /// null in every simulation.
@@ -109,6 +112,14 @@ pub const SwitchedStore = struct {
         cap_ms: *const u64,
         /// Keepalives cut by the cap.
         cut: u32 = 0,
+    };
+
+    pub const SlowList = struct {
+        prefix: []const u8,
+        clock: *ManualClock,
+        cost_ms: u32,
+        /// The clock's time when the last slow list was sent; null before the first.
+        sent_ms: ?u64 = null,
     };
 
     pub const BeforePut = struct {
@@ -219,6 +230,13 @@ pub const SwitchedStore = struct {
                 diag.cause("connection refused", .{});
                 diag.fix(.{ .sentence = "switch it back on" });
                 return error.BackendFailed;
+            }
+        }
+        if (self.slow_list) |*slow| {
+            if (std.mem.startsWith(u8, options.prefix, slow.prefix)) {
+                slow.sent_ms = slow.clock.ms;
+                slow.clock.advance(slow.cost_ms);
+                assert(slow.clock.ms == slow.sent_ms.? + slow.cost_ms);
             }
         }
         return self.inner.list(arena, options, diag);

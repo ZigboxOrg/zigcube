@@ -181,11 +181,24 @@ pub fn enforce_deadlines(
             continue;
         };
         switch (read) {
-            // No record to say when: `pass` stops it as `unknown`, with the server's word.
-            .absent, .damaged => {},
+            .absent, .damaged => enforce_unrecorded(agent, ctx, listing),
             .record => |found| enforce_one(agent, ctx, state, listing, found),
         }
     }
+}
+
+/// A running run container with no start record to say when, or a damaged one. `pass` stops it
+/// as `unknown`, with the server's word; while no read of the runs succeeds there is no pass, so
+/// the job fence stops it as it stops a recorded run (0.5.2 review 5927352205, item 7). No cause
+/// can be recorded without a record: once the server answers, `pass` reports what it finds, the
+/// container's plain exit with no stop cause (`exited_unrecorded`), as for `pass`'s own stop of
+/// it. A job that traps SIGTERM and exits 0 can so end `succeeded` though it was fenced.
+fn enforce_unrecorded(agent: *Agent, ctx: *const Context, listing: *const runtime.Listing) void {
+    assert(is_running(listing));
+    const fence_at = agent.job_fence_at_ms() orelse return;
+    const mono = ctx.mono_ms();
+    if (mono < fence_at) return note_deadline_wake(agent, fence_at);
+    stop_enforced(agent, ctx, listing, constants.fence_stop_ms);
 }
 
 fn enforce_one(
@@ -213,12 +226,25 @@ fn enforce_one(
             agent.note_enforce_failure(ctx, "record a run's stop cause");
     }
     // Any recorded cause is a stop under way: send it, or the kill once the grace has passed.
-    agent.stop_listing(ctx, listing, record.grace_ms) catch {
-        agent.note_enforce_failure(ctx, "stop a run's container");
-        return; // The next step tries again (the loop's resync), not a busy retry.
-    };
+    assert(record.stop_cause != null);
+    stop_enforced(agent, ctx, listing, record.grace_ms);
+}
+
+/// Sends a run container its stop, or the kill once the grace has passed, and wakes the agent
+/// for the kill. A failure is noted; the next step tries again (the loop's resync), not a busy
+/// retry.
+fn stop_enforced(
+    agent: *Agent,
+    ctx: *const Context,
+    listing: *const runtime.Listing,
+    grace_ms: u32,
+) void {
+    assert(is_running(listing));
+    agent.stop_listing(ctx, listing, grace_ms) catch
+        return agent.note_enforce_failure(ctx, "stop a run's container");
     const pending = agent.pending_stop(listing.handle.name()) orelse return;
     const now = ctx.clock.now_ms();
+    const mono = ctx.mono_ms();
     if (pending.deadline_ms > now) note_deadline_wake(agent, mono + (pending.deadline_ms - now));
 }
 
@@ -463,7 +489,7 @@ const Work = struct {
                     }
                 }
                 if (listing == null and seen == null and subject.assigned) {
-                    if (found == .damaged) return work.lost(subject, null, seen, .damaged);
+                    if (found == .damaged) return work.lost(subject, null, seen, run, .damaged);
                     if (run) |entry| return work.claim(subject, entry);
                     return;
                 }
@@ -536,7 +562,7 @@ const Work = struct {
         } else if (try work.refused_unstarted(subject, seen)) {
             return;
         }
-        try work.lost(subject, null, seen, .missing);
+        try work.lost(subject, null, seen, work.run_of(subject.id), .missing);
     }
 
     /// A claim and nothing else: the node lost its disk, state directory and containers after
@@ -580,12 +606,13 @@ const Work = struct {
 
     const Why = enum { missing, damaged, vanished };
 
-    /// Reports the run stopped, `lost`, once.
+    /// Reports the run stopped, `lost`, once, its recorded cause named as `stopped` names it.
     fn lost(
         work: *Work,
         subject: Subject,
         record: ?StartRecord,
         seen: ?*const records.JobObserved,
+        run: ?*const Entry(records.JobRun),
         why: Why,
     ) Error!void {
         // A run with no assignment here has nothing to report under: it ends on this node.
@@ -602,7 +629,7 @@ const Work = struct {
             .status = .stopped,
             .epoch = epoch,
             .exit = .{ .kind = .lost },
-            .stop_cause = if (record) |held| held.stop_cause else null,
+            .stop_cause = if (record) |held| reported_cause(held.stop_cause, run) else null,
             .diagnostic = raw,
             .started_at_ms = if (record) |held| held.started_at_ms else null,
         });
@@ -621,7 +648,7 @@ const Work = struct {
             const held = seen.?;
             if (held.status == .claimed) return work.claimed_unstarted(subject, record, held, run);
         }
-        try work.lost(subject, record, seen, .vanished);
+        try work.lost(subject, record, seen, run, .vanished);
         // No container: a run with no assignment here is over on this node (`report_epoch`).
         if (!subject.assigned) try remove_record(work.ctx, work.state, subject.id);
     }
@@ -715,7 +742,7 @@ const Work = struct {
                     // Test-only: start a run whose container already exited (J2, J7).
                     if (run) |entry| return work.start(subject, record, &entry.rec, null);
                 }
-                try work.stopped(subject, record, reason, seen);
+                try work.stopped(subject, record, reason, seen, run);
             },
         }
     }
@@ -809,6 +836,7 @@ const Work = struct {
         record: StartRecord,
         reason: runtime.ExitReason,
         seen: ?*const records.JobObserved,
+        run: ?*const Entry(records.JobRun),
     ) Error!void {
         // The container has ended: a run with no assignment here is over on this node.
         const epoch = report_epoch(subject, record) orelse
@@ -820,7 +848,7 @@ const Work = struct {
             .run = subject.id,
             .status = .stopped,
             .epoch = epoch,
-            .stop_cause = record.stop_cause,
+            .stop_cause = reported_cause(record.stop_cause, run),
             .started_at_ms = record.started_at_ms,
         };
         try work.apply_exit(&wanted, reason);
@@ -835,6 +863,26 @@ const Work = struct {
             wanted.diagnostic = try records.diagnostic_raw(ctx.arena, &finished, ctx.diag);
         }
         try work.report(wanted);
+    }
+
+    /// The cause a stopped run's report names. `unreachable` that this node recorded (the job
+    /// fence) stands for a stop it may have missed; once the runs read this report follows shows
+    /// that the server committed a cancel, it is reported instead, whenever the cancel was
+    /// committed (after the fence's kill too: the user asked for the stop, and the run is
+    /// stopped), so a cancelled job ends `cancelled`, not `failed` (0.5.2 review 5927352205,
+    /// item 4; docs/decisions/2026-11-21-fenced-cancel-reported-cancel.md). Every
+    /// other recorded cause is what this node did, and the server's other stops (`unreachable`,
+    /// `not_started`) say no more than `unreachable` does, so those stand.
+    fn reported_cause(
+        recorded: ?records.StopCause,
+        run: ?*const Entry(records.JobRun),
+    ) ?records.StopCause {
+        if (recorded != .@"unreachable") return recorded;
+        const entry = run orelse return recorded;
+        const asked = entry.rec.stop orelse return recorded;
+        if (asked.cause != .cancel) return recorded;
+        assert(entry.rec.stop != null);
+        return .cancel;
     }
 
     fn stop(work: *Work, listing: *const runtime.Listing, grace_ms: u32) Error!void {

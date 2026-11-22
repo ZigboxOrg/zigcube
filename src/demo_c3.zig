@@ -1,7 +1,10 @@
 //! `zig build demo-c3`: C3's demo, run for real (docs/briefs/c3.md, "Demo script" and "How
-//! demo-c3 runs"; docs/demos/c3.md). zcube-server runs on the host over SQLite; three QEMU guests
-//! (the rig of src/demo_c2_vms.zig, its first three) each run `zcube-agent --runtime zigbox` as
-//! root, which pulls the service's images through Google's mirror of Docker Hub. The steps are
+//! demo-c3 runs"; docs/demos/c3.md). zcube-server runs on the host over SQLite, serving TLS
+//! (`--listen`) only; three QEMU guests (the rig of src/demo_c2_vms.zig, its first three) each
+//! run `zcube-agent --runtime zigbox` as root with a node certificate (an agent refuses plain HTTP
+//! to a server that is not on loopback, ZC-E0505), which pulls the service's images through
+//! Google's mirror of Docker Hub. The demo's `zcube` commands present the operator's client
+//! certificate (`ca issue-client operator --scope admin`). The steps are
 //! c3-smoke's (`c3_smoke_steps.zig`) and the witness is `c3_witness.zig`, which judges R1 to R5
 //! at every revision; only the nodes, the images and the health differ:
 //!
@@ -19,6 +22,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const c2_steps = @import("demo_c2_steps.zig");
 const demo_host = @import("demo_host.zig");
 const steps = @import("c3_smoke_steps.zig");
 const vms = @import("demo_c2_vms.zig");
@@ -167,6 +171,9 @@ fn prepare(host: *Host, init: std.process.Init, options: Options) !void {
             .images = "",
             .store = "",
             .transcript_path = options.transcript,
+            // The server serves TLS only, and each guest's agent has a node certificate: an agent
+            // refuses plain HTTP to a server that is not on loopback (ZC-E0505, 0.6.0).
+            .tls_only = true,
         },
         .work = "",
         .state = "",
@@ -248,8 +255,9 @@ fn step_start(demo: *Demo) !void {
     host.section("0. Start: zcube-server on the host, an agent on each guest");
     _ = try host.zcube(&.{"version"});
     try host.start_server(steps.start_wait_ms);
-    host.say("  zcube-server is up on 127.0.0.1:{d} (SQLite); the guests reach it at {s}", .{
-        host.port, machines.server,
+    try host.check_tls_only();
+    host.say("  zcube-server is up on 127.0.0.1:{d} (SQLite, {s}); the guests reach it at {s}", .{
+        host.port, host.listener_text(), machines.server,
     });
     for (0..nodes_count) |index| _ = try guest(machines, index, "setup-root", .{});
     // A tree digest depends on the host that pulls the image: learn each on guest 1, in a
@@ -268,7 +276,12 @@ fn step_start(demo: *Demo) !void {
         .v3_fails = "its image is Alpine 3.21, so the app never creates /tmp/ready",
     };
     for (0..nodes_count) |index| {
-        _ = try guest(machines, index, "agent {s} {s}", .{ vms.names[index], machines.server });
+        // The guest is not on the server's loopback, so its agent talks TLS with a node
+        // certificate (ca.crt, node.crt and node.key in the guest's /root/tls, 0600).
+        try c2_steps.put_guest_tls(host, machines.guests, @intCast(index));
+        _ = try guest(machines, index, "agent {s} {s} {s}", .{
+            vms.names[index], machines.server, c2_steps.guest_tls_dir,
+        });
     }
     try wait_nodes(demo);
     _ = try host.zcube(&.{ "get", "nodes" });

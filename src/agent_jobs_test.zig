@@ -547,6 +547,118 @@ test "a stop the agent cannot read is enforced by the job fence while keepalives
     try testing.expectEqual(records.JobObservedStatus.stopped, seen.status);
 }
 
+/// Runs a run, optionally cancels it, then fails every read of the runs until the job fence has
+/// stopped it, optionally removes its stopped container (the runtime no longer lists it), and
+/// heals: the observation the node reports once it can read the runs again.
+fn fenced_ending(cancel: bool, vanish: bool) !Seen {
+    var rig = try Rig.start();
+    defer rig.stop();
+    const world = rig.world;
+    _ = try rig.assign(600_000);
+    rig.step();
+    try testing.expect(rig.running());
+    if (cancel) try rig.ask_stop(.cancel, 600_000);
+    world.switched.down_list_prefix = records.prefix_job_runs;
+    const fence_at = world.agent.job_fence_at_ms().?;
+    world.advance(fence_at - world.now_ms() + constants.fence_stop_ms + 1_000);
+    try testing.expect(!rig.running());
+    try testing.expect(!world.agent.fence.active);
+    const kept = (try rig.start_record()).?;
+    try testing.expectEqual(@as(?records.StopCause, .@"unreachable"), kept.stop_cause);
+    if (vanish) world.sim.evict(run_id);
+    world.switched.down_list_prefix = null;
+    world.advance(2_000);
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(records.JobObservedStatus.stopped, seen.status);
+    const lost = seen.exit.?.kind == .lost;
+    try testing.expectEqual(vanish, lost);
+    return seen;
+}
+
+test "a cancelled run the job fence stopped is reported cancelled, not unreachable" {
+    // Goal: the 0.5.2 review 5927352205, item 4: a cancel committed while the node could not read
+    // its runs was missed, the job fence stopped the run as `unreachable`, and that cause was
+    // reported though the node stayed ready, so the job ended `failed`, not `cancelled`.
+    // Method: the fence stops the run with `unreachable` recorded in both worlds; after the heal
+    // the cancelled run reports `cancel`, and the run with no stop asked still reports
+    // `unreachable` (the fence's cause stands when the server committed no cancel). Each also
+    // with the stopped container gone before the heal (PR #10's review): the run ends `lost`,
+    // and the same rule names its cause.
+    for ([_]bool{ false, true }) |vanish| {
+        const cancelled = try fenced_ending(true, vanish);
+        try testing.expectEqual(@as(?records.StopCause, .cancel), cancelled.stop_cause);
+        const unasked = try fenced_ending(false, vanish);
+        try testing.expectEqual(@as(?records.StopCause, .@"unreachable"), unasked.stop_cause);
+    }
+}
+
+test "the job fence counts from when the runs read was sent, not when it was answered" {
+    // Goal: the 0.5.2 review 5927352205, item 5: no test pinned the job fence to the time the
+    // runs read was sent. A stop committed while a slow read is in flight may be missing from
+    // its answer, so a fence counted from the answer would stop the run too late.
+    // Method: one read of the runs takes 2 s; the fence's stamp must be the time it was sent,
+    // and with every later read failing, the run runs until `sent + ttl - margin` and is stopped
+    // by the fence after it.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const world = rig.world;
+    _ = try rig.assign(600_000);
+    rig.step();
+    try testing.expect(rig.running());
+    const cost_ms: u32 = 2_000;
+    world.switched.slow_list = .{
+        .prefix = records.prefix_job_runs,
+        .clock = &world.manual,
+        .cost_ms = cost_ms,
+    };
+    rig.step();
+    const sent_ms = world.switched.slow_list.?.sent_ms.?;
+    world.switched.slow_list = null;
+    try testing.expect(world.now_ms() >= sent_ms + cost_ms);
+    try testing.expectEqual(sent_ms, world.agent.runs_read_mono_ms);
+    const fence_at = sent_ms + world.agent.lease_ttl_ms - constants.fence_margin_ms;
+    try testing.expectEqual(fence_at, world.agent.job_fence_at_ms().?);
+    world.switched.down_list_prefix = records.prefix_job_runs;
+    world.advance(fence_at - world.now_ms() - 1);
+    try testing.expect(rig.running());
+    world.advance(1 + constants.fence_stop_ms + 1_000);
+    try testing.expect(!rig.running());
+    const kept = (try rig.start_record()).?;
+    try testing.expectEqual(@as(?records.StopCause, .@"unreachable"), kept.stop_cause);
+    world.switched.down_list_prefix = null;
+}
+
+test "the job fence stops a run container whose start record is gone or damaged" {
+    // Goal: the 0.5.2 review 5927352205, item 7: with no readable start record the job fence
+    // skipped the container, and `pass`, which stops it as `unknown`, cannot run while no read
+    // of the runs succeeds, so it ran on for as long as the runs were unreadable.
+    // Method: run a run, remove its record (then, in a second world, damage it), fail every read
+    // of the runs: before the fence it runs on, after the fence and its grace it is stopped.
+    for ([_]bool{ false, true }) |damaged| {
+        var rig = try Rig.start();
+        defer rig.stop();
+        const world = rig.world;
+        _ = try rig.assign(600_000);
+        rig.step();
+        try testing.expect(rig.running());
+        world.switched.down_list_prefix = records.prefix_job_runs;
+        var buffer: [96]u8 = undefined;
+        const name = agent_jobs.record_name(&buffer, run_id);
+        if (damaged) {
+            try world.files.interface().put_atomic(name, "{not");
+        } else {
+            try world.files.interface().remove(name);
+        }
+        const fence_at = world.agent.job_fence_at_ms().?;
+        world.advance(fence_at - world.now_ms() - 500);
+        try testing.expect(rig.running());
+        world.advance(500 + constants.fence_stop_ms + 1_000);
+        try testing.expect(!rig.running());
+        try testing.expect(!world.agent.fence.active);
+        world.switched.down_list_prefix = null;
+    }
+}
+
 test "an agent restart does not move the job fence later (#143)" {
     // Goal: the job fence counts from the last runs read that succeeded, so a restart in the same
     // boot must not count it from the restart. Method: as above, but the agent restarts halfway

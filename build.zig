@@ -246,7 +246,7 @@ fn mac_target(b: *std.Build, architecture: []const u8) std.Build.ResolvedTarget 
 /// `zig build cli` installs `zcube` alone and `zig build test-cli` runs its tests, for the target
 /// given (the macOS job runs both natively). `zig build mac-cross` compiles both for each macOS
 /// target from any host, without running them (a gate of `check`). `zig build mac-release` is
-/// the owner's signed release (src/mac_release.zig).
+/// the owner's signed release (src/mac_release.zig). `zig build trust-macos` is below.
 fn add_macos_steps(
     b: *std.Build,
     options: *std.Build.Step.Options,
@@ -266,6 +266,7 @@ fn add_macos_steps(
         cross.dependOn(&mac.tests.step);
     }
     add_mac_release(b, options);
+    add_trust_macos_step(b, optimize);
 }
 
 /// `zig build mac-release`: the universal ReleaseSafe macOS `zcube`, signed with the hardened
@@ -916,6 +917,31 @@ fn add_local_smoke_step(b: *std.Build, built: Built) void {
 
 /// `zig build x509-format`: the certificates `src/x509.zig` writes, read by openssl, keytool and
 /// the JDK (src/x509_format_check.zig, tools/mtls/X509Dump.java). Never cached, not in `check`.
+/// `zig build trust-macos`: the tests of `src/trust_file.zig` (and the calls of `trust_sys.zig`
+/// they make) compiled for aarch64-macos and x86_64-macos, analysed only (nothing requests the
+/// binary, so no code is generated and no SDK is needed), as Zigbox's `fuzz-macos`. `zcube`
+/// reaches `trust_file.zig` on a Mac through `server_config.zig`, and the macOS half of
+/// `trust_sys.zig` is compiled by no other gate (PR #13's review); `check` runs it.
+fn add_trust_macos_step(b: *std.Build, optimize: std.builtin.OptimizeMode) void {
+    const step = b.step("trust-macos", "Compile trust_file's tests for macOS, without a binary");
+    for ([_]std.Target.Cpu.Arch{ .aarch64, .x86_64 }) |arch| {
+        const target = b.resolveTargetQuery(.{ .cpu_arch = arch, .os_tag = .macos });
+        const zigbox = b.dependency("zigbox", .{ .target = target, .optimize = optimize });
+        const tests = b.addTest(.{
+            .name = b.fmt("trust-macos-{t}", .{arch}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/trust_file.zig"),
+                .target = target,
+                .optimize = optimize,
+                // libSystem, which every Darwin program links: `trust_sys.zig` calls it there.
+                .link_libc = true,
+                .imports = &.{.{ .name = "zigbox", .module = zigbox.module("zigbox") }},
+            }),
+        });
+        step.dependOn(&tests.step);
+    }
+}
+
 fn add_x509_format_step(b: *std.Build, zigbox_module: *std.Build.Module) void {
     const exe = b.addExecutable(.{
         .name = "x509_format_check",
@@ -3296,6 +3322,32 @@ const c1_regressions = [_][]const []const u8{
         "44892876942", "150",       "0",        "--c1",
         "--strong",    "--tenants", "--health", "--profile=mixed",
     },
+    // R2 on C3's branch (3bb7952, PR #6 re-review): a replica refused on a node registered
+    // exclusive is dead, but its container runs until its removal commits and its node stops
+    // it; `roll_of` left it out of the surge count, so its replacement went past
+    // `replicas + max_surge`. A guard: it fails without the fix (`roll_of` in
+    // `replica_controller.zig`; docs/decisions/2026-11-21-c3-stale-replica-on-exclusive-node.md).
+    &.{ "17", "150", "0", "--c3", "--tenants", "--heal-at=108" },
+    // P1 on C3's branch (d5a2650, PR #6 second re-review): a paused rollout's refused replica
+    // was removed only while no removed container was still stopping, so one that never stopped
+    // kept it on its exclusive node past P1's bound. A guard: it fails without the fix
+    // (`replace` in `replica_controller.zig`;
+    // docs/decisions/2026-11-21-c3-stale-replica-on-exclusive-node.md).
+    &.{
+        "90",            "355",       "2",                   "--c3",
+        "--strong",      "--tenants", "--lease-ttl-ms=8496", "--replicas-pct=100",
+        "--heal-at=309",
+    },
+    // Convergence on C3's branch (PR #6 review fix of d4caacd5): `hold_stale` held a user-fault
+    // stale replica under a complete rollout too (it starts nothing either); once held stale
+    // replicas kept the halted surge, beta scaled to 0 kept its broken old replica for good. A
+    // guard: it fails with `hold_stale` keyed on `!roll.starts` instead of paused or failed
+    // (`replica_controller.zig`; docs/decisions/2026-11-22-c3-halted-rollout-holds-user-fault.md).
+    &.{
+        "385",          "98",        "2",                   "--c3",
+        "--strong",     "--tenants", "--lease-ttl-ms=8082", "--replicas-pct=100",
+        "--heal-at=94",
+    },
 };
 
 /// `zig build sim-c1-regressions`: replays `c1_regressions` with the shipped code (ReleaseSafe).
@@ -3669,7 +3721,7 @@ fn add_check_step(b: *std.Build) void {
         "wasm-check",         "wasm-test",     "console-wasm",           "check-store-memory",
         "check-store-sqlite", "mtls-teeth",    "demo-b3-build",          "demo-b5-build",
         "demos-build",        "jepsen-client", "register-barrier-build", "demo-c3-build",
-        "c3-smoke-build",     "mac-cross",
+        "c3-smoke-build",     "mac-cross",     "trust-macos",
     };
     for (gates) |name| {
         const gate = b.top_level_steps.get(name) orelse @panic(name);
