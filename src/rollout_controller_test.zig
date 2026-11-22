@@ -1314,6 +1314,94 @@ test "a refused replica still running holds its place in the surge bound (R2)" {
     try testing.expectEqual(records.RolloutPhase.paused, (try fixture.rollout()).phase);
 }
 
+test "a refused replica leaves its exclusive node while a removed container is still stopping" {
+    // Goal: the PR #6 re-review's P1 failure (seed 90 `auto --c3`): a paused rollout at its
+    // surge waited to remove a refused replica while any removed container of the service was
+    // stopping, and a container on a node that cannot report its stop (suspended, partitioned)
+    // stops only once the node is judged lost, past P1's bound. P1 wins: every refused replica
+    // leaves the exclusive node at once, unreplaced while the surge leaves no room (R2), and the
+    // paused service's count comes back, at the old generation, once the containers have
+    // stopped. Method: the R2 test's world, plus a removed replica's container on node2 that
+    // never stops (its report stays running), and node1 stops nothing during the passes (no
+    // `reap`); then node1 does.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.put(.{ .agent = "node2" }, records.node_key("node2").slice(), node2);
+    try fixture.roll();
+    try testing.expectEqual(records.RolloutPhase.paused, (try fixture.request(.pause)).done);
+    const surge_max = web.replicas + 1;
+    try testing.expect(try fixture.held_by("node1") >= 2);
+    const new_before = try fixture.count_of(2);
+    _ = try fixture.stop_one_on("node2");
+    // A container of a replica removed earlier that node2 has not reported stopped (its agent
+    // suspended): it fills the surge bound for the whole run.
+    const orphan: records.Observed = .{
+        .replica = "web-99",
+        .node = "node2",
+        .generation = 1,
+        .status = .running,
+        .reported_at_ms = fixture.manual.ms,
+    };
+    try fixture.put(.{ .agent = "node2" }, records.observed_key("node2", "web-99").slice(), orphan);
+    try testing.expectEqual(surge_max, try fixture.surge_live());
+    try fixture.put(.{ .agent = "node1" }, records.node_key("node1").slice(), exclusive_node1);
+    try fixture.report_in_tenure();
+    for (0..20) |_| {
+        const ctx = fixture.context();
+        _ = try fixture.plane.reconcile(&ctx);
+        try testing.expect(fixture.plane.mismatch == null);
+        try testing.expect(try fixture.surge_live() <= surge_max);
+        fixture.manual.advance(10);
+    }
+    // P1: nothing left on node1, though its containers have not stopped yet.
+    try testing.expectEqual(@as(u32, 0), try fixture.held_by("node1"));
+    try fixture.settle();
+    try testing.expect(try fixture.surge_live() <= surge_max);
+    try testing.expectEqual(@as(u32, 0), try fixture.held_by("node1"));
+    const total: u32 = @intCast((try fixture.replicas()).len);
+    try testing.expectEqual(web.replicas, total);
+    try testing.expect(try fixture.count_of(2) <= new_before);
+    try testing.expectEqual(records.RolloutPhase.paused, (try fixture.rollout()).phase);
+}
+
+test "a paused service with max_surge 0 gets back a replica moved off an exclusive node" {
+    // Goal: the PR #6 re-review's SHOULD: with `max_surge` 0 the refused replica's own container
+    // fills the surge bound, so it is removed unreplaced (P1, R2), and the paused service must
+    // come back to its count once that container stops, at the old generation (R4: no start of
+    // the new one), not stay short until a resume. Method: `max_surge` 0 and `max_unavailable`
+    // 1 on two nodes, pause once the first new replica has started, register node1 exclusive.
+    var surge_none = web;
+    surge_none.rollout = .{ .max_surge = 0, .max_unavailable = 1 };
+    var next = surge_none;
+    next.image = "b3:9d20c4f1";
+    next.request_id = "r-0002b11";
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.put(.{ .agent = "node2" }, records.node_key("node2").slice(), node2);
+    try fixture.apply(surge_none);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 3), try fixture.report(1, .running));
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms);
+    try fixture.settle();
+    try fixture.apply(next);
+    try fixture.settle();
+    try testing.expectEqual(records.RolloutPhase.paused, (try fixture.request(.pause)).done);
+    const new_before = try fixture.count_of(2);
+    try testing.expect(try fixture.held_by("node1") > 0);
+    try testing.expect(try fixture.count_of(1) > 0);
+    try fixture.put(.{ .agent = "node1" }, records.node_key("node1").slice(), exclusive_node1);
+    try fixture.report_in_tenure();
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 0), try fixture.held_by("node1"));
+    const total: u32 = @intCast((try fixture.replicas()).len);
+    try testing.expectEqual(web.replicas, total);
+    try testing.expect(try fixture.count_of(2) <= new_before);
+    try testing.expectEqual(records.RolloutPhase.paused, (try fixture.rollout()).phase);
+}
+
 test "a failed rollout's replicas moved off a node come back old, never at the failed generation" {
     // Goal: while a rollout has failed and its rollback is refused (ZC-E0128), nothing creates a
     // replica of the failed generation, and the service still returns to its count. Method: the
@@ -1544,8 +1632,10 @@ fn rescale(fixture: *Fixture, replicas: u32) !void {
 
 test "a pause between the read and the commit fails a scale-up of a failed rollout" {
     // Goal: seam b on `scale_up`. A failed rollout's service scaled up creates replicas past
-    // what it ran; a pause that lands before the commit must fail it, since a paused rollout
-    // starts nothing (R4). Method: the pause lands inside the creating transaction.
+    // what it ran; a pause that lands before the commit must fail it, since what it creates
+    // rests on the phase it read (R4). Method: the pause lands inside the creating transaction.
+    // The paused service then makes its count up at the old generation and starts nothing of
+    // the new one (PR #6 re-review: a halted rollout's scale-up repairs, as a failed one's does).
     var fixture: Fixture = undefined;
     try fixture.start();
     defer fixture.stop();
@@ -1556,7 +1646,7 @@ test "a pause between the read and the commit fails a scale-up of a failed rollo
     try testing.expect(fixture.interleaved != null);
     try testing.expect(!fixture.interleaved_committed);
     try testing.expectEqual(records.RolloutPhase.paused, (try fixture.rollout()).phase);
-    try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
+    try testing.expectEqual(@as(u32, 4), try fixture.count_of(1));
     try testing.expectEqual(@as(u32, 1), try fixture.count_of(2));
 }
 

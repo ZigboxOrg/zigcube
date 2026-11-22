@@ -3165,6 +3165,16 @@ const c1_regressions = [_][]const []const u8{
     // `replicas + max_surge`. A guard: it fails without the fix (`roll_of` in
     // `replica_controller.zig`; docs/decisions/2026-11-21-c3-stale-replica-on-exclusive-node.md).
     &.{ "17", "150", "0", "--c3", "--tenants", "--heal-at=108" },
+    // P1 on C3's branch (d5a2650, PR #6 second re-review): a paused rollout's refused replica
+    // was removed only while no removed container was still stopping, so one that never stopped
+    // kept it on its exclusive node past P1's bound. A guard: it fails without the fix
+    // (`replace` in `replica_controller.zig`;
+    // docs/decisions/2026-11-21-c3-stale-replica-on-exclusive-node.md).
+    &.{
+        "90",            "355",       "2",                   "--c3",
+        "--strong",      "--tenants", "--lease-ttl-ms=8496", "--replicas-pct=100",
+        "--heal-at=309",
+    },
 };
 
 /// `zig build sim-c1-regressions`: replays `c1_regressions` with the shipped code (ReleaseSafe).
