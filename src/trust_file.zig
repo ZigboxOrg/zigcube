@@ -736,7 +736,9 @@ test "in a directory others may write, every entry the walk passes must be root'
     try testing.expectError(error.BadConfig, read(arena, io, link, test_options, &diag));
     try testing.expectEqual(@as(?codes.Code, .E0505), diag.code);
     const expected = try std.fmt.allocPrint(arena, "a symbolic link owned by uid 65534, in a " ++
-        "directory others may write (mode 1777), is on the trust policy's path: {s}", .{link});
+        "directory others may write (mode 1777), is on the trust policy's path: {s}", .{
+        try test_named(arena, shared, "trust.zon", link),
+    });
     try expect_cause(expected, diag.causes.slice()[0].slice());
     // Through the link, it is named as the entry the walk passed.
     const through = try std.fmt.allocPrint(arena, "{s}/./trust.zon", .{shared});
@@ -744,8 +746,9 @@ test "in a directory others may write, every entry the walk passes must be root'
     try testing.expectError(error.BadConfig, read(arena, io, through, test_options, &diag));
     const through_cause = diag.causes.slice()[0].slice();
     const named = try std.fmt.allocPrint(arena, "a symbolic link owned by uid 65534, in a " ++
-        "directory others may write (mode 1777), is on the trust policy's path: {s}, on the " ++
-        "way to {s}", .{ link, through });
+        "directory others may write (mode 1777), is on the trust policy's path: {s}", .{
+        try test_named(arena, shared, "trust.zon", through),
+    });
     try expect_cause(named, through_cause);
     // A file planted there by another uid is refused the same way.
     const planted = try write_test_policy(arena, try test_subdirectory(arena, shared, "own"));
@@ -856,8 +859,8 @@ test "in a directory others may write, an entry must live on the directory's own
     else
         "on another mount than its directory";
     const expected = try std.fmt.allocPrint(arena, "a directory {s}, in a directory others may " ++
-        "write (mode 1777), is on the trust policy's path: {s}, on the way to {s}", .{
-        words, over, path,
+        "write (mode 1777), is on the trust policy's path: {s}", .{
+        words, try test_named(arena, sticky, "over", path),
     });
     try expect_cause(expected, diag.causes.slice()[0].slice());
 }
@@ -918,7 +921,9 @@ test "in a directory others may write, nothing but a directory may have another 
     try testing.expectError(error.BadConfig, read(arena, io, squat, test_options, &diag));
     try testing.expectEqual(@as(?codes.Code, .E0505), diag.code);
     const expected = try std.fmt.allocPrint(arena, "a file with 2 hard links, in a directory " ++
-        "others may write (mode 1777), is on the trust policy's path: {s}", .{squat});
+        "others may write (mode 1777), is on the trust policy's path: {s}", .{
+        try test_named(arena, sticky, "trust.zon", squat),
+    });
     try expect_cause(expected, diag.causes.slice()[0].slice());
     // Under its first name, in a directory only its owner can write, it is still read.
     diag.reset();
@@ -955,7 +960,27 @@ test "a refusal says why before it names the paths, which may be long" {
     const words = "a directory on the trust policy's path can be written by its group or by " ++
         "others (owner uid ";
     try testing.expect(std.mem.startsWith(u8, writable, words));
-    try testing.expect(std.mem.indexOf(u8, writable, "mode 0775): /tmp/zcube-trust-") != null);
+    // The directory is named where the walk found it: under `/private/tmp` on macOS.
+    const real_tmp = std.fs.path.dirname(try test_real_path(arena, base)).?;
+    const named = try std.fmt.allocPrint(arena, "mode 0775): {s}/zcube-trust-", .{real_tmp});
+    try testing.expect(std.mem.indexOf(u8, writable, named) != null);
+}
+
+/// `path` with its links followed, as the walk names what it finds (`/tmp` is a link on macOS).
+fn test_real_path(arena: Allocator, path: []const u8) ![]const u8 {
+    return std.Io.Dir.realPathFileAbsoluteAlloc(testing.io, path, arena);
+}
+
+/// How a refusal names the entry `name` of `directory` on the way to the policy `path`: where the
+/// walk found it, its directory's links followed (on macOS `/tmp` is a link to `/private/tmp`),
+/// then `, on the way to <path>` unless that is `path` itself. The directory is resolved, not the
+/// entry: an entry may be a link, and a hard link's descriptor may name either of its names.
+fn test_named(arena: Allocator, directory: []const u8, name: []const u8, path: []const u8) ![]u8 {
+    const entry = try std.fmt.allocPrint(arena, "{s}/{s}", .{
+        try test_real_path(arena, directory), name,
+    });
+    if (std.mem.eql(u8, entry, path)) return entry;
+    return std.fmt.allocPrint(arena, "{s}, on the way to {s}", .{ entry, path });
 }
 
 /// `cause` is `expected`, or its start cut at `diag_field_bytes_max` and marked with "...".
