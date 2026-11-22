@@ -1671,6 +1671,40 @@ test "C3 slice 8: an automatic rollback restores the generation that completed, 
     try testing.expectEqual(@as(?u64, 1), record.restores);
 }
 
+test "a paused rollout's scale-up runs its from generation, never a newer stale one (#16)" {
+    // Goal: the template of a halted scale-up is chosen by role (#16, review SHOULD 1), not as
+    // the newest older generation. Method: generation 2 never becomes ready when generation 3 is
+    // applied over it, so 3 rolls from 1 with a ready replica of 2 among its stale ones, above
+    // `from`; pause it with four replicas and scale it to 5. The new replica runs generation 1.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.roll();
+    try testing.expectEqual(@as(u32, 1), try fixture.report(2, .running));
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms);
+    try fixture.settle();
+    try fixture.apply(third);
+    try fixture.settle();
+    try testing.expectEqual(@as(u64, 1), (try fixture.rollout()).from);
+    try testing.expectEqual(records.RolloutPhase.paused, (try fixture.request(.pause)).done);
+    const old = try fixture.count_of(1);
+    const skipped = try fixture.count_of(2);
+    const new = try fixture.count_of(3);
+    try testing.expectEqual(@as(u32, 1), skipped);
+    try testing.expectEqual(@as(u32, 4), old + skipped + new);
+    var next = third;
+    next.replicas = 5;
+    next.request_id = "r-0002b16";
+    try fixture.apply(next);
+    try fixture.settle();
+    try testing.expectEqual(@as(u64, 3), (try fixture.service()).generation);
+    try testing.expectEqual(records.RolloutPhase.paused, (try fixture.rollout()).phase);
+    try testing.expectEqual(skipped, try fixture.count_of(2));
+    try testing.expectEqual(new, try fixture.count_of(3));
+    try testing.expectEqual(old + 1, try fixture.count_of(1));
+}
+
 test "C3 slice 8: a user's apply before the automatic rollback commits wins (R8)" {
     // Goal: the compare on the service key. Method: the user applies generation 3 inside the
     // rollback's transaction, after the handler read the service: the rollback must write

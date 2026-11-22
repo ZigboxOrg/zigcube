@@ -255,6 +255,14 @@ pub const rollout_race = declared("c1_teeth_rollout_race");
 /// The rollout controller never carries out an automatic rollback it owes, nor records it refused
 /// (C3 slice 8; must break R7).
 pub const rollout_stuck = declared("c1_teeth_rollout_stuck");
+/// The replica controller takes every replica of a service's name for the service's, as before
+/// issue #16's fix: one left by an earlier incarnation (deleted and applied again) is counted,
+/// replaced and copied (must break R4).
+pub const rollout_incarnation = declared("c1_teeth_rollout_incarnation");
+/// A halted rollout's scale-up finds no `/history` record of its `from` generation
+/// (`history_template` returns null), so with no old replica left it creates the paused new
+/// generation (must break R4).
+pub const rollout_template = declared("c1_teeth_rollout_template");
 
 /// The runner a replay line names: the runner a root names itself (`sim_runner`), else the
 /// fault-on runner whose root switched a tooth on (`sim_c1_teeth_<name>`, as `sim-c1-teeth-exe`
@@ -316,4 +324,6 @@ const runners = [_][2][]const u8{
     .{ "c1_teeth_rollout_exact", "sim_c1_teeth_rollout_exact" },
     .{ "c1_teeth_rollout_race", "sim_c1_teeth_rollout_race" },
     .{ "c1_teeth_rollout_stuck", "sim_c1_teeth_rollout_stuck" },
+    .{ "c1_teeth_rollout_incarnation", "sim_c1_teeth_rollout_incarnation" },
+    .{ "c1_teeth_rollout_template", "sim_c1_teeth_rollout_template" },
 };

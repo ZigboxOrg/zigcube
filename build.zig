@@ -2089,6 +2089,9 @@ const c1_teeth_roots = [_]struct {
     /// `sim-c3-teeth-<name without "rollout_">`, and left out of the canary manifest until the
     /// fleet has a sim-c3 kind.
     c3: bool = false,
+    /// Run with `auto` in place of `ops`: each seed draws its shape and profile, as the sim-c3
+    /// sweeps do. A tooth whose world only an auto-shaped seed reaches (#16) is pinned this way.
+    auto_shape: bool = false,
 }{
     .{
         .name = "allocation",
@@ -2460,6 +2463,33 @@ const c1_teeth_roots = [_]struct {
         .symptom = "R7: a failed rollout",
         .canary_seeds = 10,
     },
+    // Issue #16: the replica controller takes an earlier incarnation's replicas for the
+    // service's, and a halted scale-up finds no history of its `from`.
+    .{
+        .name = "rollout_incarnation",
+        .root = "src/sim_c1_teeth_rollout_incarnation_main.zig",
+        .c3 = true,
+        .symptom = "R4: a replica of an earlier incarnation",
+        .canary_seeds = 10,
+        // Sparse: it needs a service deleted and applied again before the orphan pass, then
+        // an old replica lost. Drawn worlds (`auto`), 2026-11-22: seed 19 of 1..80 fails, and
+        // seed 357 (the issue's); the fix passes both.
+        .auto_shape = true,
+        .also_seeds = &.{19},
+        .first_seed = 357,
+        .seeds = 357,
+    },
+    .{
+        .name = "rollout_template",
+        .root = "src/sim_c1_teeth_rollout_template_main.zig",
+        .c3 = true,
+        .symptom = "R4: a paused rollout started a replica of the new generation",
+        .canary_seeds = 10,
+        // Drawn worlds (`auto`), 2026-11-22: seeds 4 and 12 of 1..12 fail, none before 4;
+        // the fix passes all twelve.
+        .auto_shape = true,
+        .also_seeds = &.{12},
+    },
 };
 
 /// The fleet's canary runs of the two runners outside `c1_teeth_roots` (see there).
@@ -2479,7 +2509,7 @@ const canary_symptom_swarm_teeth = "a chunk with wrong bytes was accepted";
 /// `zig build sim-c1 [-Dseed=N] [-Dops=N] [-Dnodes=N]`: the cluster simulation with the
 /// per-revision invariant checks (`Options.c1`), natively and as WebAssembly, the reports
 /// compared byte for byte. `sim-c1-exe` installs the native runner (`sim_cluster --c1`);
-/// `sim-c1-teeth` runs 36 negative tests (`sim-c3-teeth` the other 6), each of which passes only
+/// `sim-c1-teeth` runs 36 negative tests (`sim-c3-teeth` the other 8), each of which passes only
 /// if its check fires.
 fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     const exe = b.addExecutable(.{
@@ -2517,7 +2547,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
 fn add_teeth_steps(b: *std.Build, sim: SimStepOptions) void {
     const teeth = b.step("sim-c1-teeth", "Run the sim-c1 negative tests; each must fire its check");
     const c3_teeth = b.step("sim-c3-teeth", "Run the sim-c3 negative tests (budget, pause, " ++
-        "history, exact, race, stuck); each must fire its check");
+        "history, exact, race, stuck, incarnation, template); each must fire its check");
     const teeth_exes = b.step("sim-c1-teeth-exe", "Install the fault-on sim-c1 and sim-c3 runners");
     const shard = teeth_shard(b, teeth);
     for (c1_teeth_roots, 0..) |entry, index| {
@@ -2538,9 +2568,9 @@ fn add_teeth_steps(b: *std.Build, sim: SimStepOptions) void {
         const seeds = b.fmt("{d}..{d}", .{ entry.first_seed, entry.seeds });
         const symptom = b.fmt("--expect-symptom={s}", .{entry.symptom});
         teeth_run.addArgs(&.{
-            "--seeds",                  seeds,
-            b.fmt("{d}", .{entry.ops}), if (entry.c3) "--c3" else "--c1",
-            "--expect-fail",            symptom,
+            "--seeds",                seeds,
+            teeth_ops_text(b, entry), if (entry.c3) "--c3" else "--c1",
+            "--expect-fail",          symptom,
         });
         if (entry.any_symptom) teeth_run.addArg("--expect-symptom-any");
         const own = if (entry.c3)
@@ -2621,8 +2651,13 @@ fn add_c1_comparison(
     }
 }
 
-/// Each more known hit of a sparse tooth (`also_seeds`), run alone with `--c1`: it must fail
-/// with the tooth's symptom.
+/// A tooth's operations argument: its `ops`, or `auto` for an `auto_shape` tooth.
+fn teeth_ops_text(b: *std.Build, entry: anytype) []const u8 {
+    return if (entry.auto_shape) "auto" else b.fmt("{d}", .{entry.ops});
+}
+
+/// Each more known hit of a sparse tooth (`also_seeds`), run alone with `--c1` (`--c3` for a
+/// sim-c3 tooth): it must fail with the tooth's symptom.
 fn add_also_seeds(
     b: *std.Build,
     steps: []const *std.Build.Step,
@@ -2632,9 +2667,9 @@ fn add_also_seeds(
     for (entry.also_seeds) |seed| {
         const run = b.addRunArtifact(exe);
         run.addArgs(&.{
-            "--seeds",                  b.fmt("{d}..{d}", .{ seed, seed }),
-            b.fmt("{d}", .{entry.ops}), "--c1",
-            "--expect-fail",            b.fmt("--expect-symptom={s}", .{entry.symptom}),
+            "--seeds",                b.fmt("{d}..{d}", .{ seed, seed }),
+            teeth_ops_text(b, entry), if (entry.c3) "--c3" else "--c1",
+            "--expect-fail",          b.fmt("--expect-symptom={s}", .{entry.symptom}),
         });
         for (steps) |step| step.dependOn(&run.step);
     }
@@ -3210,6 +3245,27 @@ const c1_regressions = [_][]const []const u8{
         "385",          "98",        "2",                   "--c3",
         "--strong",     "--tenants", "--lease-ttl-ms=8082", "--replicas-pct=100",
         "--heal-at=94",
+    },
+    // R4 on 0.6.0's RC branch (zigcube#16): a service deleted and applied again before the orphan
+    // pass kept the earlier incarnation's replicas, which the replica controller counted,
+    // replaced and copied as its own; seed 357 replaced one on a lost node at the new spec while
+    // the new incarnation's rollout was paused. Seeds 162 and 19 are the issue's other replays.
+    // Guards: each fails without `earlier_incarnation` (`replica_controller.zig`;
+    // docs/decisions/2026-11-22-replicas-of-a-deleted-incarnation.md).
+    &.{
+        "357",          "119",       "14",                   "--c3",
+        "--strong",     "--tenants", "--lease-ttl-ms=10000", "--replicas-pct=300",
+        "--heal-at=88",
+    },
+    &.{
+        "162",           "389",       "10",                  "--c3",
+        "--strong",      "--tenants", "--lease-ttl-ms=8053", "--replicas-pct=200",
+        "--heal-at=266",
+    },
+    &.{
+        "19",            "695",       "3",                    "--c3",
+        "--strong",      "--tenants", "--lease-ttl-ms=10000", "--replicas-pct=200",
+        "--heal-at=486",
     },
 };
 

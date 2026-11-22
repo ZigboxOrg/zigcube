@@ -37,6 +37,11 @@ pub const Tally = struct {
     versions_judged: u64 = 0,
     /// Transactions that wrote replicas while their service's rollout was paused (R4).
     paused_judged: u64 = 0,
+    /// Of them, scale-ups R4 let start the paused new generation: no replica of an older spec
+    /// left, and no `/history` record of this incarnation for the rollout's `from` to copy.
+    paused_first_generation: u64 = 0,
+    /// Replicas of an earlier incarnation of their service removed (R4: never replaced).
+    foreign_removed: u64 = 0,
     /// History records written (R6).
     history_judged: u64 = 0,
     /// Rollbacks written, compared with the generation they restore (R5).
@@ -172,7 +177,18 @@ const Step = struct {
     retired: u32 = 0,
     /// Of `retired`, those reported running.
     retired_running: u32 = 0,
+    /// Deleted replicas of an earlier incarnation of the service: neither dead nor retired.
+    foreign: u32 = 0,
 };
+
+/// Whether `replica` belongs to an earlier incarnation of `service`: its key is older than the
+/// service's (it was deleted and applied again since). It is never the service's (issue #16).
+fn earlier_incarnation(
+    replica: *const controller.Entry(records.Replica),
+    service: *const ServiceEntry,
+) bool {
+    return replica.kv.create_revision < service.kv.create_revision;
+}
 
 fn step_of(
     ctx: *const Context,
@@ -191,6 +207,10 @@ fn step_of(
         .delete => |key| {
             const id = replica_id(key, service.rec.name) orelse continue;
             const replica = find_replica(snap, id) orelse continue;
+            if (earlier_incarnation(replica, service)) {
+                step.foreign += 1;
+                continue;
+            }
             // The exclusive-node exemption rests on the replica controller's ordering: its
             // `classify` makes a replica on a node that refuses it dead before any other path
             // (`roll_out`, `scale_down`) runs, so only `replace` deletes one. A change that lets
@@ -239,6 +259,12 @@ fn step_problem(
 ) Found {
     var step = step_of(ctx, snap, service, request);
     scaled_down(ctx, snap, service, request, &step);
+    if (step.foreign > 0) {
+        tally.foreign_removed += step.foreign;
+        // A replica of an earlier incarnation is removed alone: one created with its removal is
+        // its replacement, whatever it runs and whatever the rollout's phase.
+        if (step.created > 0) return "R4: a replica of an earlier incarnation was replaced";
+    }
     if (step.created + step.retired == 0) return null;
     const rollout = rollout_of(ctx, service) orelse return null;
     if (rollout.phase == .paused) {
@@ -248,9 +274,12 @@ fn step_problem(
         if (step.created > step.dead and !repair) return "R4: a paused rollout started a replica";
         // A replacement runs the generation of the replica it replaces: an old replica replaced
         // at the new spec is a start (TLA+ review, C3 slice 7). A scale-up runs an old one while
-        // one is left to copy.
-        if (step.created_new > step.dead_new and !(repair and !has_older(snap, service))) {
-            return "R4: a paused rollout started a replica of the new generation";
+        // one is left to copy, or the rollout's `from` while this incarnation's history holds it.
+        if (step.created_new > step.dead_new) {
+            if (!repair or has_older(snap, service) or has_from(ctx, service, &rollout)) {
+                return "R4: a paused rollout started a replica of the new generation";
+            }
+            tally.paused_first_generation += 1;
         }
         return null;
     }
@@ -313,10 +342,24 @@ fn paused_scale_up(
     return counted(snap, service) + step.created <= service.rec.replicas;
 }
 
-/// Whether a replica of `service` runs an older spec than the service's.
+/// Whether `/history` holds the rollout's `from` generation, written in this incarnation of
+/// `service`: a paused scale-up then has a spec to copy (`history_template`).
+fn has_from(
+    ctx: *const Context,
+    service: *const ServiceEntry,
+    rollout: *const records.Rollout,
+) bool {
+    if (rollout.from == 0 or rollout.from >= service.rec.generation) return false;
+    const key = records.history_key(service.rec.name, rollout.from);
+    const kv = get(ctx, key.slice()) orelse return false;
+    return kv.mod_revision >= service.kv.create_revision;
+}
+
+/// Whether a replica of this incarnation of `service` runs an older spec than the service's.
 fn has_older(snap: *const Snapshot, service: *const ServiceEntry) bool {
     for (snap.replicas) |*replica| {
         if (!std.mem.eql(u8, replica.rec.service, service.rec.name)) continue;
+        if (earlier_incarnation(replica, service)) continue;
         if (!rollout_controller.is_new(&replica.rec, &service.rec)) return true;
     }
     return false;
@@ -359,6 +402,7 @@ fn counted(snap: *const Snapshot, service: *const ServiceEntry) u32 {
     var count: u32 = 0;
     for (snap.replicas) |*replica| {
         if (!std.mem.eql(u8, replica.rec.service, service.rec.name)) continue;
+        if (earlier_incarnation(replica, service)) continue;
         if (snap.observed_of(&replica.rec)) |observed| {
             const held = replica_controller.user_fault(&observed.rec);
             if (observed.rec.status == .stopped and !held) continue;
