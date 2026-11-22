@@ -25,8 +25,7 @@ pushed them out of `already_held`'s scan.
 `hold_stale` (`src/replica_controller.zig`), after `roll_of`: while the rollout is halted
 (paused or failed), a dead stale replica whose start failed through the user's fault is held,
 as a current one is, with a `hold_failed_replica` decision, and counts toward the service's
-count. An active or complete rollout still replaces it, at the service's generation, so there it
-stays dead.
+count. An active rollout still replaces it, at the service's generation, so there it stays dead.
 `hold_pass` now runs after `roll_of` (it reads, writes nothing); a rollout record that does not
 decode still halts the service after the holds.
 
