@@ -70,7 +70,8 @@ const slots_count = constants.http_connections_max + constants.http_refusals_max
 /// (the loopback listener) looks from the last one down, so it uses the reserve first.
 pub const SlotKind = enum { connection, connection_tls, refusal };
 
-/// Work the watchdog does on each tick besides its sweep. It must not block for long.
+/// Work the watchdog does on each tick besides its sweep. It must not block for long: it runs
+/// with cancelation blocked (#14), so a stop waits for it to return.
 pub const Tick = struct {
     context: *anyopaque,
     run: *const fn (context: *anyopaque) void,
@@ -175,11 +176,21 @@ pub const Shared = struct {
     /// Runs until cancelled: every `http_watchdog_ms` it shuts down a connection that has been
     /// waiting on its client longer than `http_idle_timeout_ms`. The connection's read or write
     /// then fails and `serve` returns.
+    ///
+    /// The sleep is its only cancelation point (#14). `std.Io` delivers a cancel once, at the
+    /// task's next cancelation point; the sweep (`shutdown`) and the tick (the revoked file's
+    /// `stat`, its log lines) swallow their errors, so a cancel one of them took was lost, the
+    /// watchdog ran for ever and `Server.stop` waited on it for ever. With cancelation blocked
+    /// around them, a cancel that arrives there stays pending and the next sleep returns at once.
     pub fn watchdog(shared: *Shared) void {
         while (true) {
             shared.io.sleep(.fromMilliseconds(constants.http_watchdog_ms), .awake) catch return;
+            const protection = shared.io.swapCancelProtection(.blocked);
+            assert(protection == .unblocked);
             shared.sweep();
             if (shared.tick) |tick| tick.run(tick.context);
+            const restored = shared.io.swapCancelProtection(protection);
+            assert(restored == .blocked);
         }
     }
 
