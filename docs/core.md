@@ -790,8 +790,9 @@ before the fix: R4, "a replica of an earlier incarnation") and `rollout_template
 scale-up finds no `/history` record of its `from`, so with no old replica left it starts the
 paused generation: R4, "a paused rollout started a replica of the new generation"). Those two
 are sparse and run drawn worlds (`auto`, `auto_shape` in `c1_teeth_roots`): `rollout_incarnation`
-seeds 357 and 19, `rollout_template` seeds 1 to 10 (caught at 4) and 12. They are not yet in the
-canary manifest: the fleet has no `sim-c3` kind.
+seeds 127 and 160, `rollout_template` seeds 1 to 11 (caught at 11) and 12. C4's mesh, which `auto`
+turns on, changed those worlds: before it the seeds were 357 and 19, and 4 and 12. They are not yet
+in the canary manifest: the fleet has no `sim-c3` kind.
 
 ## sim-c4: services that connect (C4 slice 5)
 

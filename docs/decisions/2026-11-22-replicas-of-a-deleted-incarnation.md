@@ -101,6 +101,13 @@ keeps the count and R2/P1 without advancing a paused rollout." `docs/core.md` ("
   `also_seeds` runs of a sim-c3 tooth now pass `--c3` (they passed `--c1` only, and no sim-c3
   tooth had one).
 - Seeds 357, 162 and 19 are in `c1_regressions`. Each fails before the fix.
+- Merging main (C4 slices 1 to 5) changed the drawn worlds: `auto` now turns the mesh on, and
+  the `--strong` world changed with C4 slice 3. None of the seeds above reaches either fault any
+  more (each tooth's runner passes them). Re-measured on the merge, 2026-11-22:
+  `rollout_incarnation` fails at seeds 127 and 160 of 1..240, `rollout_template` at 11 and 12 of
+  1..12, and the fixed runner passes all of them; the teeth run those seeds now. Their concrete
+  replay lines (with `--mesh`) are added to `c1_regressions`, the first two failing with the
+  incarnation tooth and the last two with the template tooth; the three older lines stay.
 
 ## A correction to an earlier decision
 

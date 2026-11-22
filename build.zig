@@ -2514,12 +2514,13 @@ const c1_teeth_roots = [_]struct {
         .symptom = "R4: a replica of an earlier incarnation",
         .canary_seeds = 10,
         // Sparse: it needs a service deleted and applied again before the orphan pass, then
-        // an old replica lost. Drawn worlds (`auto`), 2026-11-22: seed 19 of 1..80 fails, and
-        // seed 357 (the issue's); the fix passes both.
+        // an old replica lost. Drawn worlds (`auto`) since C4's mesh joined them (the merge of
+        // main, 2026-11-22): seeds 127 and 160 of 1..240 fail; the fix passes both. (Before it,
+        // seeds 19 and 357, which no longer reach the fault.)
         .auto_shape = true,
-        .also_seeds = &.{19},
-        .first_seed = 357,
-        .seeds = 357,
+        .also_seeds = &.{160},
+        .first_seed = 127,
+        .seeds = 127,
     },
     .{
         .name = "rollout_template",
@@ -2527,10 +2528,11 @@ const c1_teeth_roots = [_]struct {
         .c3 = true,
         .symptom = "R4: a paused rollout started a replica of the new generation",
         .canary_seeds = 10,
-        // Drawn worlds (`auto`), 2026-11-22: seeds 4 and 12 of 1..12 fail, none before 4;
-        // the fix passes all twelve.
+        // Drawn worlds (`auto`) since C4's mesh joined them (the merge of main, 2026-11-22):
+        // seeds 11 and 12 of 1..12 fail, none before 11; the fix passes all twelve.
         .auto_shape = true,
         .also_seeds = &.{12},
+        .seeds = 11,
     },
 };
 
@@ -3387,8 +3389,10 @@ const c1_regressions = [_][]const []const u8{
     // pass kept the earlier incarnation's replicas, which the replica controller counted,
     // replaced and copied as its own; seed 357 replaced one on a lost node at the new spec while
     // the new incarnation's rollout was paused. Seeds 162 and 19 are the issue's other replays.
-    // Guards: each fails without `earlier_incarnation` (`replica_controller.zig`;
-    // docs/decisions/2026-11-22-replicas-of-a-deleted-incarnation.md).
+    // C4's merge changed these worlds, and the three no longer reach the fault; the four lines
+    // after them do (drawn worlds of `sim-c3-teeth-incarnation` and `-template`, 2026-11-22):
+    // the first two fail without `earlier_incarnation` (`replica_controller.zig`), the last two
+    // without `history_template` (docs/decisions/2026-11-22-replicas-of-a-deleted-incarnation.md).
     &.{
         "357",          "119",       "14",                   "--c3",
         "--strong",     "--tenants", "--lease-ttl-ms=10000", "--replicas-pct=300",
@@ -3403,6 +3407,26 @@ const c1_regressions = [_][]const []const u8{
         "19",            "695",       "3",                    "--c3",
         "--strong",      "--tenants", "--lease-ttl-ms=10000", "--replicas-pct=200",
         "--heal-at=486",
+    },
+    &.{
+        "127",                "352",           "6",         "--c3",
+        "--strong",           "--mesh",        "--tenants", "--lease-ttl-ms=8497",
+        "--replicas-pct=200", "--heal-at=331",
+    },
+    &.{
+        "160",                "196",           "8",         "--c3",
+        "--strong",           "--mesh",        "--tenants", "--lease-ttl-ms=10000",
+        "--replicas-pct=200", "--heal-at=132",
+    },
+    &.{
+        "11",                 "193",           "4",         "--c3",
+        "--strong",           "--mesh",        "--tenants", "--lease-ttl-ms=9508",
+        "--replicas-pct=300", "--heal-at=122",
+    },
+    &.{
+        "12",                 "707",           "3",         "--c3",
+        "--strong",           "--mesh",        "--tenants", "--lease-ttl-ms=9705",
+        "--replicas-pct=300", "--heal-at=493",
     },
 };
 
