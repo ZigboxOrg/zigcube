@@ -56,6 +56,17 @@ at. Keyed on `!roll.starts`, with held stale replicas keeping the surge, sim-clu
 `c1_regressions`) kept service `beta`, scaled to 0 under a complete rollout, at its broken old
 replica for good ("a service lacks replicas" at rest).
 
+Beside a complete rollout, a dead stale replica is replaced at the service's generation, as under
+an active one: `replacement_templates` copies an old replica's spec only while the rollout is
+paused or failed, the same key as `hold_stale` (PR #6 review MUST). Keyed on `!roll.starts`, it
+copied the old spec under a complete rollout too, so a stale replica that failed through the
+user's fault there (not held, since the rollout is complete) was replaced by a copy of its own
+broken spec, which failed and was copied again without end (this fix's loop, in the `complete`
+phase), and a copy that did start stayed at the old generation beside the complete rollout for
+good. The reviewer reached it with a scale to 3 that lands before the removal of the last held
+old replica of a resumed rollout, so the rollout completes with that replica dead and replicas
+missing.
+
 Behaviour change: an old replica of a paused or failed rollout whose start fails through the
 user's fault is no longer replaced until the rollout resumes or a new apply starts one.
 
@@ -63,9 +74,23 @@ Unit tests (`rollout_controller_test.zig`), each red before its fix: "an old rep
 rollout whose start fails by the user's fault is held"; "a held old replica of a failed rollout
 leaves a node registered exclusive (P1)" (fails `expected 0, found 1` replicas on node1 without
 the node check); "a rollout paused at its surge keeps it while it holds every old replica left"
-(fails `expected 1, found 0` new replicas without `held_stale`).
+(fails `expected 1, found 0` new replicas without `held_stale`); "a complete rollout replaces a
+dead old replica at the service's generation" (fails `expected 0, found 1` generation-1 replicas
+with `replacement_templates` keyed on `!roll.starts`).
 
 ## Evidence
 
-Seed 44959403353 at 200 operations passes (1,167 transactions). `sim_c0 <seed> fuzz 200` for
-seeds 1..400 (ReleaseSafe): all pass.
+On d4caacd5 (the hold): seed 44959403353 at 200 operations passes (1,167 transactions), and
+`sim_c0 <seed> fuzz 200` for seeds 1..400 (ReleaseSafe) all pass. Those seeds 1..400 were not
+re-run on the later commits.
+
+On the final commit (the hold keyed on paused or failed, the node judged, the surge kept and
+`replacement_templates` keyed on paused or failed):
+
+- `zig build sim-c0 -Dseed=44959403353 -Dops=200`: passes (native and wasm agree).
+- `zig build sim-c3-teeth`: passes, every tooth caught.
+- `zig build sim-c1-regressions`: passes, seed 385's and seed 90's lines included.
+- ReleaseSafe `sim_cluster --seeds 341..480 auto --c3`: 1 of 140 failed, seed 357 ("R4: a paused
+  rollout started a replica of the new generation"; replay `sim_cluster 357 119 14 --c3 --strong
+  --tenants --lease-ttl-ms=10000 --replicas-pct=300 --heal-at=88`), which fails the same way
+  before d4caacd5 and is issue #16 (replicas of a deleted incarnation).

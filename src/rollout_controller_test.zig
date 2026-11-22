@@ -59,7 +59,8 @@ const broken: apply_mod.Input = .{
 /// `pause_create` pauses before the next transaction that creates replicas and deletes none;
 /// `stop_last` stops the kept replica the floor counts last (the newest).
 /// `apply_rollback` and `pause_rollback` apply `third` or pause before the next transaction that
-/// writes the service (the automatic rollback's).
+/// writes the service (the automatic rollback's). `scale_three` applies generation 2's spec
+/// with 3 replicas (no new generation) before the next transaction that deletes a replica.
 const Interleave = enum {
     none,
     stop_kept,
@@ -68,6 +69,7 @@ const Interleave = enum {
     pause_create,
     apply_rollback,
     pause_rollback,
+    scale_three,
 };
 
 /// A user's generation 3 of `web`.
@@ -624,6 +626,11 @@ const Fixture = struct {
             },
             .apply_rollback => {
                 const result = apply_mod.apply(&ctx, &self.api, third) catch
+                    @panic("apply failed");
+                assert(result == .written);
+            },
+            .scale_three => {
+                const result = apply_mod.apply(&ctx, &self.api, rescaled(3)) catch
                     @panic("apply failed");
                 assert(result == .written);
             },
@@ -1529,6 +1536,44 @@ test "a rollout paused at its surge keeps it while it holds every old replica le
     try testing.expectEqual(records.RolloutPhase.paused, (try fixture.rollout()).phase);
 }
 
+test "a complete rollout replaces a dead old replica at the service's generation" {
+    // Goal: once its rollout is complete, a service's dead old replica that failed by the user's
+    // fault is replaced at the service's generation, not with a copy of its own spec: the copy
+    // failed the same way and was replaced again without end, and one that started stayed beside
+    // the complete rollout for good (PR #6 review). Method: pause after the first new replica is
+    // ready, fail every old replica's start by the user's fault (held), scale to 1 (one old
+    // replica left, held), then resume with a scale to 3 landing before the removal of the old
+    // one: the rollout completes with the old replica dead and two replicas missing.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.roll();
+    try testing.expectEqual(records.RolloutPhase.paused, (try fixture.request(.pause)).done);
+    try testing.expectEqual(@as(u32, 1), try fixture.report(2, .running));
+    try fixture.settle();
+    fixture.manual.advance(min_ready_ms);
+    try fixture.settle();
+    for (0..3) |_| try fixture.fail_start(1);
+    try rescale(&fixture, 1);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 1), try fixture.count_of(1));
+    try testing.expectEqual(@as(u32, 1), try fixture.count_of(2));
+    fixture.interleave = .scale_three;
+    try testing.expect(try fixture.request(.resume_rollout) == .done);
+    try fixture.settle();
+    try testing.expect(fixture.interleaved != null);
+    try testing.expect(!fixture.interleaved_committed);
+    try testing.expectEqual(records.RolloutPhase.complete, (try fixture.rollout()).phase);
+    try testing.expectEqual(@as(u64, 2), (try fixture.service()).generation);
+    try testing.expectEqual(@as(u32, 0), try fixture.count_of(1));
+    try testing.expectEqual(@as(u32, 3), try fixture.count_of(2));
+    try testing.expectEqual(@as(u32, 3), try fixture.report(2, .running));
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 0), try fixture.count_of(1));
+    try testing.expectEqual(@as(u32, 3), try fixture.count_of(2));
+    try testing.expectEqual(records.RolloutPhase.complete, (try fixture.rollout()).phase);
+}
+
 test "a held new replica fails the rollout with ZC-E0304 and nothing more starts" {
     // Goal: `hold_failed_replica` feeds the rollout's failure. Method: the first new replica's
     // start fails by the user's fault and its rollback is refused; the rollout fails, its old
@@ -1710,11 +1755,16 @@ fn expect_web_spec(record: anytype) !void {
 
 /// Applies `web` again at generation 2's spec with `replicas` replicas (no new generation).
 fn rescale(fixture: *Fixture, replicas: u32) !void {
+    try fixture.apply(rescaled(replicas));
+}
+
+/// `web` at generation 2's spec with `replicas` replicas.
+fn rescaled(replicas: u32) apply_mod.Input {
     var next = web;
     next.image = "b3:9d20c4f1";
     next.replicas = replicas;
     next.request_id = "r-0002b13";
-    try fixture.apply(next);
+    return next;
 }
 
 test "a pause between the read and the commit fails a scale-up of a failed rollout" {
