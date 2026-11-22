@@ -1442,6 +1442,32 @@ test "a failed rollout's service scaled up runs the older generation, never the 
     try testing.expectEqual(@as(u32, 4), try fixture.count_of(1));
 }
 
+test "an old replica of a failed rollout whose start fails by the user's fault is held" {
+    // Goal: a halted rollout's replacement copies the old replica's own spec (R4), so an old
+    // replica whose start failed through the user's fault is held, not replaced by a copy that
+    // fails the same way: that loop wrote decisions without end (sim-c0 fuzz seed 44959403353).
+    // Method: fail generation 2 with its rollback refused, then fail an old replica's start by
+    // the user's fault; it stays, held, and nothing new of either generation is created.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.fail(.refuse);
+    const before = try fixture.replicas();
+    var ids: [4][]const u8 = undefined;
+    try testing.expectEqual(@as(usize, 4), before.len);
+    for (before, 0..) |replica, index| {
+        ids[index] = try testing.allocator.dupe(u8, replica.rec.id);
+    }
+    defer for (ids) |id| testing.allocator.free(id);
+    try fixture.fail_start(1);
+    const after = try fixture.replicas();
+    try testing.expectEqual(@as(usize, 4), after.len);
+    for (after, ids) |replica, id| try testing.expectEqualStrings(id, replica.rec.id);
+    try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
+    try testing.expectEqual(@as(u32, 1), try fixture.count_of(2));
+    try testing.expectEqual(records.RolloutPhase.failed, (try fixture.rollout()).phase);
+}
+
 test "a held new replica fails the rollout with ZC-E0304 and nothing more starts" {
     // Goal: `hold_failed_replica` feeds the rollout's failure. Method: the first new replica's
     // start fails by the user's fault and its rollback is refused; the rollout fails, its old

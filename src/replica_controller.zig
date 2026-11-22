@@ -277,10 +277,12 @@ const Run = struct {
         if (try run.seed_counter(service)) return;
         var plan: ServicePlan = .{};
         try run.classify(service, &plan);
-        if (!try run.hold_pass(service, &plan)) return;
         // A rollout record that does not decode halts this service only (ZC-E0301 is the rollout
         // pass's to report): every write of its replicas rests on what the rollout allows.
-        const roll = try run.roll_of(service, &plan) orelse return;
+        const roll_read = try run.roll_of(service, &plan);
+        if (roll_read) |*roll| hold_stale(&plan, roll);
+        if (!try run.hold_pass(service, &plan)) return;
+        const roll = roll_read orelse return;
         if (plan.dead > 0) return run.replace(service, &plan, &roll);
         if (plan.stale > 0 and roll.starts) return run.roll_out(service, &plan, &roll);
         // A halted rollout (failed or paused) keeps its stale replicas, which then count as
@@ -1456,6 +1458,26 @@ fn judged_node(item: *const Item) ?[]const u8 {
     if (item.class != .dead) return null;
     if (!judged_by_status(observed)) return null;
     return observed.rec.node;
+}
+
+/// While the rollout starts nothing (paused or failed), a stale replica whose start failed through
+/// the user's fault is held, as a current one is: its replacement would copy its own spec
+/// (`replacement_templates`, R4) and fail the same way, and the replace, fail, replace loop
+/// would write decisions without end (sim-c0 fuzz seed 44959403353: a failed rollout whose
+/// `from` generation had a digest no node holds). An active rollout replaces it with the
+/// service's generation, so there it stays dead. Refused and lost replicas stay dead.
+fn hold_stale(plan: *ServicePlan, roll: *const Roll) void {
+    if (roll.starts) return;
+    for (plan.items[0..plan.count]) |*item| {
+        if (item.class != .dead) continue;
+        if (item.refused != null) continue;
+        if (item.lost != null) continue;
+        const observed = item.observed orelse continue;
+        if (!user_fault(&observed.rec)) continue;
+        item.class = .held;
+        plan.dead -= 1;
+        plan.held += 1;
+    }
 }
 
 fn classify_one(
