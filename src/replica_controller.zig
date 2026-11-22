@@ -193,6 +193,9 @@ const ServicePlan = struct {
     held: u32 = 0,
     dead: u32 = 0,
     stale: u32 = 0,
+    /// Of `held`, stale replicas a halted rollout holds (`hold_stale`): the rollout has not
+    /// finished with them, so the surge it paused at is kept as for `stale` ones.
+    held_stale: u32 = 0,
 
     fn slice(plan: *const ServicePlan) []const Item {
         return plan.items[0..plan.count];
@@ -280,16 +283,19 @@ const Run = struct {
         // A rollout record that does not decode halts this service only (ZC-E0301 is the rollout
         // pass's to report): every write of its replicas rests on what the rollout allows.
         const roll_read = try run.roll_of(service, &plan);
-        if (roll_read) |*roll| hold_stale(&plan, roll);
+        if (roll_read) |*roll| hold_stale(run, &plan, roll);
         if (!try run.hold_pass(service, &plan)) return;
         const roll = roll_read orelse return;
         if (plan.dead > 0) return run.replace(service, &plan, &roll);
         if (plan.stale > 0 and roll.starts) return run.roll_out(service, &plan, &roll);
         // A halted rollout (failed or paused) keeps its stale replicas, which then count as
         // any other toward what the service asks for, and the new ones it surged: up to
-        // `max_surge` more than that stay, or a pause would undo the step it paused at.
+        // `max_surge` more than that stay, or a pause would undo the step it paused at. Stale
+        // replicas it holds (`hold_stale`) count as stale here: without them, a pause at a surge
+        // whose every remaining old replica is held would scale down to `replicas`, removing
+        // the held ones with a `scale_down` no one asked for.
         const keep = plan.live + plan.held + plan.stale;
-        const halted = plan.stale > 0 and roll.rollout != null;
+        const halted = plan.stale + plan.held_stale > 0 and roll.rollout != null;
         const wanted = service.rec.replicas + if (halted) roll.policy.max_surge else 0;
         if (keep < service.rec.replicas) return run.scale_up(service, &plan, keep, &roll);
         if (keep > wanted) return run.scale_down(service, &plan, &roll, wanted);
@@ -1460,23 +1466,36 @@ fn judged_node(item: *const Item) ?[]const u8 {
     return observed.rec.node;
 }
 
-/// While the rollout starts nothing (paused or failed), a stale replica whose start failed through
+/// While the rollout is halted (paused or failed), a stale replica whose start failed through
 /// the user's fault is held, as a current one is: its replacement would copy its own spec
 /// (`replacement_templates`, R4) and fail the same way, and the replace, fail, replace loop
 /// would write decisions without end (sim-c0 fuzz seed 44959403353: a failed rollout whose
 /// `from` generation had a digest no node holds). An active rollout replaces it with the
-/// service's generation, so there it stays dead. Refused and lost replicas stay dead.
-fn hold_stale(plan: *ServicePlan, roll: *const Roll) void {
-    if (roll.starts) return;
+/// service's generation, so there it stays dead.
+///
+/// A stopped replica is dead in `classify_one`, before `classify` judges its node, so the node is
+/// judged here, as `classify` judges a held current one: one on a node registered `exclusive`
+/// stays dead and is removed through that node (P1), and one whose report has no tenure (C0) on a
+/// node judged lost stays dead too (a C1 report is not admissible from a node that is not
+/// `ready`, so it never gets this far).
+fn hold_stale(run: *Run, plan: *ServicePlan, roll: *const Roll) void {
+    // Only a halted rollout: a complete one starts nothing either, but a stale replica left
+    // beside it (a scale to 0 at the new generation, sim-cluster seed 385) is no step the
+    // rollout paused at, and held it would never leave.
+    if (!roll.paused and !roll.failed) return;
     for (plan.items[0..plan.count]) |*item| {
         if (item.class != .dead) continue;
-        if (item.refused != null) continue;
-        if (item.lost != null) continue;
+        if (item.refused != null or item.lost != null) continue;
         const observed = item.observed orelse continue;
         if (!user_fault(&observed.rec)) continue;
+        item.refused = run.refused_placement(item.replica.rec.id);
+        if (item.refused != null) continue;
+        item.lost = run.lost_placement(item.replica.rec.id);
+        if (item.lost != null) continue;
         item.class = .held;
         plan.dead -= 1;
         plan.held += 1;
+        plan.held_stale += 1;
     }
 }
 

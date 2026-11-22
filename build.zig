@@ -3201,6 +3201,16 @@ const c1_regressions = [_][]const []const u8{
         "--strong",      "--tenants", "--lease-ttl-ms=8496", "--replicas-pct=100",
         "--heal-at=309",
     },
+    // Convergence on C3's branch (PR #6 review fix of d4caacd5): `hold_stale` held a user-fault
+    // stale replica under a complete rollout too (it starts nothing either); once held stale
+    // replicas kept the halted surge, beta scaled to 0 kept its broken old replica for good. A
+    // guard: it fails with `hold_stale` keyed on `!roll.starts` instead of paused or failed
+    // (`replica_controller.zig`; docs/decisions/2026-11-22-c3-halted-rollout-holds-user-fault.md).
+    &.{
+        "385",          "98",        "2",                   "--c3",
+        "--strong",     "--tenants", "--lease-ttl-ms=8082", "--replicas-pct=100",
+        "--heal-at=94",
+    },
 };
 
 /// `zig build sim-c1-regressions`: replays `c1_regressions` with the shipped code (ReleaseSafe).

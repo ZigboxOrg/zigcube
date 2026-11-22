@@ -387,6 +387,16 @@ const Fixture = struct {
     /// has registered again: the node controller removes reports of earlier tenures, so these
     /// stay, each until its container stops (`reap`), after its replica's removal too.
     fn report_in_tenure(self: *Fixture) !void {
+        return self.report_in_tenure_where(.running);
+    }
+
+    /// `report_in_tenure` for node1's reports of replicas that stopped: its agent reports a failed
+    /// start again in the tenure it registered with.
+    fn report_stopped_in_tenure(self: *Fixture) !void {
+        return self.report_in_tenure_where(.stopped);
+    }
+
+    fn report_in_tenure_where(self: *Fixture, which: enum { running, stopped }) !void {
         const ctx = self.context();
         const node_key = records.node_key("node1");
         const node = try ctx.store.get(ctx.arena, node_key.slice(), null, &self.diag);
@@ -396,7 +406,7 @@ const Fixture = struct {
         const page = try ctx.store.list(ctx.arena, query, &self.diag);
         for (page.kvs) |kv| {
             var observed = try records.read(records.Observed, ctx.arena, kv, &self.diag);
-            if (observed.status == .stopped) continue;
+            if ((observed.status == .stopped) != (which == .stopped)) continue;
             observed.tenure = tenure;
             const bytes = try records.encode(ctx.arena, observed, &self.diag);
             const op: store.Op = .{ .put = .{ .key = kv.key, .value = bytes } };
@@ -482,8 +492,8 @@ const Fixture = struct {
         }
     }
 
-    /// Fails the start of the first replica of `generation` by the user's fault (ZC-E0304), and
-    /// steps past `min_ready_ms`.
+    /// Fails the start of the first replica of `generation` not yet reported stopped by the
+    /// user's fault (ZC-E0304), and steps past `min_ready_ms`.
     fn fail_start(self: *Fixture, generation: u64) !void {
         var collector: Diag = undefined;
         collector.reset();
@@ -496,7 +506,9 @@ const Fixture = struct {
         const text = try testing.allocator.dupe(u8, raw.text);
         defer testing.allocator.free(text);
         const new = for (try self.replicas()) |replica| {
-            if (replica.rec.generation == generation) break replica;
+            if (replica.rec.generation != generation) continue;
+            if (try self.status_of(replica.rec.id) == .stopped) continue;
+            break replica;
         } else return error.NoNewReplica;
         const id = try testing.allocator.dupe(u8, new.rec.id);
         defer testing.allocator.free(id);
@@ -1466,6 +1478,55 @@ test "an old replica of a failed rollout whose start fails by the user's fault i
     try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
     try testing.expectEqual(@as(u32, 1), try fixture.count_of(2));
     try testing.expectEqual(records.RolloutPhase.failed, (try fixture.rollout()).phase);
+}
+
+test "a held old replica of a failed rollout leaves a node registered exclusive (P1)" {
+    // Goal: an old replica a halted rollout holds for its user's fault (`hold_stale`) is still
+    // judged against its node's labels: one on a node registered exclusive must leave it (P1),
+    // though `classify` judges the node only for replicas not already dead. Method: fail
+    // generation 2 with its rollback refused, fail an old replica's start by the user's fault
+    // (held), add node2, register node1 exclusive and have its agent report the failed start
+    // again in the new tenure; nothing stays on node1 and the old count comes back on node2.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.fail(.refuse);
+    try fixture.fail_start(1);
+    try testing.expectEqual(@as(u32, 4), try fixture.held_by("node1"));
+    try fixture.put(.{ .agent = "node2" }, records.node_key("node2").slice(), node2);
+    try fixture.put(.{ .agent = "node1" }, records.node_key("node1").slice(), exclusive_node1);
+    try fixture.report_in_tenure();
+    try fixture.report_stopped_in_tenure();
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 0), try fixture.held_by("node1"));
+    try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
+    try testing.expectEqual(@as(u32, 0), try fixture.count_of(2));
+    try testing.expectEqual(@as(u32, 3), try fixture.held_by("node2"));
+    try testing.expectEqual(records.RolloutPhase.failed, (try fixture.rollout()).phase);
+}
+
+test "a rollout paused at its surge keeps it while it holds every old replica left" {
+    // Goal: stale replicas a halted rollout holds (`hold_stale`) keep the surge it paused at, as
+    // stale ones do (PR #6 review): without them counted, the service is scaled down to
+    // `replicas` by a `scale_down` no one asked for, removing a held replica. Method: pause after
+    // the first new replica starts (three old, one new, on node1), fail every old replica's start
+    // by the user's fault; all four stay, the old ones held.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.roll();
+    try testing.expectEqual(records.RolloutPhase.paused, (try fixture.request(.pause)).done);
+    try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
+    try testing.expectEqual(@as(u32, 1), try fixture.count_of(2));
+    for (0..3) |_| try fixture.fail_start(1);
+    try testing.expectEqual(@as(u32, 3), try fixture.count_of(1));
+    try testing.expectEqual(@as(u32, 1), try fixture.count_of(2));
+    for (try fixture.replicas()) |replica| {
+        const status = try fixture.status_of(replica.rec.id);
+        const old = replica.rec.generation == 1;
+        try testing.expectEqual(old, status == .stopped);
+    }
+    try testing.expectEqual(records.RolloutPhase.paused, (try fixture.rollout()).phase);
 }
 
 test "a held new replica fails the rollout with ZC-E0304 and nothing more starts" {
